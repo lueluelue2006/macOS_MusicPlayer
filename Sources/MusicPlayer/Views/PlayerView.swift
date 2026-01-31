@@ -674,64 +674,29 @@ struct AlbumArtworkView: View {
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
     var body: some View {
-        ZStack {
-            // 播放时的内发光效果
-            if isPlaying {
-                RoundedRectangle(cornerRadius: 20)
-                    .stroke(
-                        LinearGradient(
-                            colors: [
-                                theme.accent.opacity(0.6),
-                                theme.accentSecondary.opacity(0.4),
-                                theme.accentTertiary.opacity(0.3)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: 3
-                    )
-                    .blur(radius: 4)
-            }
-
-            RoundedRectangle(cornerRadius: 20)
-                .fill(
-                    LinearGradient(
-                        gradient: Gradient(colors: [
-                            theme.surface.opacity(1.0),
-                            theme.surface.opacity(0.8)
-                        ]),
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .overlay(
-                    Group {
-                        if let artwork = artwork,
-                           let nsImage = ArtworkCache.shared.image(for: cacheKey, data: artwork, targetSize: CGSize(width: 220, height: 220)) {
-                            Image(nsImage: nsImage)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .clipped()
-                        } else {
-                            // 无封面时的优雅占位符
-                            ZStack {
-                                Circle()
-                                    .fill(theme.accentGradient.opacity(0.15))
-                                    .frame(width: 80, height: 80)
-                                Image(systemName: "music.note")
-                                    .font(.system(size: 40, weight: .light))
-                                    .foregroundStyle(theme.accentGradient)
-                            }
+        Group {
+            if let artwork = artwork,
+               let nsImage = ArtworkCache.shared.image(for: cacheKey, data: artwork, targetSize: CGSize(width: 220, height: 220)) {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+            } else {
+                // 无封面时的优雅占位符
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(theme.surface.opacity(0.5))
+                    .overlay(
+                        ZStack {
+                            Circle()
+                                .fill(theme.accentGradient.opacity(0.15))
+                                .frame(width: 80, height: 80)
+                            Image(systemName: "music.note")
+                                .font(.system(size: 40, weight: .light))
+                                .foregroundStyle(theme.accentGradient)
                         }
-                    }
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 20))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 20)
-                        .stroke(isPlaying ? theme.glowStroke : theme.stroke, lineWidth: isPlaying ? 1.5 : 1)
-                )
+                    )
+            }
         }
-        .animation(AppTheme.smoothTransition, value: isPlaying)
     }
 }
 
