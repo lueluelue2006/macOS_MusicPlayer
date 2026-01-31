@@ -174,6 +174,7 @@ struct CurrentTrackView: View {
         VStack(spacing: 20) {
             if let currentFile = audioPlayer.currentFile {
                 let coverContainerSize: CGFloat = 300
+                let artworkSize: CGFloat = coverContainerSize
 
                 // 专辑封面
                 ZStack {
@@ -194,30 +195,15 @@ struct CurrentTrackView: View {
                                     endAngle: .degrees(360)
                                 )
                             )
-                            .frame(width: 260, height: 260)
+                            .frame(width: coverContainerSize - 40, height: coverContainerSize - 40)
                             .blur(radius: 40)
                             .rotationEffect(.degrees(glowRotation))
                             .opacity(0.6)
                     }
 
-                    // 模糊背景（使用缓存，避免重复解码与模糊）
-                    if let artwork = currentFile.metadata.artwork {
-                        if let blurred = ArtworkCache.shared.blurredImage(for: currentFile.url.path,
-                                                                           data: artwork,
-                                                                           targetSize: CGSize(width: coverContainerSize, height: coverContainerSize),
-                                                                           radius: 30) {
-                            Image(nsImage: blurred)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: coverContainerSize, height: coverContainerSize)
-                                .opacity(audioPlayer.isPlaying ? 0.5 : 0.3)
-                                .clipped()
-                        }
-                    }
-
                     // 主封面
                     AlbumArtworkView(artwork: currentFile.metadata.artwork, cacheKey: currentFile.url.path, isPlaying: audioPlayer.isPlaying)
-                        .frame(width: 220, height: 220)
+                        .frame(width: artworkSize, height: artworkSize)
                         .shadow(color: audioPlayer.isPlaying ? theme.accentShadow : theme.subtleShadow, radius: audioPlayer.isPlaying ? 20 : 12, x: 0, y: 8)
                 }
                 .frame(width: coverContainerSize, height: coverContainerSize)
