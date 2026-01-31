@@ -173,6 +173,8 @@ struct CurrentTrackView: View {
     var body: some View {
         VStack(spacing: 20) {
             if let currentFile = audioPlayer.currentFile {
+                let coverContainerSize: CGFloat = 300
+
                 // 专辑封面
                 ZStack {
                     // 动态光晕背景（播放时旋转）
@@ -202,12 +204,12 @@ struct CurrentTrackView: View {
                     if let artwork = currentFile.metadata.artwork {
                         if let blurred = ArtworkCache.shared.blurredImage(for: currentFile.url.path,
                                                                            data: artwork,
-                                                                           targetSize: CGSize(width: 280, height: 280),
+                                                                           targetSize: CGSize(width: coverContainerSize, height: coverContainerSize),
                                                                            radius: 30) {
                             Image(nsImage: blurred)
                                 .resizable()
                                 .aspectRatio(contentMode: .fill)
-                                .frame(width: 280, height: 280)
+                                .frame(width: coverContainerSize, height: coverContainerSize)
                                 .opacity(audioPlayer.isPlaying ? 0.5 : 0.3)
                                 .clipped()
                         }
@@ -218,7 +220,7 @@ struct CurrentTrackView: View {
                         .frame(width: 220, height: 220)
                         .shadow(color: audioPlayer.isPlaying ? theme.accentShadow : theme.subtleShadow, radius: audioPlayer.isPlaying ? 20 : 12, x: 0, y: 8)
                 }
-                .frame(width: 300, height: 300)
+                .frame(width: coverContainerSize, height: coverContainerSize)
                 .clipShape(RoundedRectangle(cornerRadius: 24))
                 .onAppear {
                     if audioPlayer.isPlaying {
