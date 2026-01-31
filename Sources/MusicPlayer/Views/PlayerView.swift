@@ -447,6 +447,7 @@ struct CurrentTrackView: View {
     }
 
     private func startGlowAnimation() {
+        glowRotation = 0
         withAnimation(.linear(duration: 8).repeatForever(autoreverses: false)) {
             glowRotation = 360
         }
