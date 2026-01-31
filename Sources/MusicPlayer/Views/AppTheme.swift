@@ -3,30 +3,30 @@ import SwiftUI
 struct AppTheme {
     let scheme: ColorScheme
 
-    // MARK: - 主色调系统（现代音乐播放器风格）
+    // MARK: - 极光冷色系（Aurora Borealis）
 
-    /// 主强调色 - 明亮的天蓝色
+    /// 主强调色 - 冰蓝色
     var accent: Color {
-        Color(red: 0.40, green: 0.75, blue: 1.0)
+        Color(red: 0.35, green: 0.85, blue: 0.92)
     }
 
-    /// 次要强调色 - 活力紫色
+    /// 次要强调色 - 薄荷绿
     var accentSecondary: Color {
-        Color(red: 0.72, green: 0.45, blue: 1.0)
+        Color(red: 0.30, green: 0.95, blue: 0.70)
     }
 
-    /// 第三强调色 - 玫瑰粉
+    /// 第三强调色 - 极光绿
     var accentTertiary: Color {
-        Color(red: 1.0, green: 0.45, blue: 0.65)
+        Color(red: 0.55, green: 1.0, blue: 0.85)
     }
 
-    /// 主渐变 - 用于播放按钮等核心元素
+    /// 主渐变 - 极光效果
     var accentGradient: LinearGradient {
         LinearGradient(
             colors: [
-                Color(red: 0.45, green: 0.80, blue: 1.0),
-                Color(red: 0.55, green: 0.60, blue: 1.0),
-                Color(red: 0.72, green: 0.45, blue: 0.98)
+                Color(red: 0.30, green: 0.95, blue: 0.70),  // 薄荷绿
+                Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
+                Color(red: 0.45, green: 0.75, blue: 0.95)   // 天青
             ],
             startPoint: .topLeading,
             endPoint: .bottomTrailing
@@ -37,9 +37,9 @@ struct AppTheme {
     var vibrantGradient: LinearGradient {
         LinearGradient(
             colors: [
-                Color(red: 1.0, green: 0.45, blue: 0.65),
-                Color(red: 0.72, green: 0.45, blue: 1.0),
-                Color(red: 0.45, green: 0.65, blue: 1.0)
+                Color(red: 0.55, green: 1.0, blue: 0.85),   // 极光绿
+                Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
+                Color(red: 0.50, green: 0.70, blue: 0.98)   // 淡紫蓝
             ],
             startPoint: .leading,
             endPoint: .trailing
@@ -50,24 +50,24 @@ struct AppTheme {
     var progressGradient: LinearGradient {
         LinearGradient(
             colors: [
-                Color(red: 0.40, green: 0.75, blue: 1.0),
-                Color(red: 0.60, green: 0.55, blue: 1.0),
-                Color(red: 0.85, green: 0.45, blue: 0.90)
+                Color(red: 0.30, green: 0.95, blue: 0.70),  // 薄荷绿
+                Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
+                Color(red: 0.50, green: 0.75, blue: 0.98)   // 极光蓝
             ],
             startPoint: .leading,
             endPoint: .trailing
         )
     }
 
-    // MARK: - 背景系统
+    // MARK: - 背景系统（深邃夜空）
 
     var backgroundGradient: LinearGradient {
         if scheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.06, green: 0.06, blue: 0.12),
-                    Color(red: 0.08, green: 0.08, blue: 0.14),
-                    Color(red: 0.05, green: 0.05, blue: 0.10)
+                    Color(red: 0.04, green: 0.08, blue: 0.12),  // 深夜蓝
+                    Color(red: 0.06, green: 0.10, blue: 0.14),  // 午夜色
+                    Color(red: 0.03, green: 0.06, blue: 0.10)   // 深海蓝
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
@@ -75,9 +75,9 @@ struct AppTheme {
         } else {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.97, green: 0.97, blue: 1.0),
-                    Color(red: 0.94, green: 0.95, blue: 1.0),
-                    Color(red: 0.96, green: 0.96, blue: 0.99)
+                    Color(red: 0.95, green: 0.98, blue: 0.99),  // 冰雪白
+                    Color(red: 0.92, green: 0.96, blue: 0.98),  // 薄霜色
+                    Color(red: 0.94, green: 0.97, blue: 0.99)   // 极地白
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
@@ -89,8 +89,8 @@ struct AppTheme {
         if scheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.12, green: 0.12, blue: 0.18),
-                    Color(red: 0.10, green: 0.10, blue: 0.15)
+                    Color(red: 0.08, green: 0.12, blue: 0.16),  // 极夜蓝
+                    Color(red: 0.06, green: 0.10, blue: 0.14)   // 深渊蓝
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
@@ -98,8 +98,8 @@ struct AppTheme {
         } else {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.98, green: 0.98, blue: 1.0),
-                    Color(red: 0.96, green: 0.96, blue: 0.99)
+                    Color(red: 0.96, green: 0.99, blue: 1.0),   // 冰晶白
+                    Color(red: 0.94, green: 0.97, blue: 0.99)   // 霜雪色
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
