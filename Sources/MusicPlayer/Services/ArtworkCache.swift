@@ -66,17 +66,44 @@ final class ArtworkCache {
     private static func blur(nsImage: NSImage, radius: Double) -> NSImage? {
         guard let tiff = nsImage.tiffRepresentation,
               let ciImage = CIImage(data: tiff) else { return nil }
+        let context = CIContext(options: nil)
+        let extent = ciImage.extent
+
+        // 一些封面可能带透明通道（圆角 PNG 等）。直接高斯模糊会把透明边缘“抹”出一圈暗边。
+        // 先用图片的平均色做底色，再进行模糊，可避免出现明显边框。
+        let baseColor: CIColor = {
+            let avg = CIFilter.areaAverage()
+            avg.inputImage = ciImage
+            avg.extent = extent
+            guard let out = avg.outputImage else {
+                return CIColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 1.0)
+            }
+            var rgba = [UInt8](repeating: 0, count: 4)
+            context.render(
+                out,
+                toBitmap: &rgba,
+                rowBytes: 4,
+                bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                format: .RGBA8,
+                colorSpace: CGColorSpaceCreateDeviceRGB()
+            )
+            return CIColor(
+                red: CGFloat(rgba[0]) / 255.0,
+                green: CGFloat(rgba[1]) / 255.0,
+                blue: CGFloat(rgba[2]) / 255.0,
+                alpha: 1.0
+            )
+        }()
+
+        let background = CIImage(color: baseColor).cropped(to: extent)
+        let composited = ciImage.composited(over: background)
+
         let filter = CIFilter.gaussianBlur()
         filter.radius = Float(radius)
-        filter.inputImage = ciImage
-        guard let output = filter.outputImage else { return nil }
-        let context = CIContext(options: nil)
-        let rect = CGRect(origin: .zero, size: nsImage.size)
-        guard let cgImage = context.createCGImage(output, from: rect) else { return nil }
-        let result = NSImage(size: nsImage.size)
-        result.lockFocus()
-        NSGraphicsContext.current?.cgContext.draw(cgImage, in: rect)
-        result.unlockFocus()
-        return result
+        // `CIGaussianBlur` 会把边缘向外扩展并在边界引入透明像素；先 clamp 再裁剪可避免“边框漏底色”。
+        filter.inputImage = composited.clampedToExtent()
+        guard let output = filter.outputImage?.cropped(to: extent) else { return nil }
+        guard let cgImage = context.createCGImage(output, from: extent) else { return nil }
+        return NSImage(cgImage: cgImage, size: nsImage.size)
     }
 }
