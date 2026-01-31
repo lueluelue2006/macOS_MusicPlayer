@@ -1,0 +1,176 @@
+import SwiftUI
+import AppKit
+import Foundation
+import UserNotifications
+
+struct MusicPlayerCommands: Commands {
+    let audioPlayer: AudioPlayer
+    @AppStorage("userNotifyOnDeviceSwitch") private var notifyOnDeviceSwitch: Bool = true
+    @AppStorage("userNotifyDeviceSwitchSilent") private var notifyDeviceSwitchSilent: Bool = true
+
+    var body: some Commands {
+        // 顶栏菜单：保留“搜索/设置”，便于用户快速找到功能
+        CommandMenu("搜索") {
+            Button("搜索播放列表") {
+                NotificationCenter.default.post(name: .focusSearchField, object: nil)
+            }
+            .keyboardShortcut("f", modifiers: [.command])
+        }
+
+        CommandMenu("设置") {
+            Button("音量均衡分析…") {
+                NotificationCenter.default.post(name: .showVolumeNormalizationAnalysis, object: nil)
+            }
+
+            Divider()
+
+            Menu("缓存") {
+                Button("清空音量均衡缓存") {
+                    Task { @MainActor in
+                        let confirmed = DestructiveConfirmation.confirm(
+                            title: "清空音量均衡缓存？",
+                            message: "将删除已分析的音量均衡缓存。下次播放或预分析时会重新计算，可能耗时。",
+                            confirmTitle: "清除",
+                            cancelTitle: "不清除"
+                        )
+                        guard confirmed else { return }
+                        audioPlayer.clearVolumeCache()
+                        NotificationCenter.default.post(name: .showVolumeCacheClearedAlert, object: nil)
+                    }
+                }
+
+                Button("清空封面缓存") {
+                    Task { @MainActor in
+                        let confirmed = DestructiveConfirmation.confirm(
+                            title: "清空封面缓存？",
+                            message: "将清空封面缓存。之后切歌可能需要重新加载/处理封面。",
+                            confirmTitle: "清除",
+                            cancelTitle: "不清除"
+                        )
+                        guard confirmed else { return }
+                        ArtworkCache.shared.clear()
+                        NotificationCenter.default.post(name: .showArtworkCacheClearedAlert, object: nil)
+                    }
+                }
+
+                Button("清空歌词缓存") {
+                    Task { @MainActor in
+                        let confirmed = DestructiveConfirmation.confirm(
+                            title: "清空歌词缓存？",
+                            message: "将清空歌词缓存。之后会重新解析内嵌/外置歌词。",
+                            confirmTitle: "清除",
+                            cancelTitle: "不清除"
+                        )
+                        guard confirmed else { return }
+                        await LyricsService.shared.invalidateAll()
+                        NotificationCenter.default.post(name: .showLyricsCacheClearedAlert, object: nil)
+                    }
+                }
+
+                Divider()
+
+                Button("清空所有缓存") {
+                    Task { @MainActor in
+                        let confirmed = DestructiveConfirmation.confirm(
+                            title: "清空所有缓存？",
+                            message: "将清空音量均衡/封面/歌词缓存。操作不可撤销。",
+                            confirmTitle: "清除",
+                            cancelTitle: "不清除"
+                        )
+                        guard confirmed else { return }
+                        audioPlayer.clearVolumeCache()
+                        ArtworkCache.shared.clear()
+                        await LyricsService.shared.invalidateAll()
+                        NotificationCenter.default.post(name: .showAllCachesClearedAlert, object: nil)
+                    }
+                }
+            }
+
+            Divider()
+
+            Menu("通知") {
+                Button("请求通知权限…") {
+                    guard Bundle.main.bundleURL.pathExtension.lowercased() == "app" else {
+                        let alert = NSAlert()
+                        alert.messageText = "通知功能不可用"
+                        alert.informativeText = "当前不是以 .app 形式运行（例如 swift build 产物）。请使用 MusicPlayer.app 启动后再设置通知。"
+                        alert.addButton(withTitle: "确定")
+                        alert.runModal()
+                        return
+                    }
+                    let center = UNUserNotificationCenter.current()
+                    center.requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in
+                        center.getNotificationSettings { settings in
+                            DispatchQueue.main.async {
+                                let alert = NSAlert()
+                                switch settings.authorizationStatus {
+                                case .authorized, .provisional, .ephemeral:
+                                    alert.messageText = "通知权限已启用"
+                                    alert.informativeText = "设备切换时可在右上角显示通知。您可在‘设置 → 通知’控制是否发送。"
+                                case .denied:
+                                    alert.messageText = "通知权限未启用"
+                                    alert.informativeText = "请在‘系统设置 → 通知 → 音乐播放器’中开启通知权限，或点击‘打开系统通知设置…’。"
+                                case .notDetermined:
+                                    alert.messageText = "已发起授权请求"
+                                    alert.informativeText = "若未出现系统弹窗，请前往‘系统设置 → 通知 → 音乐播放器’手动开启。"
+                                @unknown default:
+                                    alert.messageText = "通知权限状态未知"
+                                    alert.informativeText = "可在‘系统设置 → 通知 → 音乐播放器’中检查设置。"
+                                }
+                                alert.addButton(withTitle: "确定")
+                                alert.runModal()
+                            }
+                        }
+                    }
+                }
+
+                Button("打开系统通知设置…") {
+                    // 尝试打开通知设置面板（不同系统版本 & scheme 不同）
+                    let bid = Bundle.main.bundleIdentifier ?? "com.musicplayer.macos"
+                    let candidates = [
+                        "x-apple.systempreferences:com.apple.preference.notifications?AppID=\(bid)",
+                        "x-apple.systempreferences:com.apple.preference.notifications?app=\(bid)",
+                        "x-apple.systempreferences:com.apple.preference.notifications?bundleId=\(bid)",
+                        "x-apple.systempreferences:com.apple.preference.notifications",
+                        "x-apple.systempreferences:com.apple.notifications-Settings.extension"
+                    ].compactMap { URL(string: $0) }
+                    var opened = false
+                    for url in candidates {
+                        if NSWorkspace.shared.open(url) { opened = true; break }
+                    }
+                    if !opened {
+                        // 回退：仅打开系统设置
+                        let settingsURL = URL(fileURLWithPath: "/System/Applications/System Settings.app")
+                        NSWorkspace.shared.openApplication(at: settingsURL, configuration: NSWorkspace.OpenConfiguration())
+                    }
+                }
+
+                Button("发送测试通知") {
+                    SystemNotifier.shared.notifyDeviceChanged(to: "测试设备", silent: notifyDeviceSwitchSilent)
+                }
+
+                Divider()
+
+                Toggle(isOn: Binding(
+                    get: { notifyOnDeviceSwitch },
+                    set: { newValue in
+                        notifyOnDeviceSwitch = newValue
+                        audioPlayer.notifyOnDeviceSwitch = newValue
+                    }
+                )) {
+                    Text("设备切换时通知")
+                }
+
+                Toggle(isOn: Binding(
+                    get: { notifyDeviceSwitchSilent },
+                    set: { newValue in
+                        notifyDeviceSwitchSilent = newValue
+                        audioPlayer.notifyDeviceSwitchSilent = newValue
+                    }
+                )) {
+                    Text("设备切换通知静音（默认）")
+                }
+            }
+        }
+    }
+}

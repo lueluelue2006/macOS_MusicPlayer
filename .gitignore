@@ -1,0 +1,8 @@
+.DS_Store
+.build/
+MusicPlayer.app/
+.clang-module-cache/
+.home/
+EmbeddedOutput/
+dmg-contents/
+.vscode/
