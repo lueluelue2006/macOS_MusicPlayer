@@ -119,6 +119,7 @@ struct PlayerView: View {
 struct FileSelectionView: View {
     let onFilesSelected: ([URL]) -> Void
     @State private var hovering = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
     
@@ -126,12 +127,13 @@ struct FileSelectionView: View {
         Button(action: selectFiles) {
             HStack(spacing: 12) {
                 Image(systemName: "folder.badge.plus")
-                    .font(.title2)
-                    .foregroundColor(.white)
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundStyle(.white)
+                    .shadow(color: Color.black.opacity(0.45), radius: 3, x: 0, y: 2)
                 Text("选择音乐文件或文件夹")
-                    .font(.headline)
-                    .foregroundColor(.white)
-                    .fontWeight(.medium)
+                    .font(.system(size: 17, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .shadow(color: Color.black.opacity(0.45), radius: 3, x: 0, y: 2)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 16)
@@ -139,7 +141,23 @@ struct FileSelectionView: View {
             .background(
                 theme.accentGradient
             )
-            .cornerRadius(16)
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
+            )
+            .overlay(
+                FlowingBorder(
+                    cornerRadius: 16,
+                    lineWidth: hovering ? 2.4 : 2.0,
+                    base: theme.accent,
+                    secondary: theme.accentSecondary,
+                    enabled: !reduceMotion
+                )
+                .opacity(hovering ? 1.0 : 0.92)
+                .blendMode(.plusLighter)
+                .allowsHitTesting(false)
+            )
             .shadow(color: theme.subtleShadow, radius: 10, x: 0, y: 5)
             .scaleEffect(hovering ? 1.02 : 1.0)
             .animation(.easeInOut(duration: 0.15), value: hovering)
@@ -158,6 +176,54 @@ struct FileSelectionView: View {
         
         if panel.runModal() == .OK {
             onFilesSelected(panel.urls)
+        }
+    }
+}
+
+private struct FlowingBorder: View {
+    let cornerRadius: CGFloat
+    let lineWidth: CGFloat
+    let base: Color
+    let secondary: Color
+    let enabled: Bool
+
+    @State private var angle: Double = 0
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: cornerRadius)
+            .strokeBorder(gradient, lineWidth: lineWidth)
+            .onAppear { start() }
+            .onChange(of: enabled) { _ in start() }
+    }
+
+    private var gradient: AngularGradient {
+        let glowA = base.opacity(0.95)
+        let glowB = secondary.opacity(0.95)
+
+        return AngularGradient(
+            gradient: Gradient(stops: [
+                .init(color: .clear, location: 0.00),
+                .init(color: .clear, location: 0.40),
+                .init(color: glowA, location: 0.47),
+                .init(color: .white.opacity(0.95), location: 0.50),
+                .init(color: glowB, location: 0.53),
+                .init(color: .clear, location: 0.60),
+                .init(color: .clear, location: 1.00),
+            ]),
+            center: .center,
+            startAngle: .degrees(angle),
+            endAngle: .degrees(angle + 360)
+        )
+    }
+
+    private func start() {
+        guard enabled else {
+            angle = 0
+            return
+        }
+        angle = 0
+        withAnimation(.linear(duration: 2.6).repeatForever(autoreverses: false)) {
+            angle = 360
         }
     }
 }
