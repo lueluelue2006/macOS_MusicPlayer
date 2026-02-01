@@ -127,6 +127,17 @@ final class AudioPlayer: NSObject, ObservableObject {
         clamp(value, min: 0.5, max: 2.0)
     }
 
+    private func volumeCacheKey(for url: URL) -> String {
+        // 统一键格式：避免同一路径因大小写/Unicode 组合形式差异导致缓存 miss / 重复分析。
+        url.standardizedFileURL.path
+            .precomposedStringWithCanonicalMapping
+            .lowercased()
+    }
+
+    private func volumeCacheKey(forPath path: String) -> String {
+        volumeCacheKey(for: URL(fileURLWithPath: path))
+    }
+
     private func debugLog(_ message: @autoclosure () -> String) {
 #if DEBUG
         print(message())
@@ -926,7 +937,7 @@ extension AudioPlayer {
 
     private func desiredPlayerVolume(for url: URL) -> Float {
         if !isNormalizationEnabled { return volume }
-        let fileKey = url.path
+        let fileKey = volumeCacheKey(for: url)
         if let levelDb = withVolumeCacheLock({ fileLoudnessCache[fileKey] }) {
             return min(volume * normalizationGain(forMeasuredLevelDb: levelDb), 1.0)
         }
@@ -982,7 +993,7 @@ extension AudioPlayer {
 	    
 	    /// 应用音量均衡（异步）
 	    private func applyVolumeNormalization(for url: URL, mode: VolumeApplyMode = .immediate, allowBackgroundAnalysis: Bool = true) {
-            let fileKey = url.path
+            let fileKey = volumeCacheKey(for: url)
 
             // 先立即/平滑应用当前可得的结果（有缓存则命中，否则保持用户音量）
             setPlayerVolume(desiredPlayerVolume(for: url), mode: mode)
@@ -1032,7 +1043,7 @@ extension AudioPlayer {
 	    
 		    /// 计算归一化音量
 		    func calculateNormalizedVolume(for url: URL, persist: Bool = true, cancellationCheck: (() -> Bool)? = nil) -> Float {
-		        let fileKey = url.path
+		        let fileKey = volumeCacheKey(for: url)
 		        
 		        // 检查缓存
 		        if let cachedLevelDb = withVolumeCacheLock({ fileLoudnessCache[fileKey] }) {
@@ -1209,17 +1220,22 @@ extension AudioPlayer {
         if let url = volumeCacheURL(), let data = try? Data(contentsOf: url) {
             if let decoded = try? JSONDecoder().decode(VolumeCacheFile.self, from: data),
                decoded.version == volumeCacheFormatVersion {
+                let normalized = normalizeVolumeCacheKeys(decoded.loudnessDbByPath)
                 withVolumeCacheLock {
-                    fileLoudnessCache = decoded.loudnessDbByPath
+                    fileLoudnessCache = normalized
                 }
-                volumeNormalizationCacheCount = decoded.loudnessDbByPath.count
-                debugLog("加载了 \(decoded.loudnessDbByPath.count) 个文件的响度缓存")
+                volumeNormalizationCacheCount = normalized.count
+                debugLog("加载了 \(normalized.count) 个文件的响度缓存")
+                if normalized != decoded.loudnessDbByPath {
+                    // 统一键格式并去重后回写，避免后续因路径格式差异导致缓存 miss。
+                    saveVolumeCache()
+                }
                 return
             }
 
             // 兼容旧版磁盘缓存：可能是“增益字典”或“响度字典”
             if let legacy = try? JSONDecoder().decode([String: Float].self, from: data) {
-                let migrated = migrateLegacyVolumeCache(legacy)
+                let migrated = normalizeVolumeCacheKeys(migrateLegacyVolumeCache(legacy))
                 withVolumeCacheLock {
                     fileLoudnessCache = migrated
                 }
@@ -1233,7 +1249,7 @@ extension AudioPlayer {
         // 兼容旧版 UserDefaults 缓存：加载后迁移到磁盘（旧版存的是“增益”）
         let d = UserDefaults.standard
         if let cachedData = d.dictionary(forKey: volumeCacheKey) as? [String: Float] {
-            let migrated = migrateLegacyVolumeCache(cachedData)
+            let migrated = normalizeVolumeCacheKeys(migrateLegacyVolumeCache(cachedData))
             withVolumeCacheLock {
                 fileLoudnessCache = migrated
             }
@@ -1269,6 +1285,17 @@ extension AudioPlayer {
         }
         return migrated
     }
+
+    private func normalizeVolumeCacheKeys(_ raw: [String: Float]) -> [String: Float] {
+        guard !raw.isEmpty else { return [:] }
+        var normalized: [String: Float] = [:]
+        normalized.reserveCapacity(raw.count)
+        for (path, value) in raw {
+            guard value.isFinite else { continue }
+            normalized[volumeCacheKey(forPath: path)] = value
+        }
+        return normalized
+    }
     
     /// 保存音量缓存到持久化存储
     private func saveVolumeCache() {
@@ -1288,7 +1315,7 @@ extension AudioPlayer {
     }
 
     func hasVolumeNormalizationCache(for url: URL) -> Bool {
-        let key = url.path
+        let key = volumeCacheKey(for: url)
         return withVolumeCacheLock { fileLoudnessCache[key] != nil }
     }
 
@@ -1304,7 +1331,7 @@ extension AudioPlayer {
 
         var seen = Set<String>()
         let unique: [URL] = urls.filter { url in
-            let key = url.path
+            let key = volumeCacheKey(for: url)
             if seen.contains(key) { return false }
             seen.insert(key)
             return true

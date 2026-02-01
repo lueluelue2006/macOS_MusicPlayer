@@ -47,7 +47,8 @@ struct VolumeNormalizationAnalysisView: View {
                     .font(.headline)
                 Spacer()
                 Button("关闭") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
+                    .keyboardShortcut(.escape, modifiers: [])
+                    .help(audioPlayer.isVolumePreanalysisRunning ? "关闭后仍会在后台继续分析；点击“停止”才会停止" : "关闭（Esc）")
             }
             .padding(.horizontal, 16)
             .padding(.top, 14)
@@ -70,7 +71,7 @@ struct VolumeNormalizationAnalysisView: View {
                 }
 
                 HStack(spacing: 12) {
-                    Button("分析未缓存") {
+                    Button("分析未缓存的") {
                         let urls = playlistManager.audioFiles.map { $0.url }
                         audioPlayer.startVolumeNormalizationPreanalysis(urls: urls)
                     }
@@ -205,5 +206,9 @@ struct VolumeNormalizationAnalysisView: View {
         .frame(minWidth: 720, minHeight: 520)
         .tint(theme.accent)
         .background(theme.backgroundGradient)
+        .onExitCommand {
+            // Esc 关闭：分析任务属于 AudioPlayer 生命周期，不应因视图关闭被取消。
+            dismiss()
+        }
     }
 }

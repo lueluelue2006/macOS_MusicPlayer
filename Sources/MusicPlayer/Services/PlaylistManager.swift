@@ -447,8 +447,8 @@ final class PlaylistManager: ObservableObject {
         await LyricsService.shared.invalidateAll()
         // 清空封面缓存，避免封面不更新
         ArtworkCache.shared.clear()
-        // 清空归一化音量缓存（文件被外部改写后需重新分析）
-        audioPlayer?.clearVolumeCache()
+        // 保留音量均衡缓存：避免“完全刷新”导致所有歌曲都需要重新分析。
+        // 若用户确实需要重算（例如音频内容被替换），可在菜单或“音量均衡分析”页手动清空缓存。
         if let currentURL = currentFileURL, let audioPlayer = audioPlayer {
             let result = await LyricsService.shared.loadLyrics(for: currentURL)
             await MainActor.run {

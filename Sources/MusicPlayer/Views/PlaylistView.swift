@@ -102,7 +102,7 @@ struct PlaylistView: View {
                         .foregroundStyle(theme.accentGradient)
                     }
                     .buttonStyle(PlainButtonStyle())
-                    .help("完全刷新：重载元数据、歌词、封面并清空缓存")
+                    .help("完全刷新：重载元数据、歌词、封面（清空歌词/封面缓存；保留音量均衡缓存）")
                 }
             }
             .padding(.horizontal, 20)
