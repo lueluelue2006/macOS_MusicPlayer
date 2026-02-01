@@ -111,7 +111,7 @@ final class IPCServer {
             return IPCReply(id: request.id, ok: true)
 
         case .clearArtworkCache:
-            ArtworkCache.shared.clear()
+            audioPlayer.clearArtworkCache()
             return IPCReply(id: request.id, ok: true)
 
         case .togglePlayPause:

@@ -277,7 +277,7 @@ struct CurrentTrackView: View {
                     }
 
                     // 主封面
-                    AlbumArtworkView(artwork: currentFile.metadata.artwork, cacheKey: currentFile.url.path, isPlaying: audioPlayer.isPlaying)
+                    AlbumArtworkView(image: audioPlayer.artworkImage, isPlaying: audioPlayer.isPlaying)
                         .frame(width: artworkSize, height: artworkSize)
                         .shadow(color: audioPlayer.isPlaying ? theme.accentShadow : theme.subtleShadow, radius: audioPlayer.isPlaying ? 20 : 12, x: 0, y: 8)
                 }
@@ -743,17 +743,15 @@ private func sourceLabel(for source: LyricsSource) -> String {
 }
 
 struct AlbumArtworkView: View {
-    let artwork: Data?
-    let cacheKey: String
+    let image: NSImage?
     var isPlaying: Bool = false
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
     var body: some View {
         Group {
-            if let artwork = artwork,
-               let nsImage = ArtworkCache.shared.image(for: cacheKey, data: artwork, targetSize: CGSize(width: 220, height: 220)) {
-                Image(nsImage: nsImage)
+            if let image {
+                Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
                     .clipShape(RoundedRectangle(cornerRadius: 16))

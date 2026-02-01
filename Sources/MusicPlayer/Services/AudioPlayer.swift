@@ -1,6 +1,8 @@
 import Foundation
 import AVFoundation
 import Combine
+import AppKit
+import ImageIO
 
 final class PlaybackClock: ObservableObject {
     @Published var currentTime: TimeInterval = 0
@@ -19,6 +21,8 @@ final class AudioPlayer: NSObject, ObservableObject {
     // 歌词相关
     @Published var lyricsTimeline: LyricsTimeline?
     @Published var showLyrics: Bool = true
+    // 当前曲目封面缩略图（低内存：仅保留缩放后的图，不保留原始 artwork Data）
+    @Published var artworkImage: NSImage?
     // 当前系统音频输出设备显示（用于 UI 展示）
     @Published var currentOutputDeviceName: String = "检测中..."
     // 是否为“系统内置扬声器”输出（用于设备名着色）
@@ -270,6 +274,7 @@ final class AudioPlayer: NSObject, ObservableObject {
     
     private var pendingLoadTask: Task<Void, Never>?
     private var artworkLoadTask: Task<Void, Never>?
+    private var artworkAttemptedPathKey: String? = nil
 
     // MARK: - Launch restore gating
     /// 本次启动/本次外部打开期间，跳过一次“恢复上次播放”。仅用于内存态，不写入 UserDefaults。
@@ -368,7 +373,16 @@ final class AudioPlayer: NSObject, ObservableObject {
 	                    self.currentFile = file
 	                    self.playbackClock.duration = newPlayer.duration
 	                    self.lastSavedTime = 0
-	                    self.loadArtworkIfNeeded(for: url)
+                    // 切歌时释放上一首封面，避免内存随播放历史增长
+                    self.artworkLoadTask?.cancel()
+                    self.artworkLoadTask = nil
+                    self.artworkImage = nil
+                    self.artworkAttemptedPathKey = nil
+
+                    // 仅在“真正开始播放”时才加载封面（省内存：浏览/选中不触发）
+                    if autostart {
+                        self.loadArtworkIfNeeded(for: url)
+                    }
 
                     NotificationCenter.default.post(
                         name: .audioPlayerDidLoadFile,
@@ -397,6 +411,8 @@ final class AudioPlayer: NSObject, ObservableObject {
                         if didStart {
                             self.isPlaying = true
                             self.startTimer()
+                            // 若封面尚未加载（例如刚切歌、或 autostart=true 但封面任务被取消），在开播时再确保触发一次
+                            self.loadArtworkIfNeeded(for: url)
                             if self.persistPlaybackState {
                                 self.saveLastPlayedFile(file)
                             }
@@ -474,6 +490,10 @@ final class AudioPlayer: NSObject, ObservableObject {
             return
         }
         guard let player = player else { return }
+        if let url = currentFile?.url {
+            // 仅在用户开始播放时加载封面（省内存）
+            loadArtworkIfNeeded(for: url)
+        }
         // 若用户开启“播放前必须分析”，且当前曲目尚未缓存，则先完成一次分析再开始播放，避免播放中音量变化
         if isNormalizationEnabled,
            requireVolumeAnalysisBeforePlayback,
@@ -513,6 +533,16 @@ final class AudioPlayer: NSObject, ObservableObject {
         speakerConfirmProceed = proceed
         showSpeakerConfirm = true
     }
+
+    @MainActor
+    func clearArtworkCache() {
+        artworkLoadTask?.cancel()
+        artworkLoadTask = nil
+        artworkImage = nil
+        artworkAttemptedPathKey = nil
+        // Keep legacy cache fully cleared as well (even if UI no longer uses it).
+        ArtworkCache.shared.clear()
+    }
     
 	    func stop() {
 	        saveCurrentProgress() // 停止时保存进度
@@ -538,6 +568,10 @@ final class AudioPlayer: NSObject, ObservableObject {
         // 清空与当前曲目相关的状态
         currentFile = nil
         lyricsTimeline = nil
+        artworkLoadTask?.cancel()
+        artworkLoadTask = nil
+        artworkImage = nil
+        artworkAttemptedPathKey = nil
         artworkLoadTask?.cancel()
         artworkLoadTask = nil
 	        playbackClock.duration = 0
@@ -816,30 +850,43 @@ final class AudioPlayer: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Artwork loading（按需，避免为整个列表持有大图数据）
+    // MARK: - Artwork loading（低内存：只生成缩略图，不保留原始 Data / 不做跨曲目缓存）
     private func loadArtworkIfNeeded(for url: URL) {
         guard let current = currentFile, current.url == url else { return }
-        guard current.metadata.artwork == nil else { return }
+
+        let key = url.path
+        if artworkAttemptedPathKey == key { return }
+        artworkAttemptedPathKey = key
+
+        // 若已有图（例如刚加载完又触发一次），不重复做事
+        if artworkImage != nil { return }
 
         artworkLoadTask?.cancel()
-        artworkLoadTask = Task { [weak self] in
+        artworkLoadTask = Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
-            let data = await self.fetchArtworkData(for: url)
-            guard let data else { return }
-            await MainActor.run {
-                guard let current = self.currentFile, current.url == url else { return }
-                guard current.metadata.artwork == nil else { return }
-                let md = AudioMetadata(
-                    title: current.metadata.title,
-                    artist: current.metadata.artist,
-                    album: current.metadata.album,
-                    year: current.metadata.year,
-                    genre: current.metadata.genre,
-                    artwork: data
-                )
-                self.currentFile = AudioFile(url: current.url, metadata: md, lyricsTimeline: current.lyricsTimeline)
+            if Task.isCancelled { return }
+            guard let data = await self.fetchArtworkData(for: url) else { return }
+            if Task.isCancelled { return }
+            guard let cgImage = Self.makeThumbnailCGImage(from: data, maxPixel: 600) else { return }
+            if Task.isCancelled { return }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                guard self.currentFile?.url == url else { return }
+                self.artworkImage = NSImage(cgImage: cgImage, size: NSSize(width: 300, height: 300))
             }
         }
+    }
+
+    private static func makeThumbnailCGImage(from data: Data, maxPixel: Int) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+            // Avoid caching decoded pixels globally; we already keep only a tiny thumbnail.
+            kCGImageSourceShouldCacheImmediately: false
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 
     private func fetchArtworkData(for url: URL) async -> Data? {

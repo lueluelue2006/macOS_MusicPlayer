@@ -62,7 +62,7 @@ struct MusicPlayerCommands: Commands {
                             cancelTitle: "不清除"
                         )
                         guard confirmed else { return }
-                        ArtworkCache.shared.clear()
+                        audioPlayer.clearArtworkCache()
                         NotificationCenter.default.post(name: .showArtworkCacheClearedAlert, object: nil)
                     }
                 }
@@ -93,7 +93,7 @@ struct MusicPlayerCommands: Commands {
                         )
                         guard confirmed else { return }
                         audioPlayer.clearVolumeCache()
-                        ArtworkCache.shared.clear()
+                        audioPlayer.clearArtworkCache()
                         await LyricsService.shared.invalidateAll()
                         NotificationCenter.default.post(name: .showAllCachesClearedAlert, object: nil)
                     }

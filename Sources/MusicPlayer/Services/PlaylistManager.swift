@@ -452,8 +452,10 @@ final class PlaylistManager: ObservableObject {
 
         // 全量刷新后：清空所有歌词缓存并主动为“当前曲目”重载歌词
         await LyricsService.shared.invalidateAll()
-        // 清空封面缓存，避免封面不更新
-        ArtworkCache.shared.clear()
+        // 清空封面（仅保留当前缩略图，不做跨曲目缓存），避免封面不更新
+        if let audioPlayer = audioPlayer {
+            await audioPlayer.clearArtworkCache()
+        }
         // 保留音量均衡缓存：避免“完全刷新”导致所有歌曲都需要重新分析。
         // 若用户确实需要重算（例如音频内容被替换），可在菜单或“音量均衡分析”页手动清空缓存。
         if let currentURL = currentFileURL, let audioPlayer = audioPlayer {
