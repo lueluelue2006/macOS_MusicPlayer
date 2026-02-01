@@ -2,6 +2,10 @@
 
 一款基于 SwiftUI 与 AVFoundation 的本地音乐播放器：拖拽添加、播放列表、随机/循环、断点续播、音量均衡（响度分析缓存）、歌词显示（内嵌/外置 `.lrc`）、基础元数据编辑（Apple 格式原生写入；其他格式提供 FFmpeg 命令引导）。
 
+## 下载（DMG）
+
+- GitHub Releases: https://github.com/lueluelue2006/macOS_MusicPlayer/releases
+
 ## 构建与运行
 
 - 构建 App：`./build.sh`（输出：`MusicPlayer.app`）

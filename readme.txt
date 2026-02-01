@@ -1,5 +1,7 @@
 # 安装与运行（DMG）— 快速开始（v3.0）
 
+下载（Releases）：https://github.com/lueluelue2006/macOS_MusicPlayer/releases
+
 1) 下载发布页面中的 DMG 安装包（文件名示例：MusicPlayer-v3.0.dmg）
 2) 双击打开 DMG，将“MusicPlayer.app”**拖入**“应用程序”或任意文件夹
 3) 首次运行故障排除（无法验证开发者或者显示“文件已损坏”）
