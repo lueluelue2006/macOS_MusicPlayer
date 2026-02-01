@@ -140,7 +140,7 @@ struct MusicPlayerCommands: Commands {
 
                 Button("打开系统通知设置…") {
                     // 尝试打开通知设置面板（不同系统版本 & scheme 不同）
-                    let bid = Bundle.main.bundleIdentifier ?? "com.musicplayer.macos"
+                    let bid = Bundle.main.bundleIdentifier ?? "io.github.lueluelue2006.macosmusicplayer"
                     let candidates = [
                         "x-apple.systempreferences:com.apple.preference.notifications?AppID=\(bid)",
                         "x-apple.systempreferences:com.apple.preference.notifications?app=\(bid)",

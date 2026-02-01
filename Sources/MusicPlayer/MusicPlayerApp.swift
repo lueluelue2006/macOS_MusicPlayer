@@ -9,40 +9,25 @@ struct MusicPlayerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     // Create single shared instances for the whole app lifetime.
     // These survive window closes (Cmd+W) and avoid duplicate audio playback.
-    private let audioPlayer = AudioPlayer()
-    private let playlistManager = PlaylistManager()
-    private var playbackCoordinator: PlaybackCoordinator!
-    private var audioRouteMonitor: AudioRouteMonitor!
-    private var ipcServer: IPCServer!
+    private let audioPlayer: AudioPlayer
+    private let playlistManager: PlaylistManager
+    private let playbackCoordinator: PlaybackCoordinator
+    private let audioRouteMonitor: AudioRouteMonitor
+    private let ipcServer: IPCServer
     private let notificationDelegate = NotificationCenterDelegate()
     
     init() {
-        // 将协调器常驻应用生命周期，确保自动切歌/自动播放不依赖视图
-        self.playbackCoordinator = PlaybackCoordinator(audioPlayer: audioPlayer, playlistManager: playlistManager)
-        // CLI/调试入口：通过 DistributedNotificationCenter 接收命令
-        self.ipcServer = IPCServer(audioPlayer: audioPlayer, playlistManager: playlistManager)
-        // 连接 AppDelegate，使其可以接管 Finder/Dock 打开的临时文件
-        appDelegate.configure(audioPlayer: audioPlayer, playlistManager: playlistManager)
+        // Bundle identifier change migration:
+        // - avoids conflicting defaults when other apps use the old id
+        // - preserves existing user settings on upgrade
+        UserDefaultsMigrator.migrateFromLegacyBundleIdentifierIfNeeded(currentBundleIdentifier: Bundle.main.bundleIdentifier)
 
-        // Run format detection tests in background to avoid blocking app startup/IPC.
-        #if DEBUG
-        Task.detached(priority: .background) {
-            FormatDetectionTest.runTests()
-            FormatDetectionTest.testSpecificScenarios()
-        }
-        #endif
+        let audioPlayer = AudioPlayer()
+        let playlistManager = PlaylistManager()
+        let playbackCoordinator = PlaybackCoordinator(audioPlayer: audioPlayer, playlistManager: playlistManager)
+        let ipcServer = IPCServer(audioPlayer: audioPlayer, playlistManager: playlistManager)
 
-        // System notifications: only available when running as a bundled .app.
-        if Bundle.main.bundleURL.pathExtension.lowercased() == "app" {
-            let center = UNUserNotificationCenter.current()
-            center.delegate = notificationDelegate
-            center.requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
-        }
-
-        // 监听音频路由变化（耳机拔出/设备切换）
-        // - 拔出：若正在播放 → 暂停并记录“可自动续播”标记
-        // - 插回/切回耳机：若标记存在且未播放 → 自动继续
-        self.audioRouteMonitor = AudioRouteMonitor(
+        let audioRouteMonitor = AudioRouteMonitor(
             onHeadphonesDisconnected: { [weak audioPlayer] in
                 DispatchQueue.main.async {
                     guard let ap = audioPlayer else { return }
@@ -108,6 +93,30 @@ struct MusicPlayerApp: App {
                 }
             }
         )
+
+        self.audioPlayer = audioPlayer
+        self.playlistManager = playlistManager
+        self.playbackCoordinator = playbackCoordinator
+        self.ipcServer = ipcServer
+        self.audioRouteMonitor = audioRouteMonitor
+
+        // 连接 AppDelegate，使其可以接管 Finder/Dock 打开的临时文件
+        appDelegate.configure(audioPlayer: audioPlayer, playlistManager: playlistManager)
+
+        // Run format detection tests in background to avoid blocking app startup/IPC.
+        #if DEBUG
+        Task.detached(priority: .background) {
+            FormatDetectionTest.runTests()
+            FormatDetectionTest.testSpecificScenarios()
+        }
+        #endif
+
+        // System notifications: only available when running as a bundled .app.
+        if Bundle.main.bundleURL.pathExtension.lowercased() == "app" {
+            let center = UNUserNotificationCenter.current()
+            center.delegate = notificationDelegate
+            center.requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+        }
     }
     
     var body: some Scene {

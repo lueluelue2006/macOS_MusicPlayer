@@ -63,7 +63,7 @@ cat > MusicPlayer.app/Contents/Info.plist << EOF
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.musicplayer.macos</string>
+    <string>io.github.lueluelue2006.macosmusicplayer</string>
     <key>CFBundleName</key>
     <string>MusicPlayer</string>
     <key>CFBundlePackageType</key>
