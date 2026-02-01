@@ -592,6 +592,40 @@ final class PlaylistManager: ObservableObject {
             return nil
         }
     }
+
+    /// 预览“下一首”（不改变 currentIndex，也不推进 shuffleIndex）。
+    /// 用于“预加载下一首”场景：提前准备下一首音频，减少曲目切换间隙。
+    func peekNextFile(isShuffling: Bool) -> AudioFile? {
+        guard !audioFiles.isEmpty else { return nil }
+
+        if isShuffling {
+            // 确保洗牌队列存在（允许提前创建队列；不会影响 UI）
+            if shuffleQueue.isEmpty || shuffleIndex >= shuffleQueue.count {
+                createShuffleQueue()
+            }
+            var i = shuffleIndex
+            while i < shuffleQueue.count {
+                let idx = shuffleQueue[i]
+                if !isUnplayableIndex(idx) {
+                    return audioFiles[idx]
+                }
+                i += 1
+            }
+            return nil
+        } else {
+            let total = audioFiles.count
+            var attempts = 0
+            var idx = currentIndex
+            while attempts < total {
+                idx = (idx + 1) % total
+                attempts += 1
+                if !isUnplayableIndex(idx) {
+                    return audioFiles[idx]
+                }
+            }
+            return nil
+        }
+    }
     
     func previousFile(isShuffling: Bool) -> AudioFile? {
         guard !audioFiles.isEmpty else { return nil }

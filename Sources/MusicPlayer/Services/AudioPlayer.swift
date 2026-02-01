@@ -276,6 +276,102 @@ final class AudioPlayer: NSObject, ObservableObject {
     private var artworkLoadTask: Task<Void, Never>?
     private var artworkAttemptedPathKey: String? = nil
 
+    // MARK: - Next-track preloading (reduce gaps between tracks)
+    private struct PreloadedNext {
+        let url: URL
+        let player: AVAudioPlayer
+    }
+    private let preloadLock = NSLock()
+    private var nextPreloadTask: Task<Void, Never>?
+    private var preloadedNext: PreloadedNext? = nil
+
+    private func preloadedPlayerIfMatching(url: URL) -> AVAudioPlayer? {
+        preloadLock.lock()
+        defer { preloadLock.unlock() }
+        guard let entry = preloadedNext, entry.url == url else { return nil }
+        return entry.player
+    }
+
+    private func consumePreloadedPlayerIfMatching(url: URL) -> AVAudioPlayer? {
+        preloadLock.lock()
+        defer { preloadLock.unlock() }
+        guard let entry = preloadedNext, entry.url == url else { return nil }
+        preloadedNext = nil
+        return entry.player
+    }
+
+    private func clearPreloadedNext() {
+        preloadLock.lock()
+        preloadedNext = nil
+        preloadLock.unlock()
+    }
+
+    func cancelNextPreload() {
+        nextPreloadTask?.cancel()
+        nextPreloadTask = nil
+        clearPreloadedNext()
+    }
+
+    /// 预加载“下一首”的 AVAudioPlayer（并按需提前写入音量均衡缓存）。
+    /// - 目标：减少曲目切换时的空隙；尽量不增加常驻内存（仅保留 1 个预加载播放器）。
+    func preloadNextTrack(_ file: AudioFile) {
+        let url = file.url
+
+        // 已预加载同一首：不重复
+        if preloadedPlayerIfMatching(url: url) != nil { return }
+
+        // 只保留一个预加载实例：新目标到来时取消旧任务并丢弃旧预加载
+        nextPreloadTask?.cancel()
+        clearPreloadedNext()
+
+        // 捕获当前设置（避免后台线程直接读取 @Published）
+        let capturedRate = playbackRate
+        let capturedNormalizationEnabled = isNormalizationEnabled
+        let capturedRequireAnalysisBeforePlayback = requireVolumeAnalysisBeforePlayback
+        let shouldPrewarmNormalization = capturedNormalizationEnabled && capturedRequireAnalysisBeforePlayback && !hasVolumeNormalizationCache(for: url)
+
+        nextPreloadTask = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            if Task.isCancelled { return }
+
+            // 1) Prepare AVAudioPlayer
+            do {
+                let p: AVAudioPlayer
+                do {
+                    p = try AVAudioPlayer(contentsOf: url)
+                } catch {
+                    if let hint = AudioFileSniffer.avAudioPlayerFileTypeHint(at: url) {
+                        p = try AVAudioPlayer(contentsOf: url, fileTypeHint: hint)
+                    } else {
+                        throw error
+                    }
+                }
+                p.numberOfLoops = 0
+                p.enableRate = true
+                p.rate = self.clampPlaybackRate(capturedRate)
+                p.prepareToPlay()
+
+                if Task.isCancelled { return }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    // 若任务已过期/被新任务覆盖，这里也能通过 nextPreloadTask.cancel() 终止
+                    self.preloadLock.lock()
+                    self.preloadedNext = PreloadedNext(url: url, player: p)
+                    self.preloadLock.unlock()
+                }
+            } catch {
+                return
+            }
+
+            if Task.isCancelled { return }
+
+            // 2) Optional: prewarm volume normalization cache so "require analysis before playback" won't block next track.
+            if shouldPrewarmNormalization {
+                _ = self.calculateNormalizedVolume(for: url, persist: true, cancellationCheck: { Task.isCancelled })
+            }
+        }
+    }
+
     // MARK: - Launch restore gating
     /// 本次启动/本次外部打开期间，跳过一次“恢复上次播放”。仅用于内存态，不写入 UserDefaults。
     func markSkipRestoreThisLaunch() {
@@ -314,6 +410,81 @@ final class AudioPlayer: NSObject, ObservableObject {
         let url = file.url
         let generation = nextLoadGeneration()
 
+        // 即将播放“某一首”时：取消旧的下一首预加载任务，并丢弃不匹配的预加载播放器（避免占用内存）
+        nextPreloadTask?.cancel()
+        nextPreloadTask = nil
+        if preloadedPlayerIfMatching(url: url) == nil {
+            clearPreloadedNext()
+        }
+
+        // 快路径：如果目标曲目已被预加载且不需要阻塞式的“播放前必须分析”，直接无缝切换
+        let needsBlockingAnalysis = autostart
+            && isNormalizationEnabled
+            && requireVolumeAnalysisBeforePlayback
+            && !hasVolumeNormalizationCache(for: url)
+        if autostart, !needsBlockingAnalysis, let prepared = consumePreloadedPlayerIfMatching(url: url) {
+            // 到这里说明下一首已就绪：直接切换并开播（避免再走异步初始化）
+            self.stop()
+            self.player = prepared
+            prepared.delegate = self
+            prepared.numberOfLoops = isLoop ? -1 : 0
+            prepared.enableRate = true
+            prepared.rate = self.clampPlaybackRate(self.playbackRate)
+
+            self.currentFile = file
+            self.playbackClock.duration = prepared.duration
+            self.lastSavedTime = 0
+
+            // 切歌时释放上一首封面，避免内存随播放历史增长
+            self.artworkLoadTask?.cancel()
+            self.artworkLoadTask = nil
+            self.artworkImage = nil
+            self.artworkAttemptedPathKey = nil
+            self.loadArtworkIfNeeded(for: url)
+
+            NotificationCenter.default.post(
+                name: .audioPlayerDidLoadFile,
+                object: nil,
+                userInfo: ["url": url]
+            )
+
+            let allowBackgroundAnalysis = (!self.requireVolumeAnalysisBeforePlayback) || (!autostart) || self.hasVolumeNormalizationCache(for: url)
+            self.applyVolumeNormalization(for: url, mode: .immediate, allowBackgroundAnalysis: allowBackgroundAnalysis)
+
+            if let t = self.pendingSeekTime {
+                let clamped = max(0, min(t, self.playbackClock.duration))
+                prepared.currentTime = clamped
+                self.playbackClock.currentTime = clamped
+                self.pendingSeekTime = nil
+            }
+
+            self.loadLyricsIfNeeded(for: file)
+
+            let didStart = prepared.play()
+            if didStart {
+                self.isPlaying = true
+                self.startTimer()
+                if self.persistPlaybackState {
+                    self.saveLastPlayedFile(file)
+                }
+            } else {
+                self.isPlaying = false
+                self.stopTimer()
+                NotificationCenter.default.post(
+                    name: .audioPlayerDidFailToPlay,
+                    object: nil,
+                    userInfo: [
+                        "url": url,
+                        "message": "无法开始播放：\(url.lastPathComponent)"
+                    ]
+                )
+                if !self.isLooping {
+                    NotificationCenter.default.post(name: .audioPlayerDidFinish, object: nil)
+                }
+            }
+            return
+        }
+
         // 在后台初始化播放器，并添加 20s 超时保护，避免 UI 卡死
         pendingLoadTask = Task { [weak self] in
             guard let self = self else { return }
@@ -335,22 +506,29 @@ final class AudioPlayer: NSObject, ObservableObject {
                 return
             }
             do {
-                let newPlayer: AVAudioPlayer = try await AsyncTimeout.withTimeout(20) {
-                    try await Task.detached(priority: .userInitiated) {
-                        let p: AVAudioPlayer
-                        do {
-                            p = try AVAudioPlayer(contentsOf: url)
-                        } catch {
-                            if let hint = AudioFileSniffer.avAudioPlayerFileTypeHint(at: url) {
-                                p = try AVAudioPlayer(contentsOf: url, fileTypeHint: hint)
-                            } else {
-                                throw error
+                let newPlayer: AVAudioPlayer
+                if let prepared = self.consumePreloadedPlayerIfMatching(url: url) {
+                    prepared.numberOfLoops = isLoop ? -1 : 0
+                    prepared.prepareToPlay()
+                    newPlayer = prepared
+                } else {
+                    newPlayer = try await AsyncTimeout.withTimeout(20) {
+                        try await Task.detached(priority: .userInitiated) {
+                            let p: AVAudioPlayer
+                            do {
+                                p = try AVAudioPlayer(contentsOf: url)
+                            } catch {
+                                if let hint = AudioFileSniffer.avAudioPlayerFileTypeHint(at: url) {
+                                    p = try AVAudioPlayer(contentsOf: url, fileTypeHint: hint)
+                                } else {
+                                    throw error
+                                }
                             }
-                        }
-                        p.numberOfLoops = isLoop ? -1 : 0
-                        p.prepareToPlay()
-                        return p
-                    }.value
+                            p.numberOfLoops = isLoop ? -1 : 0
+                            p.prepareToPlay()
+                            return p
+                        }.value
+                    }
                 }
 
                 // 若用户启用“播放前必须分析”，则在真正切歌/开播前先产出缓存，避免播放中音量变化

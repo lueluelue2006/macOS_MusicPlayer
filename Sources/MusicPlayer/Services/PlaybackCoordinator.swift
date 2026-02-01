@@ -10,12 +10,14 @@ final class PlaybackCoordinator {
     private var cancellables: Set<AnyCancellable> = []
     private var idleVolumePreanalysisTask: Task<Void, Never>?
     private let idlePreanalysisDelaySeconds: TimeInterval = 10
+    private var nextPreloadCandidatePathKey: String? = nil
 
     init(audioPlayer: AudioPlayer, playlistManager: PlaylistManager) {
         self.audioPlayer = audioPlayer
         self.playlistManager = playlistManager
         observeNotifications()
         observeIdleVolumePreanalysis()
+        observeNextTrackPreloading()
     }
 
     private func observeNotifications() {
@@ -149,6 +151,62 @@ final class PlaybackCoordinator {
 
             let urls = self.playlistManager.audioFiles.map { $0.url }
             self.audioPlayer.startVolumeNormalizationPreanalysis(urls: urls, reason: .autoIdle)
+        }
+    }
+
+    private func observeNextTrackPreloading() {
+        // 当前曲目变化/列表变化：丢弃旧预加载（避免预加载到“已经不是下一首”的曲目）
+        audioPlayer.$currentFile
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.nextPreloadCandidatePathKey = nil
+                self.audioPlayer.cancelNextPreload()
+            }
+            .store(in: &cancellables)
+
+        playlistManager.$audioFiles
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.nextPreloadCandidatePathKey = nil
+                self.audioPlayer.cancelNextPreload()
+            }
+            .store(in: &cancellables)
+
+        // 播放接近结束时：预加载下一首
+        audioPlayer.playbackClock.$currentTime
+            .throttle(for: .milliseconds(500), scheduler: DispatchQueue.main, latest: true)
+            .sink { [weak self] currentTime in
+                guard let self else { return }
+                self.maybePreloadNextTrack(currentTime: currentTime)
+            }
+            .store(in: &cancellables)
+    }
+
+    private func maybePreloadNextTrack(currentTime: TimeInterval) {
+        guard audioPlayer.isPlaying else { return }
+        // 临时播放（外部打开文件）时，不进行播放列表预加载
+        guard audioPlayer.persistPlaybackState else { return }
+        // 单曲循环：不会切歌
+        guard !audioPlayer.isLooping else { return }
+        guard audioPlayer.currentFile != nil else { return }
+
+        let duration = audioPlayer.playbackClock.duration
+        guard duration > 0, duration.isFinite else { return }
+
+        let remaining = duration - currentTime
+        guard remaining.isFinite else { return }
+
+        // 预加载窗口：最少 8s、最多 30s，并随曲目长度适配（长歌不会太早触发）
+        let threshold = min(30.0, max(8.0, duration * 0.1))
+        guard remaining <= threshold else { return }
+
+        guard let next = playlistManager.peekNextFile(isShuffling: audioPlayer.isShuffling) else { return }
+        let key = next.url.path
+        if nextPreloadCandidatePathKey != key {
+            nextPreloadCandidatePathKey = key
+            audioPlayer.preloadNextTrack(next)
         }
     }
 }
