@@ -36,6 +36,11 @@
 
 应用纯本地运行、不访问网络；仅访问你通过“打开面板/拖拽”提供的本地文件路径。
 
+## Bundle ID（UserDefaults 域）
+
+- `io.github.lueluelue2006.macosmusicplayer`
+- 说明：用户偏好（`UserDefaults/@AppStorage`）使用 Bundle ID 作为存储域；从旧版本（`com.musicplayer.macos`）升级会在首次启动时自动迁移一次设置。
+
 ## License
 
 GNU AGPLv3（见 `LICENSE`）。
