@@ -3,6 +3,9 @@ import Foundation
 public enum IPCCommand: String, Codable {
     case ping
     case status
+    case benchmarkLoad
+    case clearLyricsCache
+    case clearArtworkCache
     case togglePlayPause
     case pause
     case resume

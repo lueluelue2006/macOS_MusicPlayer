@@ -57,6 +57,63 @@ final class IPCServer {
                 data: statusSnapshot()
             )
 
+        case .benchmarkLoad:
+            guard let raw = request.arguments?["path"] else {
+                return IPCReply(id: request.id, ok: false, message: "missing path")
+            }
+            let expanded = (raw as NSString).expandingTildeInPath
+            let folderURL = URL(fileURLWithPath: expanded)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: folderURL.path, isDirectory: &isDir), isDir.boolValue else {
+                return IPCReply(id: request.id, ok: false, message: "not a directory: \(expanded)")
+            }
+
+            let limit: Int = {
+                if let rawLimit = request.arguments?["limit"], let n = Int(rawLimit), n >= 0 { return n }
+                return 0
+            }()
+
+            let report = await LoadBenchmark.run(folderURL: folderURL, limit: limit)
+            let outURL = LoadBenchmark.defaultReportURL()
+            do {
+                try LoadBenchmark.writeReport(report, to: outURL)
+            } catch {
+                return IPCReply(id: request.id, ok: false, message: "failed to write report: \(error)")
+            }
+
+            let s = report.summary
+            let summaryLine = [
+                "files=\(s.totalFiles)",
+                "lyrics=\(s.testedLyricsFiles) avg cold=\(formatMs(s.lyricsColdAvgMs)) warm=\(formatMs(s.lyricsWarmAvgMs))",
+                "artwork=\(s.testedArtworkFiles) avg fetch=\(formatMs(s.artworkFetchAvgMs)) decode cold=\(formatMs(s.artworkDecodeColdAvgMs)) warm=\(formatMs(s.artworkDecodeWarmAvgMs))",
+                "report=\(outURL.path)"
+            ].joined(separator: " | ")
+
+            return IPCReply(
+                id: request.id,
+                ok: true,
+                message: summaryLine,
+                data: [
+                    "reportPath": outURL.path,
+                    "totalFiles": "\(s.totalFiles)",
+                    "testedLyricsFiles": "\(s.testedLyricsFiles)",
+                    "testedArtworkFiles": "\(s.testedArtworkFiles)"
+                ]
+            )
+
+        case .clearLyricsCache:
+            await LyricsService.shared.invalidateAll()
+            // Also clear in-memory timeline attached to the current track to avoid confusing "still showing old lyrics".
+            audioPlayer.lyricsTimeline = nil
+            if let current = audioPlayer.currentFile {
+                audioPlayer.currentFile = AudioFile(url: current.url, metadata: current.metadata, lyricsTimeline: nil)
+            }
+            return IPCReply(id: request.id, ok: true)
+
+        case .clearArtworkCache:
+            ArtworkCache.shared.clear()
+            return IPCReply(id: request.id, ok: true)
+
         case .togglePlayPause:
             audioPlayer.togglePlayPause()
             return IPCReply(id: request.id, ok: true)
@@ -319,6 +376,11 @@ final class IPCServer {
             userInfo: [MusicPlayerIPC.payloadKey: data],
             deliverImmediately: true
         )
+    }
+
+    private func formatMs(_ value: Double?) -> String {
+        guard let value, value.isFinite else { return "-" }
+        return String(format: "%.1fms", value)
     }
 
     @MainActor

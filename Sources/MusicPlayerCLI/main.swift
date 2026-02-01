@@ -21,6 +21,7 @@ private func printUsage() {
         commands:
           ping
           status [--json] [--timeout <seconds>]
+          bench <folder> [--limit <n> | --all] [--timeout <seconds>]
           toggle
           pause
           resume
@@ -392,6 +393,54 @@ private func run() -> ExitCode {
         guard let reply else { eprint("no reply"); return .noReply }
         if reply.ok {
             if let msg = reply.message, !msg.isEmpty { print(msg) }
+            return .ok
+        }
+        eprint(reply.message ?? "failed")
+        return .failure
+    case "bench":
+        var folderPath: String? = nil
+        var limit: Int = 50
+        var timeoutSeconds: TimeInterval = 180.0
+
+        var i = 0
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--limit":
+                guard i + 1 < args.count else { eprint("bench: --limit needs a value"); return .usage }
+                guard let n = Int(args[i + 1]), n >= 0 else { eprint("bench: invalid limit"); return .usage }
+                limit = n
+                i += 2
+            case "--all":
+                limit = 0
+                i += 1
+            case "--timeout":
+                guard i + 1 < args.count else { eprint("bench: --timeout needs a value"); return .usage }
+                guard let t = parseTimeout(args[i + 1]) else { eprint("bench: invalid timeout"); return .usage }
+                timeoutSeconds = t
+                i += 2
+            default:
+                if folderPath == nil {
+                    folderPath = a
+                    i += 1
+                } else {
+                    eprint("bench: unexpected argument \(a)")
+                    return .usage
+                }
+            }
+        }
+
+        guard let folderPath else {
+            eprint("bench: missing folder")
+            return .usage
+        }
+
+        let req = makeRequest(command: .benchmarkLoad, arguments: ["path": folderPath, "limit": "\(limit)"])
+        let reply = sendRequest(req, timeoutSeconds: timeoutSeconds)
+        guard let reply else { eprint("no reply"); return .noReply }
+        if reply.ok {
+            if let msg = reply.message, !msg.isEmpty { print(msg) }
+            if let report = reply.data?["reportPath"] { print(report) }
             return .ok
         }
         eprint(reply.message ?? "failed")
