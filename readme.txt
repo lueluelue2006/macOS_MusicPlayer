@@ -1,8 +1,8 @@
-# 安装与运行（DMG）— 快速开始（v3.0）
+# 安装与运行（DMG）— 快速开始（v3.1）
 
 下载（Releases）：https://github.com/lueluelue2006/macOS_MusicPlayer/releases
 
-1) 下载发布页面中的 DMG 安装包（文件名示例：MusicPlayer-v3.0.dmg）
+1) 下载发布页面中的 DMG 安装包（文件名示例：MusicPlayer-v3.1.dmg）
 2) 双击打开 DMG，将“MusicPlayer.app”**拖入**“应用程序”或任意文件夹
 3) 首次运行故障排除（无法验证开发者或者显示“文件已损坏”）
    - 方法一（推荐）：打开“系统设置 → 隐私与安全性”，在底部“安全性”区域找到被阻止的“MusicPlayer”，点击“仍要打开”。随后再次从“应用程序”启动。
@@ -121,7 +121,7 @@
 
 ## 安装与运行（DMG）
 
-1) 下载发布页面中的 DMG 安装包（文件名示例：MusicPlayer-v3.0.dmg）
+1) 下载发布页面中的 DMG 安装包（文件名示例：MusicPlayer-v3.1.dmg）
 2) 双击打开 DMG，将“MusicPlayer.app”拖入“应用程序”或任意文件夹
 3) 首次运行故障排除（无法验证开发者或者显示“文件已损坏”）
    - 方法一（推荐）：打开“系统设置 → 隐私与安全性”，在底部“安全性”区域找到被阻止的“MusicPlayer”，点击“仍要打开”。随后再次从“应用程序”启动。
@@ -178,8 +178,8 @@
   - 播放列表：[`Swift.PlaylistView`](Sources/MusicPlayer/Views/PlaylistView.swift:19)（搜索、子目录开关、条目操作、元数据编辑窗口）
 
 - 打包发布
-- 构建应用：`./build.sh`（生成 `MusicPlayer.app`，Info.plist 版本号 v3.0）
-- 创建 DMG：`./create_dmg.sh`（输出文件：`MusicPlayer-v3.0.dmg`）
+- 构建应用：`./build.sh`（生成 `MusicPlayer.app`，Info.plist 版本号 v3.1）
+- 创建 DMG：`./create_dmg.sh`（输出文件：`MusicPlayer-v3.1.dmg`）
   - DMG 内容：`MusicPlayer.app`、`Applications` 快捷方式、`README.txt`
 
 - CLI（调试/自动化）

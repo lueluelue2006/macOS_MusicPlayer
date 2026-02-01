@@ -213,7 +213,7 @@ final class PlaylistManager: ObservableObject {
                 group.addTask { [weak self] in
                     guard let self else { return nil }
                     if Task.isCancelled { return nil }
-                    let metadata = await self.loadFreshMetadata(from: url)
+                    let metadata = await self.loadCachedMetadata(from: url)
                     if Task.isCancelled { return nil }
                     return AudioFile(url: url, metadata: metadata)
                 }
@@ -383,6 +383,11 @@ final class PlaylistManager: ObservableObject {
             let newFile = AudioFile(url: file.url, metadata: newMetadata, lyricsTimeline: existingLyrics)
             audioFiles[index] = newFile
             updateFilteredFiles()
+
+            // 同步更新磁盘元数据缓存（仅基本字段；失效由 mtime+size 保证）
+            Task.detached(priority: .utility) {
+                await MetadataCache.shared.storeBasicMetadata(newMetadata, for: file.url)
+            }
         }
     }
     
@@ -391,6 +396,7 @@ final class PlaylistManager: ObservableObject {
         if let index = audioFiles.firstIndex(where: { $0.id == file.id }) {
             // 强制清除所有缓存，重新创建 AVAsset
             let newMetadata = await loadFreshMetadata(from: file.url)
+            await MetadataCache.shared.storeBasicMetadata(newMetadata, for: file.url)
 
             // 创建新的 AudioFile
             let newFile = AudioFile(url: file.url, metadata: newMetadata)
@@ -416,6 +422,7 @@ final class PlaylistManager: ObservableObject {
             for (index, file) in audioFiles.enumerated() {
                 group.addTask {
                     let newMetadata = await self.loadFreshMetadata(from: file.url)
+                    await MetadataCache.shared.storeBasicMetadata(newMetadata, for: file.url)
                     // 不保留歌词时间轴，强制后续重新解析（避免外部 .lrc 或嵌入歌词更新后不生效）
                     let newFile = AudioFile(url: file.url, metadata: newMetadata, lyricsTimeline: nil)
                     return (index, newFile)
@@ -509,6 +516,17 @@ final class PlaylistManager: ObservableObject {
             // 如果异步加载失败，回退到同步方法
             return await AudioMetadata.load(from: asset, includeArtwork: false)
         }
+    }
+
+    /// 加载元数据（带磁盘缓存）：仅缓存标题/艺术家/专辑，并用 (mtime+size) 做失效判断。
+    /// - 目的：重启/清空后重新导入时避免反复读取 AVAsset 元数据（更快、更省 CPU）。
+    func loadCachedMetadata(from url: URL) async -> AudioMetadata {
+        if let cached = await MetadataCache.shared.cachedMetadataIfValid(for: url) {
+            return cached
+        }
+        let fresh = await loadFreshMetadata(from: url)
+        await MetadataCache.shared.storeBasicMetadata(fresh, for: url)
+        return fresh
     }
     
     func removeFile(at index: Int) {
@@ -685,7 +703,9 @@ final class PlaylistManager: ObservableObject {
 
     // 统一的路径键（大小写不敏感，标准化 URL）
     private func pathKey(_ url: URL) -> String {
-        return url.standardizedFileURL.path.lowercased()
+        return url.standardizedFileURL.path
+            .precomposedStringWithCanonicalMapping
+            .lowercased()
     }
     
     // 当选择了新曲目时，尝试预取歌词（供未来调用）
@@ -739,8 +759,18 @@ final class PlaylistManager: ObservableObject {
             self.isRestoringPlaylist = true
         }
 
-        // 使用极轻量的元数据：仅根据文件名构建标题，其他字段使用占位
-        let restoredFiles: [AudioFile] = validURLs.map { url in
+        // 恢复时优先使用磁盘元数据缓存（有失效判断），避免整列表先显示“未知艺术家/未知专辑”。
+        var restoredFiles: [AudioFile] = []
+        restoredFiles.reserveCapacity(validURLs.count)
+        var cacheHits = 0
+        for url in validURLs {
+            if let cached = await MetadataCache.shared.cachedMetadataIfValid(for: url) {
+                restoredFiles.append(AudioFile(url: url, metadata: cached))
+                cacheHits += 1
+                continue
+            }
+
+            // 缓存未命中：使用极轻量的占位元数据（仅根据文件名构建标题）
             let title = url.deletingPathExtension().lastPathComponent
             let metadata = AudioMetadata(
                 title: title.isEmpty ? "未知标题" : title,
@@ -750,11 +780,13 @@ final class PlaylistManager: ObservableObject {
                 genre: nil,
                 artwork: nil
             )
-            return AudioFile(url: url, metadata: metadata)
+            restoredFiles.append(AudioFile(url: url, metadata: metadata))
         }
+        debugLog("恢复播放列表元数据缓存命中: \(cacheHits)/\(validURLs.count)")
 
+        let restoredFilesSnapshot = restoredFiles
         await MainActor.run {
-            self.audioFiles = restoredFiles
+            self.audioFiles = restoredFilesSnapshot
             self.currentIndex = 0
             self.updateFilteredFiles()
             self.resetShuffleQueue()
@@ -786,7 +818,7 @@ final class PlaylistManager: ObservableObject {
                 for url in batch {
                     group.addTask { [weak self] in
                         guard let self else { return (url, AudioMetadata(title: "未知标题", artist: "未知艺术家", album: "未知专辑", year: nil, genre: nil, artwork: nil)) }
-                        let metadata = await self.loadFreshMetadata(from: url)
+                        let metadata = await self.loadCachedMetadata(from: url)
                         return (url, metadata)
                     }
                 }

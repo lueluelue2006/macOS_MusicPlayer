@@ -1,4 +1,4 @@
-# MusicPlayer for macOS (v3.0)
+# MusicPlayer for macOS (v3.1)
 
 一款基于 SwiftUI 与 AVFoundation 的本地音乐播放器：拖拽添加、播放列表、随机/循环、断点续播、音量均衡（响度分析缓存）、歌词显示（内嵌/外置 `.lrc`）、基础元数据编辑（Apple 格式原生写入；其他格式提供 FFmpeg 命令引导）。
 
@@ -11,7 +11,7 @@
 - 构建 App：`./build.sh`（输出：`MusicPlayer.app`）
 - 运行 App：`open MusicPlayer.app`
 - 构建 CLI：`swift build -c release`（输出：`.build/release/musicplayerctl`）
-- 创建 DMG：`./create_dmg.sh`（输出：`MusicPlayer-v3.0.dmg`）
+- 创建 DMG：`./create_dmg.sh`（输出：`MusicPlayer-v3.1.dmg`）
 
 ## CLI（调试/自动化）
 
