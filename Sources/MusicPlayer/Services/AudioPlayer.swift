@@ -321,7 +321,16 @@ final class AudioPlayer: NSObject, ObservableObject {
             do {
                 let newPlayer: AVAudioPlayer = try await AsyncTimeout.withTimeout(20) {
                     try await Task.detached(priority: .userInitiated) {
-                        let p = try AVAudioPlayer(contentsOf: url)
+                        let p: AVAudioPlayer
+                        do {
+                            p = try AVAudioPlayer(contentsOf: url)
+                        } catch {
+                            if let hint = AudioFileSniffer.avAudioPlayerFileTypeHint(at: url) {
+                                p = try AVAudioPlayer(contentsOf: url, fileTypeHint: hint)
+                            } else {
+                                throw error
+                            }
+                        }
                         p.numberOfLoops = isLoop ? -1 : 0
                         p.prepareToPlay()
                         return p
@@ -554,7 +563,16 @@ final class AudioPlayer: NSObject, ObservableObject {
             do {
                 let newPlayer: AVAudioPlayer = try await AsyncTimeout.withTimeout(20) {
                     try await Task.detached(priority: .userInitiated) {
-                        let p = try AVAudioPlayer(contentsOf: url)
+                        let p: AVAudioPlayer
+                        do {
+                            p = try AVAudioPlayer(contentsOf: url)
+                        } catch {
+                            if let hint = AudioFileSniffer.avAudioPlayerFileTypeHint(at: url) {
+                                p = try AVAudioPlayer(contentsOf: url, fileTypeHint: hint)
+                            } else {
+                                throw error
+                            }
+                        }
                         p.numberOfLoops = isLoop ? -1 : 0
                         p.prepareToPlay()
                         return p
@@ -1051,7 +1069,29 @@ extension AudioPlayer {
 	        if cancellationCheck?() == true { return nil }
 	        if Task.isCancelled { return nil }
 	        do {
-	            let audioFile = try AVAudioFile(forReading: url)
+                var audioFile: AVAudioFile? = nil
+                var aliasURL: URL? = nil
+                do {
+                    audioFile = try AVAudioFile(forReading: url)
+                } catch {
+                    if cancellationCheck?() == true { return nil }
+                    if Task.isCancelled { return nil }
+                    // Some files have extensions that don't match the actual container (e.g. `.mp3` name
+                    // but actually an `.m4a`). AVAudioFile relies on the extension in some cases, so we
+                    // create a temporary alias with a best-effort extension inferred from magic bytes.
+                    aliasURL = makeAudioReadAliasURLIfNeeded(for: url)
+                    if let aliasURL {
+                        audioFile = try AVAudioFile(forReading: aliasURL)
+                    } else {
+                        throw error
+                    }
+                }
+                guard let audioFile else { return nil }
+                defer {
+                    if let aliasURL {
+                        try? FileManager.default.removeItem(at: aliasURL)
+                    }
+                }
 	            let format = audioFile.processingFormat
 	            let channelCount = Int(format.channelCount)
 	            guard channelCount > 0 else { return nil }
@@ -1110,6 +1150,40 @@ extension AudioPlayer {
 
         } catch {
             debugLog("分析音频音量失败: \(error)")
+            return nil
+        }
+    }
+
+    /// Create a temporary symlink with a corrected extension if `AVAudioFile(forReading:)` may fail due to
+    /// extension/container mismatch. Returns `nil` if no hint is available or alias creation fails.
+    private func makeAudioReadAliasURLIfNeeded(for url: URL) -> URL? {
+        guard url.isFileURL else { return nil }
+
+        let hint = AudioFileSniffer.avAudioPlayerFileTypeHint(at: url)
+        guard let hint else { return nil }
+
+        let desiredExtension: String? = {
+            if hint == AVFileType.m4a.rawValue { return "m4a" }
+            if hint == AVFileType.wav.rawValue { return "wav" }
+            if hint == AVFileType.aiff.rawValue { return "aiff" }
+            if hint == AVFileType.aifc.rawValue { return "aifc" }
+            if hint == AVFileType.caf.rawValue { return "caf" }
+            if hint == AVFileType.mp3.rawValue { return "mp3" }
+            if hint == "public.aac-audio" { return "aac" }
+            return nil
+        }()
+
+        guard let desiredExtension else { return nil }
+        if url.pathExtension.lowercased() == desiredExtension { return nil }
+
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let alias = tempDir.appendingPathComponent("MusicPlayer-AudioAlias-\(UUID().uuidString).\(desiredExtension)")
+
+        do {
+            try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: url)
+            return alias
+        } catch {
+            debugLog("创建音频别名失败: \(error)")
             return nil
         }
     }

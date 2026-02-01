@@ -11,7 +11,7 @@ cd "$SCRIPT_DIR"
 
 # 配置参数（基于脚本目录）
 APP_NAME="MusicPlayer"
-VERSION="2.4"
+VERSION="3.0"
 DMG_NAME="MusicPlayer-v${VERSION}"
 SOURCE_APP="${SCRIPT_DIR}/MusicPlayer.app"
 DMG_TEMP_DIR="${SCRIPT_DIR}/dmg-temp"

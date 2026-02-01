@@ -3,63 +3,105 @@ import SwiftUI
 struct AppTheme {
     let scheme: ColorScheme
 
-    // MARK: - 极光冷色系（Aurora Borealis）
+    // MARK: - 双模式配色（暗色极光 / 亮色暖霞）
 
-    /// 主强调色 - 冰蓝色
+    /// 主强调色 - 暗色冰蓝 / 亮色玫瑰粉
     var accent: Color {
-        Color(red: 0.35, green: 0.85, blue: 0.92)
+        scheme == .dark
+            ? Color(red: 0.35, green: 0.85, blue: 0.92)   // 冰蓝色
+            : Color(red: 0.93, green: 0.32, blue: 0.52)    // 玫瑰粉
     }
 
-    /// 次要强调色 - 薄荷绿
+    /// 次要强调色 - 暗色薄荷绿 / 亮色暖橙
     var accentSecondary: Color {
-        Color(red: 0.30, green: 0.95, blue: 0.70)
+        scheme == .dark
+            ? Color(red: 0.30, green: 0.95, blue: 0.70)   // 薄荷绿
+            : Color(red: 1.0, green: 0.55, blue: 0.32)    // 暖橙
     }
 
-    /// 第三强调色 - 极光绿
+    /// 第三强调色 - 暗色极光绿 / 亮色梦幻紫
     var accentTertiary: Color {
-        Color(red: 0.55, green: 1.0, blue: 0.85)
+        scheme == .dark
+            ? Color(red: 0.55, green: 1.0, blue: 0.85)    // 极光绿
+            : Color(red: 0.58, green: 0.25, blue: 0.80)    // 梦幻紫
     }
 
-    /// 主渐变 - 极光效果
+    /// 主渐变 - 暗色极光效果 / 亮色暖霞渐变
     var accentGradient: LinearGradient {
-        LinearGradient(
-            colors: [
-                Color(red: 0.30, green: 0.95, blue: 0.70),  // 薄荷绿
-                Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
-                Color(red: 0.45, green: 0.75, blue: 0.95)   // 天青
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
+        if scheme == .dark {
+            return LinearGradient(
+                colors: [
+                    Color(red: 0.30, green: 0.95, blue: 0.70),  // 薄荷绿
+                    Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
+                    Color(red: 0.45, green: 0.75, blue: 0.95)   // 天青
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        } else {
+            return LinearGradient(
+                colors: [
+                    accentTertiary,
+                    accent,
+                    accentSecondary
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        }
     }
 
     /// 活力渐变 - 用于当前播放项等高亮元素
     var vibrantGradient: LinearGradient {
-        LinearGradient(
-            colors: [
-                Color(red: 0.55, green: 1.0, blue: 0.85),   // 极光绿
-                Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
-                Color(red: 0.50, green: 0.70, blue: 0.98)   // 淡紫蓝
-            ],
-            startPoint: .leading,
-            endPoint: .trailing
-        )
+        if scheme == .dark {
+            return LinearGradient(
+                colors: [
+                    Color(red: 0.55, green: 1.0, blue: 0.85),   // 极光绿
+                    Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
+                    Color(red: 0.50, green: 0.70, blue: 0.98)   // 淡紫蓝
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        } else {
+            return LinearGradient(
+                colors: [
+                    Color(red: 0.55, green: 0.22, blue: 0.78),  // 深紫
+                    Color(red: 0.95, green: 0.36, blue: 0.50),  // 玫红
+                    Color(red: 1.0, green: 0.58, blue: 0.28)    // 暖橙
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        }
     }
 
     /// 进度条渐变
     var progressGradient: LinearGradient {
-        LinearGradient(
-            colors: [
-                Color(red: 0.30, green: 0.95, blue: 0.70),  // 薄荷绿
-                Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
-                Color(red: 0.50, green: 0.75, blue: 0.98)   // 极光蓝
-            ],
-            startPoint: .leading,
-            endPoint: .trailing
-        )
+        if scheme == .dark {
+            return LinearGradient(
+                colors: [
+                    Color(red: 0.30, green: 0.95, blue: 0.70),  // 薄荷绿
+                    Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
+                    Color(red: 0.50, green: 0.75, blue: 0.98)   // 极光蓝
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        } else {
+            return LinearGradient(
+                colors: [
+                    Color(red: 0.60, green: 0.28, blue: 0.82),  // 紫色
+                    Color(red: 0.93, green: 0.34, blue: 0.52),  // 品红
+                    Color(red: 1.0, green: 0.55, blue: 0.32)    // 珊瑚
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        }
     }
 
-    // MARK: - 背景系统（深邃夜空）
+    // MARK: - 背景系统
 
     var backgroundGradient: LinearGradient {
         if scheme == .dark {
@@ -75,9 +117,9 @@ struct AppTheme {
         } else {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.95, green: 0.98, blue: 0.99),  // 冰雪白
-                    Color(red: 0.92, green: 0.96, blue: 0.98),  // 薄霜色
-                    Color(red: 0.94, green: 0.97, blue: 0.99)   // 极地白
+                    Color(red: 0.97, green: 0.95, blue: 0.98),  // 淡紫白
+                    Color(red: 0.99, green: 0.96, blue: 0.95),  // 暖桃白
+                    Color(red: 0.98, green: 0.95, blue: 0.93)   // 暖杏白
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
@@ -98,8 +140,8 @@ struct AppTheme {
         } else {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.96, green: 0.99, blue: 1.0),   // 冰晶白
-                    Color(red: 0.94, green: 0.97, blue: 0.99)   // 霜雪色
+                    Color(red: 1.0, green: 0.97, blue: 0.97),   // 暖玫白
+                    Color(red: 0.99, green: 0.96, blue: 0.95)   // 暖桃色
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
@@ -123,7 +165,9 @@ struct AppTheme {
 
     /// 玻璃效果背景色
     var glassSurface: Color {
-        scheme == .dark ? Color(red: 0.15, green: 0.15, blue: 0.22).opacity(0.85) : Color.white.opacity(0.75)
+        scheme == .dark
+            ? Color(red: 0.15, green: 0.15, blue: 0.22).opacity(0.85)
+            : Color(red: 1.0, green: 0.97, blue: 0.96).opacity(0.80)
     }
 
     // MARK: - 边框和阴影
@@ -134,16 +178,16 @@ struct AppTheme {
 
     /// 发光边框色
     var glowStroke: Color {
-        scheme == .dark ? accent.opacity(0.35) : accent.opacity(0.25)
+        scheme == .dark ? accent.opacity(0.35) : accent.opacity(0.30)
     }
 
     var subtleShadow: Color {
-        scheme == .dark ? Color.black.opacity(0.50) : Color.black.opacity(0.12)
+        scheme == .dark ? Color.black.opacity(0.50) : Color.black.opacity(0.10)
     }
 
     /// 强调阴影 - 带颜色的阴影
     var accentShadow: Color {
-        scheme == .dark ? accent.opacity(0.30) : accent.opacity(0.20)
+        scheme == .dark ? accent.opacity(0.30) : accentSecondary.opacity(0.22)
     }
 
     // MARK: - 文字颜色

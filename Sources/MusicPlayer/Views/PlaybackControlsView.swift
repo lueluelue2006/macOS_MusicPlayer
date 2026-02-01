@@ -11,6 +11,7 @@ struct PlaybackControlsView: View {
     @State private var nextHovered = false
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+    private var onAccentPillForeground: Color { colorScheme == .dark ? Color.black.opacity(0.86) : Color.white }
 
     var body: some View {
         VStack(spacing: 24) {
@@ -181,7 +182,7 @@ struct PlaybackControlsView: View {
                             )
                             .shadow(color: theme.subtleShadow, radius: 6, x: 0, y: 2)
                     )
-                    .foregroundColor(audioPlayer.isLooping ? .white : .primary)
+                    .foregroundColor(audioPlayer.isLooping ? onAccentPillForeground : .primary)
                     .animation(.easeInOut(duration: 0.2), value: audioPlayer.isLooping)
                 }
                 .buttonStyle(PlainButtonStyle())
@@ -213,7 +214,7 @@ struct PlaybackControlsView: View {
                                 )
                                 .shadow(color: theme.subtleShadow, radius: 6, x: 0, y: 2)
                         )
-                        .foregroundColor(audioPlayer.isShuffling ? .white : .primary)
+                        .foregroundColor(audioPlayer.isShuffling ? onAccentPillForeground : .primary)
                         .animation(.easeInOut(duration: 0.2), value: audioPlayer.isShuffling)
                     }
                     .buttonStyle(PlainButtonStyle())
@@ -359,7 +360,7 @@ struct AudioControlsView: View {
             HStack {
                 Image(systemName: "waveform.badge.magnifyingglass")
                     .font(.system(size: 14))
-                    .foregroundColor(audioPlayer.isNormalizationEnabled ? theme.accent : theme.mutedText)
+                    .foregroundStyle(audioPlayer.isNormalizationEnabled ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText))
 
                 Text("音量均衡")
                     .font(.system(size: 14, weight: .medium))

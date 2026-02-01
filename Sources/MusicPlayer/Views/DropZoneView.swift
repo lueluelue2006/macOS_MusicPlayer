@@ -44,7 +44,8 @@ struct DropZoneView: View {
 
                     Image(systemName: isDragOver ? "arrow.down.circle.fill" : "music.note.list")
                         .font(.system(size: 36, weight: .light))
-                        .foregroundStyle(isDragOver ? theme.accentGradient : LinearGradient(colors: [theme.mutedText], startPoint: .top, endPoint: .bottom))
+                        .foregroundStyle(theme.accentGradient)
+                        .opacity(isDragOver ? 1.0 : 0.85)
                 }
 
                 Text(isDragOver ? "松开以添加" : "将音乐文件拖放到此处")

@@ -7,17 +7,31 @@ struct MusicPlayerCommands: Commands {
     let audioPlayer: AudioPlayer
     @AppStorage("userNotifyOnDeviceSwitch") private var notifyOnDeviceSwitch: Bool = true
     @AppStorage("userNotifyDeviceSwitchSilent") private var notifyDeviceSwitchSilent: Bool = true
+    @AppStorage("userColorSchemeOverride") private var userColorSchemeOverride: Int = 0
 
     var body: some Commands {
-        // 顶栏菜单：保留“搜索/设置”，便于用户快速找到功能
-        CommandMenu("搜索") {
+        // 将自定义命令收纳到系统默认菜单中，避免顶栏出现过多一级菜单
+        CommandGroup(after: .textEditing) {
+            Divider()
             Button("搜索播放列表") {
                 NotificationCenter.default.post(name: .focusSearchField, object: nil)
             }
             .keyboardShortcut("f", modifiers: [.command])
         }
 
-        CommandMenu("设置") {
+        CommandGroup(after: .appSettings) {
+            Divider()
+            Menu("外观") {
+                Picker("外观", selection: $userColorSchemeOverride) {
+                    Text("跟随系统").tag(UserColorSchemeOverride.system.rawValue)
+                    Text("亮色").tag(UserColorSchemeOverride.light.rawValue)
+                    Text("暗色").tag(UserColorSchemeOverride.dark.rawValue)
+                }
+                .pickerStyle(.inline)
+            }
+
+            Divider()
+
             Button("音量均衡分析…") {
                 NotificationCenter.default.post(name: .showVolumeNormalizationAnalysis, object: nil)
             }
@@ -106,16 +120,16 @@ struct MusicPlayerCommands: Commands {
                                 switch settings.authorizationStatus {
                                 case .authorized, .provisional, .ephemeral:
                                     alert.messageText = "通知权限已启用"
-                                    alert.informativeText = "设备切换时可在右上角显示通知。您可在‘设置 → 通知’控制是否发送。"
+                                    alert.informativeText = "设备切换时可在右上角显示通知。您可在“通知”菜单里开关是否发送。"
                                 case .denied:
                                     alert.messageText = "通知权限未启用"
-                                    alert.informativeText = "请在‘系统设置 → 通知 → 音乐播放器’中开启通知权限，或点击‘打开系统通知设置…’。"
+                                    alert.informativeText = "请在“系统设置 → 通知 → 音乐播放器”中开启通知权限，或点击“打开系统通知设置…”。"
                                 case .notDetermined:
                                     alert.messageText = "已发起授权请求"
-                                    alert.informativeText = "若未出现系统弹窗，请前往‘系统设置 → 通知 → 音乐播放器’手动开启。"
+                                    alert.informativeText = "若未出现系统弹窗，请前往“系统设置 → 通知 → 音乐播放器”手动开启。"
                                 @unknown default:
                                     alert.messageText = "通知权限状态未知"
-                                    alert.informativeText = "可在‘系统设置 → 通知 → 音乐播放器’中检查设置。"
+                                    alert.informativeText = "可在“系统设置 → 通知 → 音乐播放器”中检查设置。"
                                 }
                                 alert.addButton(withTitle: "确定")
                                 alert.runModal()

@@ -5,4 +5,8 @@ MusicPlayer.app/
 .home/
 EmbeddedOutput/
 dmg-contents/
+dmg-temp/
 .vscode/
+.swiftpm/
+.codex/
+*.dmg

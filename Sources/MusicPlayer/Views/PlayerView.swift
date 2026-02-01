@@ -12,7 +12,7 @@ struct PlayerView: View {
         ScrollView {
             VStack(spacing: 20) {
                 // 文件选择按钮
-                FileSelectionView { urls in
+                FileSelectionView(showFlowingBorder: playlistManager.audioFiles.isEmpty) { urls in
                     playlistManager.enqueueAddFiles(urls)
                 }
                 .padding(.horizontal)
@@ -117,6 +117,7 @@ struct PlayerView: View {
 }
 
 struct FileSelectionView: View {
+    let showFlowingBorder: Bool
     let onFilesSelected: ([URL]) -> Void
     @State private var hovering = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -147,16 +148,20 @@ struct FileSelectionView: View {
                     .stroke(Color.white.opacity(0.14), lineWidth: 1)
             )
             .overlay(
-                FlowingBorder(
-                    cornerRadius: 16,
-                    lineWidth: hovering ? 2.4 : 2.0,
-                    base: theme.accent,
-                    secondary: theme.accentSecondary,
-                    enabled: !reduceMotion
-                )
-                .opacity(hovering ? 1.0 : 0.92)
-                .blendMode(.plusLighter)
-                .allowsHitTesting(false)
+                Group {
+                    if showFlowingBorder {
+                        FlowingBorder(
+                            cornerRadius: 16,
+                            lineWidth: hovering ? 2.4 : 2.0,
+                            base: theme.accent,
+                            secondary: theme.accentSecondary,
+                            enabled: !reduceMotion
+                        )
+                        .opacity(hovering ? 1.0 : 0.92)
+                        .blendMode(.plusLighter)
+                        .allowsHitTesting(false)
+                    }
+                }
             )
             .shadow(color: theme.subtleShadow, radius: 10, x: 0, y: 5)
             .scaleEffect(hovering ? 1.02 : 1.0)
@@ -180,23 +185,37 @@ struct FileSelectionView: View {
     }
 }
 
-private struct FlowingBorder: View {
+struct FlowingBorder: View {
     let cornerRadius: CGFloat
     let lineWidth: CGFloat
     let base: Color
     let secondary: Color
     let enabled: Bool
-
-    @State private var angle: Double = 0
+    // One full cycle duration. Larger = slower flow.
+    var period: TimeInterval = 10.4
+    var phaseOffset: Double = 0
 
     var body: some View {
-        RoundedRectangle(cornerRadius: cornerRadius)
-            .strokeBorder(gradient, lineWidth: lineWidth)
-            .onAppear { start() }
-            .onChange(of: enabled) { _ in start() }
+        if enabled {
+            TimelineView(.animation) { timeline in
+                let angle = rotationAngle(for: timeline.date)
+                RoundedRectangle(cornerRadius: cornerRadius)
+                    .strokeBorder(gradient(angle: angle), lineWidth: lineWidth)
+            }
+        } else {
+            RoundedRectangle(cornerRadius: cornerRadius)
+                .strokeBorder(gradient(angle: 0), lineWidth: lineWidth)
+        }
     }
 
-    private var gradient: AngularGradient {
+    private func rotationAngle(for date: Date) -> Double {
+        guard period > 0 else { return 0 }
+        let t = date.timeIntervalSinceReferenceDate
+        let phase = (t / period + phaseOffset).truncatingRemainder(dividingBy: 1)
+        return phase * 360
+    }
+
+    private func gradient(angle: Double) -> AngularGradient {
         let glowA = base.opacity(0.95)
         let glowB = secondary.opacity(0.95)
 
@@ -215,17 +234,6 @@ private struct FlowingBorder: View {
             endAngle: .degrees(angle + 360)
         )
     }
-
-    private func start() {
-        guard enabled else {
-            angle = 0
-            return
-        }
-        angle = 0
-        withAnimation(.linear(duration: 2.6).repeatForever(autoreverses: false)) {
-            angle = 360
-        }
-    }
 }
 
 struct CurrentTrackView: View {
@@ -234,6 +242,7 @@ struct CurrentTrackView: View {
     @State private var showRatePicker: Bool = false
     @State private var glowRotation: Double = 0
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
     var body: some View {
@@ -274,6 +283,19 @@ struct CurrentTrackView: View {
                 }
                 .frame(width: coverContainerSize, height: coverContainerSize)
                 .clipShape(RoundedRectangle(cornerRadius: 24))
+                .overlay(
+                    FlowingBorder(
+                        cornerRadius: 24,
+                        lineWidth: 2.0,
+                        base: theme.accent,
+                        secondary: theme.accentSecondary,
+                        enabled: audioPlayer.isPlaying && !reduceMotion
+                    )
+                    .opacity(audioPlayer.isPlaying ? 0.9 : 0)
+                    .blendMode(.plusLighter)
+                    .allowsHitTesting(false)
+                    .animation(.easeInOut(duration: 0.3), value: audioPlayer.isPlaying)
+                )
                 .onAppear {
                     if audioPlayer.isPlaying {
                         startGlowAnimation()
@@ -502,7 +524,7 @@ struct CurrentTrackView: View {
 
     private func startGlowAnimation() {
         glowRotation = 0
-        withAnimation(.linear(duration: 8).repeatForever(autoreverses: false)) {
+        withAnimation(.linear(duration: 16).repeatForever(autoreverses: false)) {
             glowRotation = 360
         }
     }

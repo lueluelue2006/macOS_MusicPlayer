@@ -113,7 +113,7 @@ struct MusicPlayerApp: App {
     var body: some Scene {
         // 使用单窗口场景，避免因外部“打开文件”事件在 macOS 上产生重复主窗口
         Window("音乐播放器", id: "main") {
-            ContentView(audioPlayer: audioPlayer, playlistManager: playlistManager)
+            RootView(audioPlayer: audioPlayer, playlistManager: playlistManager)
                 .frame(minWidth: 600, minHeight: 400)
         }
         .windowResizability(.contentSize)

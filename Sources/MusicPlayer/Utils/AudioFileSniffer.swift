@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 
 enum AudioFileSniffer {
     /// Returns a user-facing reason if the file is very likely not an audio file
@@ -23,6 +24,60 @@ enum AudioFileSniffer {
         // Conservative: only flag obvious “text masquerading as audio”.
         if lowered.hasPrefix("{") || lowered.hasPrefix("[") {
             return "不是音频文件（疑似文本/JSON 内容）：\(url.lastPathComponent)"
+        }
+
+        return nil
+    }
+
+    /// Best-effort file type hint for `AVAudioPlayer(contentsOf:fileTypeHint:)`, based on magic bytes.
+    /// This helps with files whose extension doesn't match the actual container (e.g. a `.mp3` file name
+    /// that is actually an `.m4a` AAC file).
+    static func avAudioPlayerFileTypeHint(at url: URL) -> String? {
+        guard url.isFileURL else { return nil }
+
+        let header = readHeader(url: url, length: 64)
+        guard header.count >= 12 else { return nil }
+
+        func ascii(_ start: Int, _ length: Int) -> String? {
+            guard header.count >= start + length else { return nil }
+            return String(bytes: header[start..<(start + length)], encoding: .ascii)
+        }
+
+        // MP4/M4A (....ftyp)
+        if ascii(4, 4) == "ftyp" {
+            return AVFileType.m4a.rawValue
+        }
+
+        // WAV (RIFF....WAVE)
+        if ascii(0, 4) == "RIFF", ascii(8, 4) == "WAVE" {
+            return AVFileType.wav.rawValue
+        }
+
+        // AIFF/AIFC (FORM....AIFF/AIFC)
+        if ascii(0, 4) == "FORM" {
+            let formType = ascii(8, 4)
+            if formType == "AIFF" { return AVFileType.aiff.rawValue }
+            if formType == "AIFC" { return AVFileType.aifc.rawValue }
+        }
+
+        // CAF (caff)
+        if ascii(0, 4) == "caff" {
+            return AVFileType.caf.rawValue
+        }
+
+        // MP3 with ID3v2 tag
+        if ascii(0, 3) == "ID3" {
+            return AVFileType.mp3.rawValue
+        }
+
+        // MP3 / AAC ADTS frame sync (0xFFFx)
+        if header[0] == 0xFF, (header[1] & 0xE0) == 0xE0 {
+            // We can't reliably distinguish MP3 vs AAC ADTS from just the sync word.
+            // If the extension says AAC, hint AAC; otherwise prefer MP3 as the common case.
+            if url.pathExtension.lowercased() == "aac" {
+                return "public.aac-audio"
+            }
+            return AVFileType.mp3.rawValue
         }
 
         return nil
@@ -100,4 +155,3 @@ private extension Data {
         return self.subdata(in: count..<self.count)
     }
 }
-

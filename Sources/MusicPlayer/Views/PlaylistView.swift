@@ -36,10 +36,15 @@ struct PlaylistView: View {
         VStack(alignment: .leading, spacing: 20) {
             // 标题和操作按钮
             HStack {
-                Text("🎶 播放列表")
-                    .font(.title2)
-                    .fontWeight(.bold)
-                    .foregroundColor(.primary)
+                HStack(spacing: 10) {
+                    Image(systemName: "music.note.list")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(theme.accentGradient)
+                    Text("播放列表")
+                        .font(.title2)
+                        .fontWeight(.bold)
+                        .foregroundColor(.primary)
+                }
                 
                 Spacer()
                 
@@ -91,10 +96,10 @@ struct PlaylistView: View {
                                 .fill(theme.mutedSurface)
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 12)
-                                        .stroke(theme.accent.opacity(0.45), lineWidth: 1)
+                                        .stroke(theme.accentGradient, lineWidth: 1)
                                 )
                         )
-                        .foregroundColor(theme.accent)
+                        .foregroundStyle(theme.accentGradient)
                     }
                     .buttonStyle(PlainButtonStyle())
                     .help("完全刷新：重载元数据、歌词、封面并清空缓存")
@@ -303,11 +308,7 @@ struct SearchBarView: View {
     let onSearchChanged: (String) -> Void
     @FocusState private var isFocused: Bool
     @Environment(\.colorScheme) private var colorScheme
-    @State private var isBreathing = false
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
-    private var breathingAnimation: Animation {
-        .easeInOut(duration: 1.4).repeatForever(autoreverses: true)
-    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -324,11 +325,6 @@ struct SearchBarView: View {
                 }
                 .onChange(of: isFocused) { focused in
                     AppFocusState.shared.isSearchFocused = focused
-                    if focused {
-                        startBreathing()
-                    } else {
-                        isBreathing = false
-                    }
                 }
             
             if !searchText.isEmpty {
@@ -354,10 +350,7 @@ struct SearchBarView: View {
                 if isFocused {
                     RoundedRectangle(cornerRadius: 12)
                         .stroke(theme.accent.opacity(0.45), lineWidth: 2)
-                        .scaleEffect(isBreathing ? 1.04 : 0.98)
-                        .opacity(isBreathing ? 0.82 : 0.35)
                         .shadow(color: theme.accent.opacity(0.35), radius: 8)
-                        .animation(breathingAnimation, value: isBreathing)
                 }
             }
             .shadow(color: theme.subtleShadow, radius: 6, x: 0, y: 2)
@@ -369,21 +362,14 @@ struct SearchBarView: View {
         .onReceive(NotificationCenter.default.publisher(for: .blurSearchField)) { _ in
             isFocused = false
             AppFocusState.shared.isSearchFocused = false
-            isBreathing = false
         }
         .onAppear {
             // 防止窗口初次展示时自动获得焦点
             DispatchQueue.main.async {
                 isFocused = false
                 AppFocusState.shared.isSearchFocused = false
-                isBreathing = false
             }
         }
-    }
-
-    private func startBreathing() {
-        guard !isBreathing else { return }
-        isBreathing = true
     }
 }
 
@@ -397,9 +383,18 @@ struct PlaylistItemView: View {
     let deleteAction: (AudioFile) -> Void
     let editAction: (AudioFile) -> Void
     @State private var isHovered = false
-    @State private var iconPulse = false
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+    private var iconStyle: AnyShapeStyle {
+        if isCurrentTrack { return AnyShapeStyle(theme.accentGradient) }
+        if unplayableReason != nil { return AnyShapeStyle(Color.orange) }
+        return AnyShapeStyle(Color.primary)
+    }
+    private var titleStyle: AnyShapeStyle {
+        if isCurrentTrack { return AnyShapeStyle(theme.accentGradient) }
+        if unplayableReason != nil { return AnyShapeStyle(Color.secondary) }
+        return AnyShapeStyle(Color.primary)
+    }
 
     var body: some View {
         HStack(spacing: 14) {
@@ -414,8 +409,8 @@ struct PlaylistItemView: View {
                                 .fill(theme.accent.opacity(0.2))
                                 .frame(width: 36, height: 36)
                                 .blur(radius: 4)
-                                .scaleEffect(iconPulse ? 1.2 : 1.0)
-                                .opacity(iconPulse ? 0.3 : 0.6)
+                                .scaleEffect(1.2)
+                                .opacity(0.6)
                         }
 
                         let iconName: String = {
@@ -424,7 +419,7 @@ struct PlaylistItemView: View {
                             return "play.circle.fill"
                         }()
                         Image(systemName: iconName)
-                            .foregroundStyle(isCurrentTrack ? theme.accentGradient : LinearGradient(colors: [unplayableReason != nil ? .orange : .primary], startPoint: .top, endPoint: .bottom))
+                            .foregroundStyle(iconStyle)
                             .font(.system(size: 22))
                             .frame(width: 28, height: 28)
                             .help(unplayableReason.map { "不可播放：\($0)" } ?? "")
@@ -437,20 +432,22 @@ struct PlaylistItemView: View {
                             Text(highlightedText(file.metadata.title, searchText: searchText))
                                 .font(.system(size: 14, weight: .semibold))
                                 .lineLimit(1)
-                                .foregroundStyle(isCurrentTrack ? theme.accentGradient : LinearGradient(colors: [unplayableReason != nil ? .secondary : .primary], startPoint: .top, endPoint: .bottom))
+                                .foregroundStyle(titleStyle)
                                 .layoutPriority(1)
 
-                            let badgeColor: Color = isVolumeAnalyzed ? theme.accent : theme.mutedText
+                            let badgeTextStyle: AnyShapeStyle = isVolumeAnalyzed ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText)
+                            let badgeStrokeStyle: AnyShapeStyle = isVolumeAnalyzed ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText.opacity(0.45))
                             Text("均")
                                 .font(.system(size: 10, weight: .bold, design: .rounded))
-                                .foregroundStyle(badgeColor)
+                                .foregroundStyle(badgeTextStyle)
                                 .frame(width: 18, height: 18)
                                 .background(
                                     Circle()
                                         .fill(isVolumeAnalyzed ? theme.accent.opacity(theme.scheme == .dark ? 0.20 : 0.15) : Color.clear)
                                         .overlay(
                                             Circle()
-                                                .stroke(badgeColor.opacity(isVolumeAnalyzed ? 0.8 : 0.45), lineWidth: 1)
+                                                .stroke(badgeStrokeStyle, lineWidth: 1)
+                                                .opacity(isVolumeAnalyzed ? 0.85 : 1)
                                         )
                                 )
                                 .help(isVolumeAnalyzed ? "音量均衡：已分析" : "音量均衡：未分析")
@@ -473,6 +470,9 @@ struct PlaylistItemView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(PlainButtonStyle())
+            // 让按钮的可点击区域覆盖整行（含顶部/底部留白），避免只“选中”但点不到播放
+            .padding(.leading, 16)
+            .padding(.vertical, 14)
             .frame(maxWidth: .infinity, alignment: .leading)
 
             // 操作按钮组
@@ -505,21 +505,25 @@ struct PlaylistItemView: View {
                 }
                 .buttonStyle(PlainButtonStyle())
             }
+            .padding(.trailing, 16)
+            .padding(.vertical, 14)
             .opacity(isHovered ? 1 : 0.6)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
         .background(
-            ZStack {
+            Group {
                 // 当前播放项的发光底层
                 if isCurrentTrack {
                     RoundedRectangle(cornerRadius: 14)
                         .fill(theme.rowBackground(isActive: true))
                         .shadow(color: theme.accentShadow, radius: 12, x: 0, y: 4)
-                } else {
+                } else if isHovered {
                     RoundedRectangle(cornerRadius: 14)
-                        .fill(isHovered ? theme.elevatedSurface : theme.surface.opacity(0.6))
-                        .shadow(color: theme.subtleShadow, radius: isHovered ? 8 : 4, x: 0, y: 2)
+                        .fill(theme.elevatedSurface)
+                        .shadow(color: theme.subtleShadow, radius: 8, x: 0, y: 2)
+                } else {
+                    // 默认态不加阴影，提升滚动性能
+                    RoundedRectangle(cornerRadius: 14)
+                        .fill(theme.surface.opacity(0.6))
                 }
             }
         )
@@ -530,29 +534,8 @@ struct PlaylistItemView: View {
                     lineWidth: isCurrentTrack ? 1.5 : 1
                 )
         )
-        .scaleEffect(isHovered ? 1.015 : 1.0, anchor: .center)
-        .animation(AppTheme.quickSpring, value: isHovered)
-        .animation(AppTheme.smoothTransition, value: isCurrentTrack)
         .onHover { hovering in
             isHovered = hovering
-        }
-        .onAppear {
-            if isCurrentTrack {
-                startIconPulse()
-            }
-        }
-        .onChange(of: isCurrentTrack) { current in
-            if current {
-                startIconPulse()
-            } else {
-                iconPulse = false
-            }
-        }
-    }
-
-    private func startIconPulse() {
-        withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
-            iconPulse = true
         }
     }
     
@@ -628,7 +611,8 @@ struct EmptyPlaylistView: View {
                 
                 Image(systemName: "music.note.list")
                     .font(.system(size: 48))
-                    .foregroundColor(theme.mutedText)
+                    .foregroundStyle(theme.accentGradient)
+                    .opacity(0.9)
             }
             
             VStack(spacing: 12) {

@@ -17,6 +17,7 @@ final class PlaylistManager: ObservableObject {
     @Published var isRestoringPlaylist = false  // 标记是否正在恢复播放列表
     private var didPerformInitialRestore: Bool = false
     private var initialRestoreTask: Task<Void, Never>?
+    private var restoredMetadataHydrationTask: Task<Void, Never>?
     
     // MARK: - 添加/扫描进度（可取消）
     @Published private(set) var isAddingFiles: Bool = false
@@ -60,7 +61,7 @@ final class PlaylistManager: ObservableObject {
         initialRestoreTask?.cancel()
         initialRestoreTask = Task.detached(priority: .userInitiated) { [weak self, weak audioPlayer] in
             guard let self, let audioPlayer else { return }
-            await self.loadSavedPlaylist()
+            await self.loadSavedPlaylist(audioPlayer: audioPlayer)
             await MainActor.run {
                 // 若本次启动是通过 Finder/Dock 外部文件打开，则不恢复上次播放
                 if audioPlayer.consumeSkipRestoreThisLaunch() {
@@ -710,7 +711,7 @@ final class PlaylistManager: ObservableObject {
         }
     }
     
-    func loadSavedPlaylist() async {
+    func loadSavedPlaylist(audioPlayer: AudioPlayer? = nil) async {
         guard let saved = loadSavedPlaylistSnapshot() else {
             debugLog("没有找到保存的播放列表")
             return
@@ -728,6 +729,10 @@ final class PlaylistManager: ObservableObject {
         }
 
         debugLog("轻量恢复保存的播放列表: \(validURLs.count) 个文件")
+
+        // 取消上一轮“恢复后补全元数据”的后台任务（若存在）
+        restoredMetadataHydrationTask?.cancel()
+        restoredMetadataHydrationTask = nil
 
         // 标记正在恢复播放列表，避免触发“首次添加自动播放”等逻辑（必须在主线程发布）
         await MainActor.run {
@@ -758,6 +763,61 @@ final class PlaylistManager: ObservableObject {
         // 恢复完成；后续由 AudioPlayer.loadLastPlayedFile 按需定位到具体曲目
         await MainActor.run {
             self.isRestoringPlaylist = false
+        }
+
+        // 在后台逐步补全真实元数据（避免重启后整列表都显示“未知艺术家/未知专辑”）。
+        restoredMetadataHydrationTask = Task.detached(priority: .utility) { [weak self, weak audioPlayer] in
+            guard let self else { return }
+            await self.hydrateRestoredMetadata(urls: validURLs, audioPlayer: audioPlayer)
+        }
+    }
+
+    private func hydrateRestoredMetadata(urls: [URL], audioPlayer: AudioPlayer?) async {
+        // 分批并发加载，避免一次性创建过多 task，同时让 UI 更快看到更新
+        let batchSize = 8
+        var start = 0
+        while start < urls.count {
+            if Task.isCancelled { return }
+
+            let end = min(start + batchSize, urls.count)
+            let batch = Array(urls[start..<end])
+
+            let results: [(URL, AudioMetadata)] = await withTaskGroup(of: (URL, AudioMetadata).self) { group in
+                for url in batch {
+                    group.addTask { [weak self] in
+                        guard let self else { return (url, AudioMetadata(title: "未知标题", artist: "未知艺术家", album: "未知专辑", year: nil, genre: nil, artwork: nil)) }
+                        let metadata = await self.loadFreshMetadata(from: url)
+                        return (url, metadata)
+                    }
+                }
+
+                var collected: [(URL, AudioMetadata)] = []
+                collected.reserveCapacity(batch.count)
+                for await item in group {
+                    collected.append(item)
+                }
+                return collected
+            }
+
+            if Task.isCancelled { return }
+
+            await MainActor.run { [weak self, weak audioPlayer] in
+                guard let self else { return }
+                for (url, metadata) in results {
+                    guard let index = self.audioFiles.firstIndex(where: { self.pathKey($0.url) == self.pathKey(url) }) else {
+                        continue
+                    }
+                    let existing = self.audioFiles[index]
+                    self.audioFiles[index] = AudioFile(url: existing.url, metadata: metadata, lyricsTimeline: existing.lyricsTimeline)
+
+                    if let ap = audioPlayer, ap.currentFile?.url.path == existing.url.path {
+                        ap.currentFile = AudioFile(url: existing.url, metadata: metadata, lyricsTimeline: ap.currentFile?.lyricsTimeline)
+                    }
+                }
+                self.updateFilteredFiles()
+            }
+
+            start = end
         }
     }
 

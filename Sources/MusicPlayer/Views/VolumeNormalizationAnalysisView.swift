@@ -181,7 +181,7 @@ struct VolumeNormalizationAnalysisView: View {
                     let cached = audioPlayer.hasVolumeNormalizationCache(for: file.url)
                     HStack(spacing: 10) {
                         Image(systemName: cached ? "checkmark.seal.fill" : "circle")
-                            .foregroundStyle(cached ? theme.accent : theme.mutedText)
+                            .foregroundStyle(cached ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText))
                         VStack(alignment: .leading, spacing: 2) {
                             Text(file.metadata.title)
                                 .lineLimit(1)
@@ -193,7 +193,7 @@ struct VolumeNormalizationAnalysisView: View {
                         Spacer()
                         Text(cached ? "已分析" : "未分析")
                             .font(.caption)
-                            .foregroundStyle(cached ? theme.accent : theme.mutedText)
+                            .foregroundStyle(cached ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText))
                     }
                     .padding(.vertical, 4)
                 }
@@ -203,6 +203,7 @@ struct VolumeNormalizationAnalysisView: View {
         }
         .padding(.bottom, 14)
         .frame(minWidth: 720, minHeight: 520)
+        .tint(theme.accent)
         .background(theme.backgroundGradient)
     }
 }
