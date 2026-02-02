@@ -39,7 +39,7 @@
 ## Bundle ID（UserDefaults 域）
 
 - `io.github.lueluelue2006.macosmusicplayer`
-- 说明：用户偏好（`UserDefaults/@AppStorage`）使用 Bundle ID 作为存储域；从旧版本（`com.musicplayer.macos`）升级会在首次启动时自动迁移一次设置。
+- 说明：用户偏好（`UserDefaults/@AppStorage`）使用 Bundle ID 作为存储域。
 
 ## License
 
