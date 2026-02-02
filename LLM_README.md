@@ -3,7 +3,7 @@ audience: LLM / coding agents
 purpose: Help an AI agent make safe, correct changes with minimal context.
 ---
 
-# LLM guide (macOS_MusicPlayer)
+# LLM README (macOS_MusicPlayer)
 
 This file is intended for AI coding assistants (Codex/Cursor/Claude/etc.). It is not end‑user documentation.
 
@@ -66,4 +66,3 @@ Common commands:
 - Do not retain full-resolution artwork `Data` across the playlist; only keep a small thumbnail for the currently playing track.
 - Avoid unbounded caches (lyrics/artwork/analysis results) in memory.
 - Avoid copying large Sets/Arrays on every render; prefer incremental checks.
-
