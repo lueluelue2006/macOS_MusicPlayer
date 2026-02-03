@@ -12,7 +12,9 @@ struct ContentView: View {
     @State private var alertMessage = ""
     @State private var showVolumeNormalizationAnalysis = false
     // 播放失败提示（非阻塞）
-    @State private var toastMessage: String = ""
+    @State private var toastTitle: String = ""
+    @State private var toastSubtitle: String? = nil
+    @State private var toastKind: ToastKind = .info
     @State private var showToast: Bool = false
     @State private var toastTask: Task<Void, Never>?
 
@@ -103,28 +105,18 @@ struct ContentView: View {
         }
         .overlay(alignment: .topTrailing) {
             if showToast {
-                Text(toastMessage)
-                    .font(.callout)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(
-                        RoundedRectangle(cornerRadius: 12)
-                            .fill(theme.elevatedSurface.opacity(0.92))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(theme.accent.opacity(0.25), lineWidth: 1)
-                            )
-                    )
-                    .shadow(color: theme.subtleShadow, radius: 10, x: 0, y: 4)
-                    .padding(.top, 12)
-                    .padding(.trailing, 12)
-                    .onTapGesture {
-                        if let url = toastTapURL {
-                            openURL(url)
-                        }
-                    }
-                    .help(toastTapURL == nil ? "" : "点击打开 GitHub Releases")
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                ToastBanner(
+                    title: toastTitle,
+                    subtitle: toastSubtitle,
+                    kind: toastKind,
+                    onTap: toastTapURL == nil ? nil : {
+                        if let url = toastTapURL { openURL(url) }
+                    },
+                    onClose: { dismissToast() }
+                )
+                .padding(.top, 12)
+                .padding(.trailing, 12)
+                .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
         // 扬声器播放确认弹窗（仅在“耳机→扬声器”后，用户显式点击开始时出现一次）
@@ -165,7 +157,7 @@ struct ContentView: View {
                     audioPlayer.play(file, autostart: false, bypassConfirm: true)
                     audioPlayer.seek(to: time)
                 } else {
-                    showToastMessage("未能在播放列表中找到上次播放文件")
+                    showToastMessage("未能在播放列表中找到上次播放文件", kind: .warning)
                 }
             }
         }
@@ -191,7 +183,7 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .audioPlayerDidFailToPlay)) { notification in
             let raw = (notification.userInfo?["message"] as? String) ?? "播放失败"
             let firstLine = raw.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true).first.map(String.init) ?? raw
-            showToastMessage(firstLine)
+            showToastMessage(firstLine, kind: .error)
         }
     }
 
@@ -230,15 +222,21 @@ struct ContentView: View {
                 updateCheckTask = nil
                 switch outcome {
                 case .updateAvailable(let info):
-                    showToastMessage("发现新版本 \(info.latestVersion) · 点击打开下载页", duration: 3.0, tapURL: info.releaseURL)
+                    showToastMessage(
+                        "发现新版本 \(info.latestVersion)",
+                        subtitle: "点击打开 GitHub Releases 下载",
+                        kind: .update,
+                        duration: 10.0,
+                        tapURL: info.releaseURL
+                    )
                 case .upToDate(let current, let latest, let url):
                     if latest == current {
-                        showToastMessage("已是最新版本 \(current)", duration: 2.0, tapURL: url)
+                        showToastMessage("已是最新版本 \(current)", kind: .success, duration: 2.0, tapURL: url)
                     } else {
-                        showToastMessage("已是最新版本 \(current)（线上 \(latest)）", duration: 2.0, tapURL: url)
+                        showToastMessage("已是最新版本 \(current)", subtitle: "线上最新：\(latest)", kind: .success, duration: 2.0, tapURL: url)
                     }
                 case .failed(let message, let url):
-                    showToastMessage(message, duration: 2.0, tapURL: url)
+                    showToastMessage(message, subtitle: "点击打开 GitHub Releases", kind: .warning, duration: 2.0, tapURL: url)
                 }
             }
         }
@@ -268,9 +266,17 @@ struct ContentView: View {
     }
 
     @MainActor
-    private func showToastMessage(_ message: String, duration: TimeInterval = 2.8, tapURL: URL? = nil) {
+    private func showToastMessage(
+        _ message: String,
+        subtitle: String? = nil,
+        kind: ToastKind = .info,
+        duration: TimeInterval = 2.8,
+        tapURL: URL? = nil
+    ) {
         toastTask?.cancel()
-        toastMessage = message
+        toastTitle = message
+        toastSubtitle = subtitle
+        toastKind = kind
         toastTapURL = tapURL
         withAnimation(.easeInOut(duration: 0.2)) {
             showToast = true
@@ -278,10 +284,123 @@ struct ContentView: View {
         toastTask = Task {
             try? await Task.sleep(nanoseconds: UInt64(max(0, duration) * 1_000_000_000))
             await MainActor.run {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    showToast = false
-                }
+                dismissToast()
             }
         }
+    }
+
+    @MainActor
+    private func dismissToast() {
+        toastTask?.cancel()
+        toastTask = nil
+        toastTapURL = nil
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showToast = false
+        }
+    }
+}
+
+private enum ToastKind: Sendable {
+    case info
+    case success
+    case warning
+    case error
+    case update
+}
+
+private struct ToastBanner: View {
+    let title: String
+    let subtitle: String?
+    let kind: ToastKind
+    let onTap: (() -> Void)?
+    let onClose: () -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+    private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            if let onTap {
+                Button(action: onTap) {
+                    bannerContent
+                }
+                .buttonStyle(PlainButtonStyle())
+                .help("点击打开 GitHub Releases")
+            } else {
+                bannerContent
+            }
+
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(theme.mutedText)
+                    .padding(10)
+            }
+            .buttonStyle(PlainButtonStyle())
+            .help("关闭")
+        }
+        .background(backgroundShape)
+        .shadow(color: theme.subtleShadow, radius: 14, x: 0, y: 8)
+    }
+
+    private var bannerContent: some View {
+        HStack(alignment: .top, spacing: 12) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(indicatorStyle)
+                .frame(width: 4)
+                .padding(.vertical, 2)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.primary)
+                    .lineLimit(2)
+
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.system(size: 12))
+                        .foregroundColor(theme.mutedText)
+                        .lineLimit(2)
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 30)
+        .padding(.vertical, 12)
+        .frame(minWidth: 320, maxWidth: 420, alignment: .leading)
+    }
+
+    private var indicatorStyle: AnyShapeStyle {
+        switch kind {
+        case .update:
+            return AnyShapeStyle(theme.accentGradient)
+        case .success:
+            return AnyShapeStyle(theme.accent.opacity(0.9))
+        case .error:
+            return AnyShapeStyle(Color.red.opacity(0.85))
+        case .warning:
+            return AnyShapeStyle(Color.orange.opacity(0.85))
+        case .info:
+            return AnyShapeStyle(theme.accentSecondary.opacity(0.85))
+        }
+    }
+
+    private var backgroundShape: some View {
+        RoundedRectangle(cornerRadius: 14)
+            .fill(.ultraThinMaterial)
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(theme.glassSurface)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(borderColor, lineWidth: 1)
+            )
+    }
+
+    private var borderColor: Color {
+        colorScheme == .dark ? Color.white.opacity(0.16) : Color.black.opacity(0.10)
     }
 }
