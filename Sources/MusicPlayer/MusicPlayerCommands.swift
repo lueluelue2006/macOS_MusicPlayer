@@ -56,8 +56,8 @@ struct MusicPlayerCommands: Commands {
                 Button("清空封面缓存") {
                     Task { @MainActor in
                         let confirmed = DestructiveConfirmation.confirm(
-                            title: "清空封面缓存？",
-                            message: "将清空封面缓存。之后切歌可能需要重新加载/处理封面。",
+                            title: "清空封面缩略图？",
+                            message: "将清空当前封面缩略图与内存缓存。之后切歌可能需要重新加载/处理封面。",
                             confirmTitle: "清除",
                             cancelTitle: "不清除"
                         )

@@ -1,4 +1,5 @@
 import SwiftUI
+import Foundation
 
 struct ContentView: View {
     // Inject shared instances from MusicPlayerApp to avoid duplicate players after window reopen
@@ -14,6 +15,13 @@ struct ContentView: View {
     @State private var toastMessage: String = ""
     @State private var showToast: Bool = false
     @State private var toastTask: Task<Void, Never>?
+
+    // 更新检查（自动：每次启动，成功加载完歌曲后执行一次）
+    @Environment(\.openURL) private var openURL
+    @State private var didAutoCheckForUpdatesThisLaunch: Bool = false
+    @State private var updateCheckTask: Task<Void, Never>?
+    @State private var showUpdateAlert: Bool = false
+    @State private var updateInfo: UpdateChecker.UpdateInfo?
 
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
@@ -76,10 +84,13 @@ struct ContentView: View {
             NotificationCenter.default.post(name: .blurSearchField, object: nil)
             // 一次性恢复逻辑移动到持久化的 PlaylistManager（避免窗口重开导致重复）
             playlistManager.performInitialRestoreIfNeeded(audioPlayer: audioPlayer)
+            maybeAutoCheckForUpdates()
         }
         .onDisappear {
             // 应用关闭时保存播放列表（不会影响后台播放）
             playlistManager.savePlaylist()
+            updateCheckTask?.cancel()
+            updateCheckTask = nil
         }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             handleGlobalDrop(providers: providers)
@@ -90,6 +101,20 @@ struct ContentView: View {
         }
         .alert(alertMessage, isPresented: $showAlert) {
             Button("确定", role: .cancel) { }
+        }
+        .alert("发现新版本", isPresented: $showUpdateAlert) {
+            Button("稍后", role: .cancel) { }
+            Button("打开下载页") {
+                if let url = updateInfo?.releaseURL {
+                    openURL(url)
+                }
+            }
+        } message: {
+            if let info = updateInfo {
+                Text("当前版本：\(info.currentVersion)\n最新版本：\(info.latestVersion)\n\n是否前往 GitHub Releases 下载？")
+            } else {
+                Text("发现新版本，是否前往 GitHub Releases 下载？")
+            }
         }
         .overlay(alignment: .top) {
             if showToast {
@@ -127,6 +152,15 @@ struct ContentView: View {
         } message: {
             Text("当前输出设备：\(audioPlayer.currentOutputDeviceName)\n为了避免误外放，请确认是否通过扬声器播放。")
         }
+        .onChange(of: playlistManager.audioFiles.count) { _ in
+            maybeAutoCheckForUpdates()
+        }
+        .onChange(of: playlistManager.isAddingFiles) { _ in
+            maybeAutoCheckForUpdates()
+        }
+        .onChange(of: playlistManager.isRestoringPlaylist) { _ in
+            maybeAutoCheckForUpdates()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .loadLastPlayedFile)) { notification in
             if let userInfo = notification.userInfo,
                let url = userInfo["url"] as? URL,
@@ -148,7 +182,7 @@ struct ContentView: View {
             showAlert = true
         }
         .onReceive(NotificationCenter.default.publisher(for: .showArtworkCacheClearedAlert)) { _ in
-            alertMessage = "封面缓存已清空"
+            alertMessage = "封面缩略图已清空"
             showAlert = true
         }
         .onReceive(NotificationCenter.default.publisher(for: .showLyricsCacheClearedAlert)) { _ in
@@ -166,6 +200,25 @@ struct ContentView: View {
             let raw = (notification.userInfo?["message"] as? String) ?? "播放失败"
             let firstLine = raw.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true).first.map(String.init) ?? raw
             showToastMessage(firstLine)
+        }
+    }
+
+    private func maybeAutoCheckForUpdates() {
+        guard !didAutoCheckForUpdatesThisLaunch else { return }
+        guard !playlistManager.audioFiles.isEmpty else { return }
+        guard !playlistManager.isAddingFiles else { return }
+        guard !playlistManager.isRestoringPlaylist else { return }
+
+        didAutoCheckForUpdatesThisLaunch = true
+        updateCheckTask?.cancel()
+
+        let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "3.1"
+        updateCheckTask = Task {
+            guard let info = await UpdateChecker.shared.checkIfUpdateAvailable(currentVersion: currentVersion) else { return }
+            await MainActor.run {
+                self.updateInfo = info
+                self.showUpdateAlert = true
+            }
         }
     }
     
