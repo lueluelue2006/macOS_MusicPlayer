@@ -43,3 +43,11 @@
 ## License
 
 GNU AGPLv3（见 `LICENSE`）。
+
+## 预览图
+
+![暗色模式主页](assets/screenshots/home-dark.png)
+
+![亮色模式主页](assets/screenshots/home-light.png)
+
+![暗色模式：音量均衡分析](assets/screenshots/volume-analysis-dark.png)
