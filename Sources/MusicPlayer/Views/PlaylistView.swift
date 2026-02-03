@@ -19,17 +19,26 @@ class MetadataWindowDelegate: NSObject, NSWindowDelegate {
 struct PlaylistView: View {
     @ObservedObject var audioPlayer: AudioPlayer
     @ObservedObject var playlistManager: PlaylistManager
+    @ObservedObject var playlistsStore: PlaylistsStore
     @State private var showingMetadataEdit = false
     @State private var selectedFileForEdit: AudioFile?
     @State private var metadataEditWindow: NSWindow?
     @State private var windowDelegate: MetadataWindowDelegate?
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+
+    private enum PanelMode: Int {
+        case queue = 0
+        case playlists = 1
+    }
+
+    @State private var panelMode: PanelMode = .queue
     
     // 确保窗口在视图销毁时被清理
-    init(audioPlayer: AudioPlayer, playlistManager: PlaylistManager) {
+    init(audioPlayer: AudioPlayer, playlistManager: PlaylistManager, playlistsStore: PlaylistsStore) {
         self.audioPlayer = audioPlayer
         self.playlistManager = playlistManager
+        self.playlistsStore = playlistsStore
     }
     
     var body: some View {
@@ -37,72 +46,128 @@ struct PlaylistView: View {
             // 标题和操作按钮
             HStack {
                 HStack(spacing: 10) {
-                    Image(systemName: "music.note.list")
+                    Image(systemName: panelMode == .queue ? "music.note.list" : "rectangle.stack")
                         .font(.system(size: 18, weight: .semibold))
                         .foregroundStyle(theme.accentGradient)
-                    Text("播放列表")
+                    Text(panelMode == .queue ? "播放列表" : "歌单")
                         .font(.title2)
                         .fontWeight(.bold)
                         .foregroundColor(.primary)
+
+                    Picker("", selection: $panelMode) {
+                        Text("队列").tag(PanelMode.queue)
+                        Text("歌单").tag(PanelMode.playlists)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 150)
+                    .labelsHidden()
                 }
                 
                 Spacer()
                 
                 HStack(spacing: 12) {
-                    // 清空按钮
-                    Button(action: {
-                        playlistManager.clearAllFiles()
-                        audioPlayer.stopAndClearCurrent()
-                    }) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "trash")
-                                .font(.caption)
-                            Text("清空")
-                                .font(.caption)
-                                .fontWeight(.medium)
+                    if panelMode == .queue {
+                        // 清空按钮
+                        Button(action: {
+                            playlistManager.clearAllFiles()
+                            audioPlayer.stopAndClearCurrent()
+                        }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "trash")
+                                    .font(.caption)
+                                Text("清空")
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(theme.mutedSurface)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 12)
+                                            .stroke(Color.red.opacity(0.35), lineWidth: 1)
+                                    )
+                            )
+                            .foregroundColor(.red)
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(theme.mutedSurface)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 12)
-                                        .stroke(Color.red.opacity(0.35), lineWidth: 1)
-                                )
-                        )
-                        .foregroundColor(.red)
+                        .buttonStyle(PlainButtonStyle())
+                        .disabled(playlistManager.audioFiles.isEmpty)
+                        
+                        // 刷新按钮
+                        Button(action: {
+                            Task {
+                                await playlistManager.refreshAllMetadata(audioPlayer: audioPlayer)
+                            }
+                        }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.caption)
+                                Text("完全刷新")
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(theme.mutedSurface)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 12)
+                                            .stroke(theme.accentGradient, lineWidth: 1)
+                                    )
+                            )
+                            .foregroundStyle(theme.accentGradient)
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        .help("完全刷新：重载元数据、歌词、封面（清空歌词/封面缓存；保留音量均衡缓存）")
+                    } else {
+                        Button(action: { createPlaylist() }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "plus")
+                                    .font(.caption)
+                                Text("新建歌单")
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(theme.mutedSurface)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 12)
+                                            .stroke(theme.accentGradient, lineWidth: 1)
+                                    )
+                            )
+                            .foregroundStyle(theme.accentGradient)
+                        }
+                        .buttonStyle(PlainButtonStyle())
+
+                        Button(action: { saveQueueAsPlaylist() }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "square.and.arrow.down")
+                                    .font(.caption)
+                                Text("保存队列")
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(theme.mutedSurface)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 12)
+                                            .stroke(theme.stroke, lineWidth: 1)
+                                    )
+                            )
+                            .foregroundColor(theme.mutedText)
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        .help("将当前队列保存为一个歌单（按文件路径引用，不会复制文件）")
+                        .disabled(playlistManager.audioFiles.isEmpty)
                     }
-                    .buttonStyle(PlainButtonStyle())
-                    .disabled(playlistManager.audioFiles.isEmpty)
-                    
-                    // 刷新按钮
-                    Button(action: {
-                        Task {
-                            await playlistManager.refreshAllMetadata(audioPlayer: audioPlayer)
-                        }
-                    }) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "arrow.clockwise")
-                                .font(.caption)
-                            Text("完全刷新")
-                                .font(.caption)
-                                .fontWeight(.medium)
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(theme.mutedSurface)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 12)
-                                        .stroke(theme.accentGradient, lineWidth: 1)
-                                )
-                        )
-                        .foregroundStyle(theme.accentGradient)
-                    }
-                    .buttonStyle(PlainButtonStyle())
-                    .help("完全刷新：重载元数据、歌词、封面（清空歌词/封面缓存；保留音量均衡缓存）")
                 }
             }
             .padding(.horizontal, 20)
@@ -112,86 +177,98 @@ struct PlaylistView: View {
                 NotificationCenter.default.post(name: .blurSearchField, object: nil)
             }
             
-            // 搜索框
-            SearchBarView(searchText: $playlistManager.searchText) { query in
-                playlistManager.searchFiles(query)
-            }
-            .padding(.horizontal, 20)
-            // 搜索框以外区域：点击自动取消搜索框聚焦
-            VStack(alignment: .leading, spacing: 20) {
-                // 子文件夹扫描开关（移除右侧文件夹图标）
-                HStack {
-                    Toggle("扫描子文件夹", isOn: $playlistManager.scanSubfolders)
-                        .font(.subheadline)
-                        .help("开启后会递归扫描所选文件夹中的所有子文件夹")
+            if panelMode == .queue {
+                // 搜索框
+                SearchBarView(searchText: $playlistManager.searchText) { query in
+                    playlistManager.searchFiles(query)
                 }
                 .padding(.horizontal, 20)
-                
-                // 搜索统计
-                if !playlistManager.searchText.isEmpty {
+                // 搜索框以外区域：点击自动取消搜索框聚焦
+                VStack(alignment: .leading, spacing: 20) {
+                    // 子文件夹扫描开关（移除右侧文件夹图标）
                     HStack {
-                        Text("找到 \(playlistManager.filteredFiles.count) / \(playlistManager.audioFiles.count) 首歌曲")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Spacer()
+                        Toggle("扫描子文件夹", isOn: $playlistManager.scanSubfolders)
+                            .font(.subheadline)
+                            .help("开启后会递归扫描所选文件夹中的所有子文件夹")
                     }
                     .padding(.horizontal, 20)
-                }
-                
-                // 播放列表
-                if playlistManager.filteredFiles.isEmpty {
-                    EmptyPlaylistView()
-                } else {
-                    List(playlistManager.filteredFiles) { file in
-                        PlaylistItemView(
-                            file: file,
-                            isCurrentTrack: audioPlayer.currentFile?.url == file.url,
-                            isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
-                            unplayableReason: playlistManager.unplayableReason(for: file.url),
-                            searchText: playlistManager.searchText
-                        ) { selectedFile in
-                            // 点击列表条目也顺便取消搜索聚焦
-                            NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                            if let index = playlistManager.audioFiles.firstIndex(of: selectedFile) {
-                                if let file = playlistManager.selectFile(at: index) {
-                                    audioPlayer.play(file)
-                                }
-                            }
-                        } deleteAction: { fileToDelete in
-                            NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                            // 删除前判断是否命中当前播放
-                            let isDeletingCurrent = (audioPlayer.currentFile?.url == fileToDelete.url)
-                            if let index = playlistManager.audioFiles.firstIndex(of: fileToDelete) {
-                                // 先执行删除
-                                playlistManager.removeFile(at: index)
-                                
-                                // 若删除的是当前播放，根据播放模式处理
-                                if isDeletingCurrent {
-                                    // 删除后剩余文件列表（从真实数据源拿）
-                                    let remaining = playlistManager.audioFiles
-                                    
-                                    // 如果后续需要顺序“下一首”，可在此提供闭包：playNext: { playlistManager.nextAfterDeletion(from: index) }
-                                    // 现阶段按约定：单曲循环->停止并清空；随机->随机一首；其他->停止并清空
-                                    audioPlayer.handleCurrentTrackRemoved(remainingFiles: remaining, playNext: nil)
-                                }
-                            }
-                        } editAction: { fileToEdit in
-                            NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                            selectedFileForEdit = fileToEdit
-                            showingMetadataEdit = true
+                    
+                    // 搜索统计
+                    if !playlistManager.searchText.isEmpty {
+                        HStack {
+                            Text("找到 \(playlistManager.filteredFiles.count) / \(playlistManager.audioFiles.count) 首歌曲")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
                         }
-                        .listRowBackground(Color.clear)
-                        .listRowSeparator(.hidden)
-                        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                        .padding(.horizontal, 20)
                     }
-                    .listStyle(PlainListStyle())
-                    .background(Color.clear)
-                    .scrollContentBackground(.hidden)
+                    
+                    // 播放列表
+                    if playlistManager.filteredFiles.isEmpty {
+                        EmptyPlaylistView()
+                    } else {
+                        List(playlistManager.filteredFiles) { file in
+                            PlaylistItemView(
+                                file: file,
+                                isCurrentTrack: audioPlayer.currentFile?.url == file.url,
+                                isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
+                                unplayableReason: playlistManager.unplayableReason(for: file.url),
+                                searchText: playlistManager.searchText
+                            ) { selectedFile in
+                                // 点击列表条目也顺便取消搜索聚焦
+                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
+                                if let index = playlistManager.audioFiles.firstIndex(of: selectedFile) {
+                                    if let file = playlistManager.selectFile(at: index) {
+                                        audioPlayer.play(file)
+                                    }
+                                }
+                            } deleteAction: { fileToDelete in
+                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
+                                // 删除前判断是否命中当前播放
+                                let isDeletingCurrent = (audioPlayer.currentFile?.url == fileToDelete.url)
+                                if let index = playlistManager.audioFiles.firstIndex(of: fileToDelete) {
+                                    // 先执行删除
+                                    playlistManager.removeFile(at: index)
+                                    
+                                    // 若删除的是当前播放，根据播放模式处理
+                                    if isDeletingCurrent {
+                                        // 删除后剩余文件列表（从真实数据源拿）
+                                        let remaining = playlistManager.audioFiles
+                                        
+                                        // 如果后续需要顺序“下一首”，可在此提供闭包：playNext: { playlistManager.nextAfterDeletion(from: index) }
+                                        // 现阶段按约定：单曲循环->停止并清空；随机->随机一首；其他->停止并清空
+                                        audioPlayer.handleCurrentTrackRemoved(remainingFiles: remaining, playNext: nil)
+                                    }
+                                }
+                            } editAction: { fileToEdit in
+                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
+                                selectedFileForEdit = fileToEdit
+                                showingMetadataEdit = true
+                            }
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                        }
+                        .listStyle(PlainListStyle())
+                        .background(Color.clear)
+                        .scrollContentBackground(.hidden)
+                    }
                 }
-            }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                NotificationCenter.default.post(name: .blurSearchField, object: nil)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    NotificationCenter.default.post(name: .blurSearchField, object: nil)
+                }
+            } else {
+                PlaylistsPanelView(
+                    audioPlayer: audioPlayer,
+                    playlistManager: playlistManager,
+                    playlistsStore: playlistsStore,
+                    onRequestEditMetadata: { file in
+                        selectedFileForEdit = file
+                        showingMetadataEdit = true
+                    }
+                )
             }
         }
         .background(theme.surface)
@@ -210,6 +287,30 @@ struct PlaylistView: View {
                 windowDelegate = nil
             }
         }
+    }
+
+    @MainActor
+    private func createPlaylist() {
+        let name = TextInputPrompt.prompt(
+            title: "新建歌单",
+            message: "输入歌单名称",
+            defaultValue: "",
+            okTitle: "创建",
+            cancelTitle: "取消"
+        )
+        playlistsStore.createPlaylist(name: name ?? "")
+    }
+
+    @MainActor
+    private func saveQueueAsPlaylist() {
+        let name = TextInputPrompt.prompt(
+            title: "保存队列为歌单",
+            message: "输入歌单名称",
+            defaultValue: "我的歌单",
+            okTitle: "保存",
+            cancelTitle: "取消"
+        )
+        playlistsStore.createPlaylist(name: name ?? "我的歌单", trackURLs: playlistManager.audioFiles.map(\.url))
     }
     
     private func showMetadataEditWindow(for file: AudioFile) {

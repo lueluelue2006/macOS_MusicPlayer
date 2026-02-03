@@ -9,12 +9,13 @@ struct MusicPlayerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     // Create single shared instances for the whole app lifetime.
     // These survive window closes (Cmd+W) and avoid duplicate audio playback.
-    private let audioPlayer: AudioPlayer
-    private let playlistManager: PlaylistManager
-    private let playbackCoordinator: PlaybackCoordinator
-    private let audioRouteMonitor: AudioRouteMonitor
-    private let ipcServer: IPCServer
-    private let notificationDelegate = NotificationCenterDelegate()
+	    private let audioPlayer: AudioPlayer
+	    private let playlistManager: PlaylistManager
+	    private let playlistsStore: PlaylistsStore
+	    private let playbackCoordinator: PlaybackCoordinator
+	    private let audioRouteMonitor: AudioRouteMonitor
+	    private let ipcServer: IPCServer
+	    private let notificationDelegate = NotificationCenterDelegate()
     
     init() {
         // Bundle identifier change migration:
@@ -22,10 +23,11 @@ struct MusicPlayerApp: App {
         // - preserves existing user settings on upgrade
         UserDefaultsMigrator.migrateFromLegacyBundleIdentifierIfNeeded(currentBundleIdentifier: Bundle.main.bundleIdentifier)
 
-        let audioPlayer = AudioPlayer()
-        let playlistManager = PlaylistManager()
-        let playbackCoordinator = PlaybackCoordinator(audioPlayer: audioPlayer, playlistManager: playlistManager)
-        let ipcServer = IPCServer(audioPlayer: audioPlayer, playlistManager: playlistManager)
+	        let audioPlayer = AudioPlayer()
+	        let playlistManager = PlaylistManager()
+	        let playlistsStore = PlaylistsStore()
+	        let playbackCoordinator = PlaybackCoordinator(audioPlayer: audioPlayer, playlistManager: playlistManager)
+	        let ipcServer = IPCServer(audioPlayer: audioPlayer, playlistManager: playlistManager)
 
         let audioRouteMonitor = AudioRouteMonitor(
             onHeadphonesDisconnected: { [weak audioPlayer] in
@@ -94,11 +96,12 @@ struct MusicPlayerApp: App {
             }
         )
 
-        self.audioPlayer = audioPlayer
-        self.playlistManager = playlistManager
-        self.playbackCoordinator = playbackCoordinator
-        self.ipcServer = ipcServer
-        self.audioRouteMonitor = audioRouteMonitor
+	        self.audioPlayer = audioPlayer
+	        self.playlistManager = playlistManager
+	        self.playlistsStore = playlistsStore
+	        self.playbackCoordinator = playbackCoordinator
+	        self.ipcServer = ipcServer
+	        self.audioRouteMonitor = audioRouteMonitor
 
         // 连接 AppDelegate，使其可以接管 Finder/Dock 打开的临时文件
         appDelegate.configure(audioPlayer: audioPlayer, playlistManager: playlistManager)
@@ -121,10 +124,10 @@ struct MusicPlayerApp: App {
     
     var body: some Scene {
         // 使用单窗口场景，避免因外部“打开文件”事件在 macOS 上产生重复主窗口
-        Window("音乐播放器", id: "main") {
-            RootView(audioPlayer: audioPlayer, playlistManager: playlistManager)
-                .frame(minWidth: 600, minHeight: 400)
-        }
+	        Window("音乐播放器", id: "main") {
+	            RootView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
+	                .frame(minWidth: 600, minHeight: 400)
+	        }
         .windowResizability(.contentSize)
         .windowToolbarStyle(.unified)
         .commands {

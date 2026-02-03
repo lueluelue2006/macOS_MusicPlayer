@@ -583,6 +583,50 @@ final class PlaylistManager: ObservableObject {
             }
         }
     }
+
+    // MARK: - Direct append (for playlists feature)
+
+    /// Append files to the current queue without re-reading metadata.
+    /// - Note: Dedup is by normalized path key.
+    /// - Returns: The index of `focusURL` in the queue after ensuring, if provided.
+    @MainActor
+    func ensureInQueue(_ files: [AudioFile], focusURL: URL? = nil) -> Int? {
+        guard !files.isEmpty else { return nil }
+
+        var indexByKey: [String: Int] = [:]
+        indexByKey.reserveCapacity(audioFiles.count)
+        for (idx, f) in audioFiles.enumerated() {
+            indexByKey[pathKey(f.url)] = idx
+        }
+
+        let focusKey = focusURL.map { pathKey($0) }
+        var focusIndex: Int? = focusKey.flatMap { indexByKey[$0] }
+
+        var toAppend: [AudioFile] = []
+        toAppend.reserveCapacity(files.count)
+
+        for f in files {
+            let key = pathKey(f.url)
+            if let existing = indexByKey[key] {
+                if focusIndex == nil, let focusKey, focusKey == key { focusIndex = existing }
+                continue
+            }
+
+            let newIndex = audioFiles.count + toAppend.count
+            indexByKey[key] = newIndex
+            if focusIndex == nil, let focusKey, focusKey == key { focusIndex = newIndex }
+            toAppend.append(f)
+        }
+
+        guard !toAppend.isEmpty else { return focusIndex }
+
+        audioFiles.append(contentsOf: toAppend)
+        updateFilteredFiles()
+        enqueueDurationPrefetch(for: toAppend.map(\.url))
+        savePlaylist()
+
+        return focusIndex
+    }
     
     func nextFile(isShuffling: Bool) -> AudioFile? {
         guard !audioFiles.isEmpty else { return nil }

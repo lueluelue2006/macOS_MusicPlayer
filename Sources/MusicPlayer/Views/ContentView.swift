@@ -5,6 +5,7 @@ struct ContentView: View {
     // Inject shared instances from MusicPlayerApp to avoid duplicate players after window reopen
     @ObservedObject var audioPlayer: AudioPlayer
     @ObservedObject var playlistManager: PlaylistManager
+    @ObservedObject var playlistsStore: PlaylistsStore
     @Environment(\.colorScheme) private var colorScheme
 
     // 缓存清理提示
@@ -44,7 +45,7 @@ struct ContentView: View {
                         .shadow(color: theme.subtleShadow, radius: 16, x: 0, y: 8)
 
                     // 下方播放列表
-                    PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager)
+                    PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
                         .frame(minHeight: 200)
                         .background(.ultraThinMaterial)
                         .background(theme.surface.opacity(0.3))
@@ -65,7 +66,7 @@ struct ContentView: View {
                         .shadow(color: theme.subtleShadow, radius: 16, x: 0, y: 8)
 
                     // 右侧播放列表
-                    PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager)
+                    PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
                         .frame(minWidth: 400)
                         .background(.ultraThinMaterial)
                         .background(theme.surface.opacity(0.3))
