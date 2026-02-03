@@ -139,24 +139,13 @@ struct MusicPlayerCommands: Commands {
                 }
 
                 Button("打开系统通知设置…") {
-                    // 尝试打开通知设置面板（不同系统版本 & scheme 不同）
-                    let bid = Bundle.main.bundleIdentifier ?? "io.github.lueluelue2006.macosmusicplayer"
-                    let candidates = [
-                        "x-apple.systempreferences:com.apple.preference.notifications?AppID=\(bid)",
-                        "x-apple.systempreferences:com.apple.preference.notifications?app=\(bid)",
-                        "x-apple.systempreferences:com.apple.preference.notifications?bundleId=\(bid)",
-                        "x-apple.systempreferences:com.apple.preference.notifications",
-                        "x-apple.systempreferences:com.apple.notifications-Settings.extension"
-                    ].compactMap { URL(string: $0) }
-                    var opened = false
-                    for url in candidates {
-                        if NSWorkspace.shared.open(url) { opened = true; break }
+                    if !NotificationSettingsHelper.openSystemNotificationSettings() {
+                        NotificationSettingsHelper.copyOpenCommandAndOpenTerminal()
                     }
-                    if !opened {
-                        // 回退：仅打开系统设置
-                        let settingsURL = URL(fileURLWithPath: "/System/Applications/System Settings.app")
-                        NSWorkspace.shared.openApplication(at: settingsURL, configuration: NSWorkspace.OpenConfiguration())
-                    }
+                }
+
+                Button("复制打开命令并打开终端…") {
+                    NotificationSettingsHelper.copyOpenCommandAndOpenTerminal()
                 }
 
                 Button("发送测试通知") {
@@ -185,6 +174,63 @@ struct MusicPlayerCommands: Commands {
                     Text("设备切换通知静音（默认）")
                 }
             }
+        }
+    }
+}
+
+private enum NotificationSettingsHelper {
+    private static let notificationsPaneCandidates: [URL] = [
+        URL(string: "x-apple.systempreferences:com.apple.preference.notifications")!,
+        URL(string: "x-apple.systempreferences:com.apple.notifications-Settings.extension")!,
+    ]
+
+    private static let settingsAppURL = URL(fileURLWithPath: "/System/Applications/System Settings.app")
+    private static let terminalAppURL = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+
+    @discardableResult
+    static func openSystemNotificationSettings() -> Bool {
+        for url in notificationsPaneCandidates {
+            if NSWorkspace.shared.open(url) {
+                activateSystemSettingsSoon()
+                return true
+            }
+        }
+
+        NSWorkspace.shared.openApplication(at: settingsAppURL, configuration: NSWorkspace.OpenConfiguration())
+        return false
+    }
+
+    static func copyOpenCommandAndOpenTerminal() {
+        let cmd = #"open "x-apple.systempreferences:com.apple.preference.notifications""#
+        copyToPasteboard(cmd)
+
+        NSWorkspace.shared.openApplication(at: terminalAppURL, configuration: NSWorkspace.OpenConfiguration())
+
+        NotificationCenter.default.post(
+            name: .showAppToast,
+            object: nil,
+            userInfo: [
+                "title": "已复制命令到剪贴板",
+                "subtitle": "终端已打开，粘贴回车即可",
+                "kind": "info",
+                "duration": 4.0,
+                "url": notificationsPaneCandidates.first as Any
+            ]
+        )
+    }
+
+    private static func copyToPasteboard(_ string: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(string, forType: .string)
+    }
+
+    private static func activateSystemSettingsSoon() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NSRunningApplication
+                .runningApplications(withBundleIdentifier: "com.apple.systempreferences")
+                .first?
+                .activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
         }
     }
 }

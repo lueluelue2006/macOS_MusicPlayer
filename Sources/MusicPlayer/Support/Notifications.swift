@@ -14,4 +14,7 @@ extension Notification.Name {
 
     /// 音量均衡分析面板
     static let showVolumeNormalizationAnalysis = Notification.Name("showVolumeNormalizationAnalysis")
+
+    /// App 内 Toast（右上角）
+    static let showAppToast = Notification.Name("showAppToast")
 }

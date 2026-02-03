@@ -185,6 +185,21 @@ struct ContentView: View {
             let firstLine = raw.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true).first.map(String.init) ?? raw
             showToastMessage(firstLine, kind: .error)
         }
+        .onReceive(NotificationCenter.default.publisher(for: .showAppToast)) { notification in
+            guard let userInfo = notification.userInfo else { return }
+
+            let title = (userInfo["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let subtitle = (userInfo["subtitle"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let duration = (userInfo["duration"] as? TimeInterval) ?? 2.8
+            let tapURL =
+                (userInfo["url"] as? URL)
+                ?? ((userInfo["url"] as? String).flatMap { URL(string: $0) })
+            let kindRaw = (userInfo["kind"] as? String) ?? "info"
+            let kind = ToastKind(rawValue: kindRaw) ?? .info
+
+            guard !title.isEmpty else { return }
+            showToastMessage(title, subtitle: subtitle, kind: kind, duration: duration, tapURL: tapURL)
+        }
     }
 
     private func maybeAutoCheckForUpdates() {
@@ -300,7 +315,7 @@ struct ContentView: View {
     }
 }
 
-private enum ToastKind: Sendable {
+private enum ToastKind: String, Sendable {
     case info
     case success
     case warning
