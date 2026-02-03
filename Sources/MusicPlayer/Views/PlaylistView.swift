@@ -179,9 +179,9 @@ struct PlaylistView: View {
             
             if panelMode == .queue {
                 // 搜索框
-                SearchBarView(searchText: $playlistManager.searchText) { query in
+                SearchBarView(searchText: $playlistManager.searchText, onSearchChanged: { query in
                     playlistManager.searchFiles(query)
-                }
+                }, focusTarget: .queue)
                 .padding(.horizontal, 20)
                 // 搜索框以外区域：点击自动取消搜索框聚焦
                 VStack(alignment: .leading, spacing: 20) {
@@ -272,6 +272,14 @@ struct PlaylistView: View {
             }
         }
         .background(theme.surface)
+        .onAppear {
+            AppFocusState.shared.activeSearchTarget = (panelMode == .queue) ? .queue : .playlists
+        }
+        .onChange(of: panelMode) { _ in
+            AppFocusState.shared.activeSearchTarget = (panelMode == .queue) ? .queue : .playlists
+            // 切换面板时清掉旧的搜索框焦点，避免 Cmd+F 来回跳
+            NotificationCenter.default.post(name: .blurSearchField, object: nil)
+        }
         .onChange(of: showingMetadataEdit) { isShowing in
             if isShowing, let file = selectedFileForEdit {
                 showMetadataEditWindow(for: file)
@@ -407,6 +415,8 @@ struct PlaylistView: View {
 struct SearchBarView: View {
     @Binding var searchText: String
     let onSearchChanged: (String) -> Void
+    let focusTarget: SearchFocusTarget
+    var autoFocusOnAppear: Bool = false
     @FocusState private var isFocused: Bool
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
@@ -425,7 +435,14 @@ struct SearchBarView: View {
                     onSearchChanged(newValue)
                 }
                 .onChange(of: isFocused) { focused in
-                    AppFocusState.shared.isSearchFocused = focused
+                    if focused {
+                        AppFocusState.shared.activeSearchTarget = focusTarget
+                        AppFocusState.shared.isSearchFocused = true
+                    } else {
+                        if AppFocusState.shared.activeSearchTarget == focusTarget {
+                            AppFocusState.shared.isSearchFocused = false
+                        }
+                    }
                 }
             
             if !searchText.isEmpty {
@@ -456,19 +473,37 @@ struct SearchBarView: View {
             }
             .shadow(color: theme.subtleShadow, radius: 6, x: 0, y: 2)
         )
-        .onReceive(NotificationCenter.default.publisher(for: .focusSearchField)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .focusSearchField)) { notification in
+            let requestedTarget = (notification.userInfo?["target"] as? String).flatMap { SearchFocusTarget(rawValue: $0) }
+            if let requestedTarget {
+                guard requestedTarget == focusTarget else { return }
+            } else {
+                // No explicit target: focus only the current active search target.
+                guard AppFocusState.shared.activeSearchTarget == focusTarget else { return }
+            }
+            AppFocusState.shared.activeSearchTarget = focusTarget
             isFocused = true
             AppFocusState.shared.isSearchFocused = true
         }
         .onReceive(NotificationCenter.default.publisher(for: .blurSearchField)) { _ in
             isFocused = false
-            AppFocusState.shared.isSearchFocused = false
+            if AppFocusState.shared.activeSearchTarget == focusTarget {
+                AppFocusState.shared.isSearchFocused = false
+            }
         }
         .onAppear {
-            // 防止窗口初次展示时自动获得焦点
             DispatchQueue.main.async {
-                isFocused = false
-                AppFocusState.shared.isSearchFocused = false
+                if autoFocusOnAppear {
+                    AppFocusState.shared.activeSearchTarget = focusTarget
+                    isFocused = true
+                    AppFocusState.shared.isSearchFocused = true
+                } else {
+                    // 防止窗口初次展示时自动获得焦点
+                    isFocused = false
+                    if AppFocusState.shared.activeSearchTarget == focusTarget {
+                        AppFocusState.shared.isSearchFocused = false
+                    }
+                }
             }
         }
     }

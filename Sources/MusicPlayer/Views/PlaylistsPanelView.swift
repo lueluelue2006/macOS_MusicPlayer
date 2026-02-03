@@ -130,9 +130,9 @@ struct PlaylistsPanelView: View {
             VStack(alignment: .leading, spacing: 14) {
                 header(for: playlist)
 
-                SearchBarView(searchText: $trackSearchText) { q in
+                SearchBarView(searchText: $trackSearchText, onSearchChanged: { q in
                     trackSearchText = q
-                }
+                }, focusTarget: .playlists)
 
                 if isLoadingTracks {
                     VStack(spacing: 10) {
@@ -463,9 +463,9 @@ struct PlaylistsPanelView: View {
                 .disabled(addFromQueueSelectedKeys.isEmpty)
             }
 
-            SearchBarView(searchText: $addFromQueueSearchText) { q in
+            SearchBarView(searchText: $addFromQueueSearchText, onSearchChanged: { q in
                 addFromQueueSearchText = q
-            }
+            }, focusTarget: .addFromQueue, autoFocusOnAppear: true)
 
             List(addFromQueueCandidates) { file in
                 Button {
@@ -554,6 +554,20 @@ struct PlaylistsPanelView: View {
                 .keyboardShortcut(.defaultAction)
                 .disabled(addFromQueueSelectedKeys.isEmpty)
             }
+        }
+        .onAppear {
+            AppFocusState.shared.activeSearchTarget = .addFromQueue
+            // 自动聚焦搜索框（并确保 Cmd+F 只作用于当前弹窗）
+            NotificationCenter.default.post(
+                name: .focusSearchField,
+                object: nil,
+                userInfo: ["target": SearchFocusTarget.addFromQueue.rawValue]
+            )
+        }
+        .onDisappear {
+            // 恢复到歌单面板的搜索框
+            AppFocusState.shared.activeSearchTarget = .playlists
+            AppFocusState.shared.isSearchFocused = false
         }
         .padding(16)
         .frame(minWidth: 520, minHeight: 560)

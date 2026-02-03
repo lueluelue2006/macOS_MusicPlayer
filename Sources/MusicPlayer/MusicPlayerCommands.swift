@@ -11,6 +11,14 @@ struct MusicPlayerCommands: Commands {
     @AppStorage("userColorSchemeOverride") private var userColorSchemeOverride: Int = 0
 
     var body: some Commands {
+        // 保证 Command+Q 在任何弹窗/子窗口/Sheet 打开时都能正常退出（不被焦点/第一响应者影响）
+        CommandGroup(replacing: .appTermination) {
+            Button("退出 MusicPlayer") {
+                NSApplication.shared.terminate(nil)
+            }
+            .keyboardShortcut("q", modifiers: [.command])
+        }
+
         // 将自定义命令收纳到系统默认菜单中，避免顶栏出现过多一级菜单
         CommandGroup(after: .textEditing) {
             Divider()
