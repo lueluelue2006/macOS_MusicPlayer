@@ -765,6 +765,22 @@ final class PlaylistManager: ObservableObject {
 
     // MARK: - Duration prefetch (lazy + disk cache)
 
+    /// Clear in-memory durations (for the current session) and restart lazy duration prefetch.
+    /// - Note: This does **not** delete any music files. Disk cache is handled elsewhere.
+    @MainActor
+    func resetDurationsAndRestartPrefetch() {
+        cancelDurationPrefetch()
+
+        audioFiles = audioFiles.map { file in
+            AudioFile(url: file.url, metadata: file.metadata, lyricsTimeline: file.lyricsTimeline, duration: nil)
+        }
+        filteredFiles = filteredFiles.map { file in
+            AudioFile(url: file.url, metadata: file.metadata, lyricsTimeline: file.lyricsTimeline, duration: nil)
+        }
+
+        enqueueDurationPrefetch(for: audioFiles.map(\.url))
+    }
+
     @MainActor
     private func enqueueDurationPrefetch(for urls: [URL]) {
         guard !urls.isEmpty else { return }

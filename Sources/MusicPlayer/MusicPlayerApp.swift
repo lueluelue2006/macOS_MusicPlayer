@@ -128,7 +128,7 @@ struct MusicPlayerApp: App {
         .windowResizability(.contentSize)
         .windowToolbarStyle(.unified)
         .commands {
-            MusicPlayerCommands(audioPlayer: audioPlayer)
+            MusicPlayerCommands(audioPlayer: audioPlayer, playlistManager: playlistManager)
         }
     }
 }

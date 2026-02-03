@@ -5,6 +5,7 @@ import UserNotifications
 
 struct MusicPlayerCommands: Commands {
     let audioPlayer: AudioPlayer
+    let playlistManager: PlaylistManager
     @AppStorage("userNotifyOnDeviceSwitch") private var notifyOnDeviceSwitch: Bool = true
     @AppStorage("userNotifyDeviceSwitchSilent") private var notifyDeviceSwitchSilent: Bool = true
     @AppStorage("userColorSchemeOverride") private var userColorSchemeOverride: Int = 0
@@ -63,6 +64,7 @@ struct MusicPlayerCommands: Commands {
                         )
                         guard confirmed else { return }
                         await DurationCache.shared.removeAll()
+                        playlistManager.resetDurationsAndRestartPrefetch()
                         NotificationCenter.default.post(name: .showDurationCacheClearedAlert, object: nil)
                     }
                 }
@@ -108,6 +110,7 @@ struct MusicPlayerCommands: Commands {
                         guard confirmed else { return }
                         audioPlayer.clearVolumeCache()
                         await DurationCache.shared.removeAll()
+                        playlistManager.resetDurationsAndRestartPrefetch()
                         audioPlayer.clearArtworkCache()
                         await LyricsService.shared.invalidateAll()
                         NotificationCenter.default.post(name: .showAllCachesClearedAlert, object: nil)
