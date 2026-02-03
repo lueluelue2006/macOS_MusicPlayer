@@ -541,16 +541,6 @@ struct PlaylistItemView: View {
                 HStack(alignment: .center, spacing: 14) {
                     // 播放图标
                     ZStack {
-                        // 当前播放项的发光背景
-                        if isCurrentTrack {
-                            Circle()
-                                .fill(theme.accent.opacity(0.2))
-                                .frame(width: 36, height: 36)
-                                .blur(radius: 4)
-                                .scaleEffect(1.2)
-                                .opacity(0.6)
-                        }
-
                         let iconName: String = {
                             if isCurrentTrack { return "speaker.wave.2.fill" }
                             if unplayableReason != nil { return "exclamationmark.triangle.fill" }
@@ -661,7 +651,6 @@ struct PlaylistItemView: View {
                 if isCurrentTrack {
                     RoundedRectangle(cornerRadius: 14)
                         .fill(theme.rowBackground(isActive: true))
-                        .shadow(color: theme.accentShadow, radius: 12, x: 0, y: 4)
                 } else if isHovered {
                     RoundedRectangle(cornerRadius: 14)
                         .fill(theme.elevatedSurface)
