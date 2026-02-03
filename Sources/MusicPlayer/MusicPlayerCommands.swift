@@ -113,26 +113,64 @@ struct MusicPlayerCommands: Commands {
                         return
                     }
                     let center = UNUserNotificationCenter.current()
-                    center.requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in
-                        center.getNotificationSettings { settings in
+                    center.getNotificationSettings { settings in
+                        switch settings.authorizationStatus {
+                        case .authorized, .provisional, .ephemeral:
                             DispatchQueue.main.async {
-                                let alert = NSAlert()
-                                switch settings.authorizationStatus {
-                                case .authorized, .provisional, .ephemeral:
-                                    alert.messageText = "通知权限已启用"
-                                    alert.informativeText = "设备切换时可在右上角显示通知。您可在“通知”菜单里开关是否发送。"
-                                case .denied:
-                                    alert.messageText = "通知权限未启用"
-                                    alert.informativeText = "请在“系统设置 → 通知 → 音乐播放器”中开启通知权限，或点击“打开系统通知设置…”。"
-                                case .notDetermined:
-                                    alert.messageText = "已发起授权请求"
-                                    alert.informativeText = "若未出现系统弹窗，请前往“系统设置 → 通知 → 音乐播放器”手动开启。"
-                                @unknown default:
-                                    alert.messageText = "通知权限状态未知"
-                                    alert.informativeText = "可在“系统设置 → 通知 → 音乐播放器”中检查设置。"
+                                NotificationSettingsHelper.postToast(
+                                    title: "通知权限已启用",
+                                    subtitle: "可在“通知”菜单里开关是否发送",
+                                    kind: "success",
+                                    duration: 2.5
+                                )
+                            }
+                        case .denied:
+                            DispatchQueue.main.async {
+                                NotificationSettingsHelper.openSystemNotificationSettingsOrFallback()
+                            }
+                        case .notDetermined:
+                            center.requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in
+                                center.getNotificationSettings { updated in
+                                    DispatchQueue.main.async {
+                                        switch updated.authorizationStatus {
+                                        case .authorized, .provisional, .ephemeral:
+                                            NotificationSettingsHelper.postToast(
+                                                title: "通知权限已启用",
+                                                subtitle: "设备切换时可显示通知",
+                                                kind: "success",
+                                                duration: 2.5
+                                            )
+                                        case .denied:
+                                            NotificationSettingsHelper.openSystemNotificationSettingsOrFallback()
+                                        case .notDetermined:
+                                            NotificationSettingsHelper.postToast(
+                                                title: "未弹出系统授权弹窗",
+                                                subtitle: "已打开系统通知设置，请手动开启",
+                                                kind: "warning",
+                                                duration: 4.0
+                                            )
+                                            NotificationSettingsHelper.openSystemNotificationSettingsOrFallback()
+                                        @unknown default:
+                                            NotificationSettingsHelper.postToast(
+                                                title: "通知权限状态未知",
+                                                subtitle: "已打开系统通知设置，请检查通知权限",
+                                                kind: "warning",
+                                                duration: 4.0
+                                            )
+                                            NotificationSettingsHelper.openSystemNotificationSettingsOrFallback()
+                                        }
+                                    }
                                 }
-                                alert.addButton(withTitle: "确定")
-                                alert.runModal()
+                            }
+                        @unknown default:
+                            DispatchQueue.main.async {
+                                NotificationSettingsHelper.postToast(
+                                    title: "通知权限状态未知",
+                                    subtitle: "已打开系统通知设置，请检查通知权限",
+                                    kind: "warning",
+                                    duration: 4.0
+                                )
+                                NotificationSettingsHelper.openSystemNotificationSettingsOrFallback()
                             }
                         }
                     }
@@ -187,6 +225,26 @@ private enum NotificationSettingsHelper {
     private static let settingsAppURL = URL(fileURLWithPath: "/System/Applications/System Settings.app")
     private static let terminalAppURL = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
 
+    static func postToast(
+        title: String,
+        subtitle: String? = nil,
+        kind: String = "info",
+        duration: TimeInterval = 3.0,
+        url: URL? = nil
+    ) {
+        NotificationCenter.default.post(
+            name: .showAppToast,
+            object: nil,
+            userInfo: [
+                "title": title,
+                "subtitle": subtitle as Any,
+                "kind": kind,
+                "duration": duration,
+                "url": url as Any
+            ]
+        )
+    }
+
     @discardableResult
     static func openSystemNotificationSettings() -> Bool {
         for url in notificationsPaneCandidates {
@@ -200,22 +258,32 @@ private enum NotificationSettingsHelper {
         return false
     }
 
+    static func openSystemNotificationSettingsOrFallback() {
+        if openSystemNotificationSettings() {
+            postToast(
+                title: "通知权限未启用",
+                subtitle: "已打开系统通知设置（找到“音乐播放器”并开启通知）",
+                kind: "warning",
+                duration: 5.0,
+                url: notificationsPaneCandidates.first
+            )
+            return
+        }
+        copyOpenCommandAndOpenTerminal()
+    }
+
     static func copyOpenCommandAndOpenTerminal() {
         let cmd = #"open "x-apple.systempreferences:com.apple.preference.notifications""#
         copyToPasteboard(cmd)
 
         NSWorkspace.shared.openApplication(at: terminalAppURL, configuration: NSWorkspace.OpenConfiguration())
 
-        NotificationCenter.default.post(
-            name: .showAppToast,
-            object: nil,
-            userInfo: [
-                "title": "已复制命令到剪贴板",
-                "subtitle": "终端已打开，粘贴回车即可",
-                "kind": "info",
-                "duration": 4.0,
-                "url": notificationsPaneCandidates.first as Any
-            ]
+        postToast(
+            title: "已复制命令到剪贴板",
+            subtitle: "终端已打开，粘贴回车即可",
+            kind: "info",
+            duration: 4.0,
+            url: notificationsPaneCandidates.first
         )
     }
 

@@ -386,7 +386,7 @@ private struct ToastBanner: View {
             if let onTap {
                 Button(action: onTap) { bannerContent }
                     .buttonStyle(PlainButtonStyle())
-                    .help("点击打开 GitHub Releases")
+                    .help("点击打开")
             } else {
                 bannerContent
             }
