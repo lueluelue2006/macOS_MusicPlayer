@@ -28,15 +28,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // 本地按键监听：仅在未编辑文本时拦截空格/回车进行播放/暂停
-        keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self = self, let ap = self.audioPlayer else { return event }
-            ap.recordUserInteraction(throttleSeconds: 0.25)
+	        keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+	            guard let self = self, let ap = self.audioPlayer else { return event }
+	            ap.recordUserInteraction(throttleSeconds: 0.25)
 
-            // ESC：从文本输入（尤其是搜索框）退出焦点，方便中文输入法/快捷键切换
-            if event.keyCode == 53, let window = NSApp.keyWindow, let responder = window.firstResponder as? NSTextView {
-                if responder.isEditable || responder.isFieldEditor || responder.hasMarkedText() {
-                    window.makeFirstResponder(nil)
-                    AppFocusState.shared.isSearchFocused = false
+	            // Command+Q：无论任何弹窗/子窗口/输入焦点都允许强制退出（符合 macOS 习惯）
+	            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+	            if flags.contains(.command),
+	               !flags.contains(.control),
+	               !flags.contains(.option),
+	               !flags.contains(.shift),
+	               event.charactersIgnoringModifiers?.lowercased() == "q" {
+	                DispatchQueue.main.async {
+	                    NSApplication.shared.terminate(nil)
+	                }
+	                return nil
+	            }
+
+	            // Command+F：聚焦当前上下文的搜索框（由 AppFocusState 决定目标）
+	            if flags.contains(.command),
+	               !flags.contains(.control),
+	               !flags.contains(.option),
+	               !flags.contains(.shift),
+	               event.charactersIgnoringModifiers?.lowercased() == "f" {
+	                NotificationCenter.default.post(name: .focusSearchField, object: nil)
+	                return nil
+	            }
+
+	            // ESC：从文本输入（尤其是搜索框）退出焦点，方便中文输入法/快捷键切换
+	            if event.keyCode == 53, let window = NSApp.keyWindow, let responder = window.firstResponder as? NSTextView {
+	                if responder.isEditable || responder.isFieldEditor || responder.hasMarkedText() {
+	                    window.makeFirstResponder(nil)
+	                    AppFocusState.shared.isSearchFocused = false
                     return nil
                 }
             }
@@ -46,16 +69,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return event
             }
 
-            // Ctrl+F：聚焦播放列表搜索框（避免在菜单里出现重复的“搜索播放列表”条目）
-            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            if flags.contains(.control),
-               !flags.contains(.command),
-               !flags.contains(.option),
-               !flags.contains(.shift),
-               event.charactersIgnoringModifiers?.lowercased() == "f" {
-                NotificationCenter.default.post(name: .focusSearchField, object: nil)
-                return nil
-            }
+	            // Ctrl+F：聚焦当前上下文搜索框
+	            if flags.contains(.control),
+	               !flags.contains(.command),
+	               !flags.contains(.option),
+	               !flags.contains(.shift),
+	               event.charactersIgnoringModifiers?.lowercased() == "f" {
+	                NotificationCenter.default.post(name: .focusSearchField, object: nil)
+	                return nil
+	            }
 
             // 空格（49）/ 回车（36）/ 小键盘回车（76）：切换播放/暂停
             let keyCode = event.keyCode

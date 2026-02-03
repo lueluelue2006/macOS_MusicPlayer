@@ -4,6 +4,7 @@ enum SearchFocusTarget: String {
     case queue
     case playlists
     case addFromQueue
+    case volumeAnalysis
 }
 
 final class AppFocusState {

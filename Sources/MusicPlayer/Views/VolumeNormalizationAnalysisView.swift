@@ -8,6 +8,8 @@ struct VolumeNormalizationAnalysisView: View {
 
     @State private var showOnlyMissing: Bool = false
     @State private var searchText: String = ""
+    @FocusState private var isSearchFieldFocused: Bool
+    @State private var previousSearchTarget: SearchFocusTarget = .queue
 
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
@@ -168,6 +170,17 @@ struct VolumeNormalizationAnalysisView: View {
                 HStack {
                     TextField("搜索（标题/歌手/专辑/文件名）", text: $searchText)
                         .textFieldStyle(.roundedBorder)
+                        .focused($isSearchFieldFocused)
+                        .onChange(of: isSearchFieldFocused) { focused in
+                            if focused {
+                                AppFocusState.shared.activeSearchTarget = .volumeAnalysis
+                                AppFocusState.shared.isSearchFocused = true
+                            } else {
+                                if AppFocusState.shared.activeSearchTarget == .volumeAnalysis {
+                                    AppFocusState.shared.isSearchFocused = false
+                                }
+                            }
+                        }
                     Toggle("仅看未分析", isOn: $showOnlyMissing)
                 }
             }
@@ -206,6 +219,34 @@ struct VolumeNormalizationAnalysisView: View {
         .frame(minWidth: 720, minHeight: 520)
         .tint(theme.accent)
         .background(theme.backgroundGradient)
+        .onAppear {
+            previousSearchTarget = AppFocusState.shared.activeSearchTarget
+            AppFocusState.shared.activeSearchTarget = .volumeAnalysis
+        }
+        .onDisappear {
+            // 恢复上一个上下文（队列/歌单/弹窗等）
+            if AppFocusState.shared.activeSearchTarget == .volumeAnalysis {
+                AppFocusState.shared.activeSearchTarget = previousSearchTarget
+                AppFocusState.shared.isSearchFocused = false
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .focusSearchField)) { notification in
+            let requestedTarget = (notification.userInfo?["target"] as? String).flatMap { SearchFocusTarget(rawValue: $0) }
+            if let requestedTarget {
+                guard requestedTarget == .volumeAnalysis else { return }
+            } else {
+                guard AppFocusState.shared.activeSearchTarget == .volumeAnalysis else { return }
+            }
+            AppFocusState.shared.activeSearchTarget = .volumeAnalysis
+            isSearchFieldFocused = true
+            AppFocusState.shared.isSearchFocused = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .blurSearchField)) { _ in
+            isSearchFieldFocused = false
+            if AppFocusState.shared.activeSearchTarget == .volumeAnalysis {
+                AppFocusState.shared.isSearchFocused = false
+            }
+        }
         .onExitCommand {
             // Esc 关闭：分析任务属于 AudioPlayer 生命周期，不应因视图关闭被取消。
             dismiss()
