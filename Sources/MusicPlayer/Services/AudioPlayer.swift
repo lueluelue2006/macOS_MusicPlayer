@@ -1018,7 +1018,7 @@ final class AudioPlayer: NSObject, ObservableObject {
                 case .success(let timeline):
                     self.lyricsTimeline = timeline
                     if let current = self.currentFile, current.url == url {
-                        let updated = AudioFile(url: current.url, metadata: current.metadata, lyricsTimeline: timeline)
+                        let updated = AudioFile(url: current.url, metadata: current.metadata, lyricsTimeline: timeline, duration: current.duration)
                         self.currentFile = updated
                     }
                 case .failure:

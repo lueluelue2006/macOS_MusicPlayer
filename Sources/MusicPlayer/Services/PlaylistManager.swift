@@ -40,6 +40,12 @@ final class PlaylistManager: ObservableObject {
     private let playlistIOQueue = DispatchQueue(label: "playlist.persistence", qos: .utility)
     private let playlistIOQueueKey = DispatchSpecificKey<Void>()
     private let metadataGate = ConcurrencyGate(maxConcurrent: 4) // 限制元数据加载并发
+    private let durationGate = ConcurrencyGate(maxConcurrent: 2) // 限制时长计算并发（更轻量但也需要控速）
+
+    @MainActor private var durationPrefetchTask: Task<Void, Never>?
+    @MainActor private var pendingDurationURLs: [URL] = []
+    @MainActor private var pendingDurationURLKeys: Set<String> = []
+    @MainActor private var pendingDurationIndex: Int = 0
 
     init() {
         playlistIOQueue.setSpecific(key: playlistIOQueueKey, value: ())
@@ -215,7 +221,8 @@ final class PlaylistManager: ObservableObject {
                     if Task.isCancelled { return nil }
                     let metadata = await self.loadCachedMetadata(from: url)
                     if Task.isCancelled { return nil }
-                    return AudioFile(url: url, metadata: metadata)
+                    let duration = await DurationCache.shared.cachedDurationIfValid(for: url)
+                    return AudioFile(url: url, metadata: metadata, duration: duration)
                 }
             }
 
@@ -264,6 +271,7 @@ final class PlaylistManager: ObservableObject {
             }
             self.audioFiles.append(contentsOf: toAppend)
             self.updateFilteredFiles()
+            self.enqueueDurationPrefetch(for: toAppend.map { $0.url })
 
             self.savePlaylist()
 
@@ -380,7 +388,7 @@ final class PlaylistManager: ObservableObject {
             let existingLyrics = audioFiles[index].lyricsTimeline
             
             // 创建新的AudioFile
-            let newFile = AudioFile(url: file.url, metadata: newMetadata, lyricsTimeline: existingLyrics)
+            let newFile = AudioFile(url: file.url, metadata: newMetadata, lyricsTimeline: existingLyrics, duration: file.duration)
             audioFiles[index] = newFile
             updateFilteredFiles()
 
@@ -399,7 +407,7 @@ final class PlaylistManager: ObservableObject {
             await MetadataCache.shared.storeBasicMetadata(newMetadata, for: file.url)
 
             // 创建新的 AudioFile
-            let newFile = AudioFile(url: file.url, metadata: newMetadata)
+            let newFile = AudioFile(url: file.url, metadata: newMetadata, duration: file.duration)
 
             await MainActor.run {
                 audioFiles[index] = newFile
@@ -424,7 +432,7 @@ final class PlaylistManager: ObservableObject {
                     let newMetadata = await self.loadFreshMetadata(from: file.url)
                     await MetadataCache.shared.storeBasicMetadata(newMetadata, for: file.url)
                     // 不保留歌词时间轴，强制后续重新解析（避免外部 .lrc 或嵌入歌词更新后不生效）
-                    let newFile = AudioFile(url: file.url, metadata: newMetadata, lyricsTimeline: nil)
+                    let newFile = AudioFile(url: file.url, metadata: newMetadata, lyricsTimeline: nil, duration: file.duration)
                     return (index, newFile)
                 }
             }
@@ -445,7 +453,7 @@ final class PlaylistManager: ObservableObject {
                 let audioPlayer = audioPlayer,
                let newCurrentFile = audioFiles.first(where: { $0.url == currentURL }) {
                 // 暂时保留播放器当前显示的歌词，待下面主动重载后替换
-                let mergedCurrent = AudioFile(url: newCurrentFile.url, metadata: newCurrentFile.metadata, lyricsTimeline: audioPlayer.lyricsTimeline)
+                let mergedCurrent = AudioFile(url: newCurrentFile.url, metadata: newCurrentFile.metadata, lyricsTimeline: audioPlayer.lyricsTimeline, duration: newCurrentFile.duration)
                 audioPlayer.currentFile = mergedCurrent
             }
         }
@@ -467,10 +475,10 @@ final class PlaylistManager: ObservableObject {
                     // 将新时间轴写回列表中的对应条目和 currentFile
                     if let idx = self.audioFiles.firstIndex(where: { $0.url == currentURL }) {
                         let f = self.audioFiles[idx]
-                        self.audioFiles[idx] = AudioFile(url: f.url, metadata: f.metadata, lyricsTimeline: timeline)
+                        self.audioFiles[idx] = AudioFile(url: f.url, metadata: f.metadata, lyricsTimeline: timeline, duration: f.duration)
                     }
                     if let cur = audioPlayer.currentFile, cur.url == currentURL {
-                        audioPlayer.currentFile = AudioFile(url: cur.url, metadata: cur.metadata, lyricsTimeline: timeline)
+                        audioPlayer.currentFile = AudioFile(url: cur.url, metadata: cur.metadata, lyricsTimeline: timeline, duration: cur.duration)
                     }
                     // 彻底刷新当前曲目的底层播放器，确保持续播放但载入新文件内容
                     audioPlayer.reloadCurrentPreservingState()
@@ -478,10 +486,10 @@ final class PlaylistManager: ObservableObject {
                     audioPlayer.lyricsTimeline = nil
                     if let idx = self.audioFiles.firstIndex(where: { $0.url == currentURL }) {
                         let f = self.audioFiles[idx]
-                        self.audioFiles[idx] = AudioFile(url: f.url, metadata: f.metadata, lyricsTimeline: nil)
+                        self.audioFiles[idx] = AudioFile(url: f.url, metadata: f.metadata, lyricsTimeline: nil, duration: f.duration)
                     }
                     if let cur = audioPlayer.currentFile, cur.url == currentURL {
-                        audioPlayer.currentFile = AudioFile(url: cur.url, metadata: cur.metadata, lyricsTimeline: nil)
+                        audioPlayer.currentFile = AudioFile(url: cur.url, metadata: cur.metadata, lyricsTimeline: nil, duration: cur.duration)
                     }
                     // 即便没有歌词，也要重载当前曲目，确保元数据/封面/时长更新
                     audioPlayer.reloadCurrentPreservingState()
@@ -546,7 +554,9 @@ final class PlaylistManager: ObservableObject {
         savePlaylist() // 保存播放列表
     }
     
+    @MainActor
     func clearAllFiles() {
+        cancelDurationPrefetch()
         audioFiles.removeAll()
         filteredFiles.removeAll()
         currentIndex = 0
@@ -752,6 +762,132 @@ final class PlaylistManager: ObservableObject {
         }
         return nil
     }
+
+    // MARK: - Duration prefetch (lazy + disk cache)
+
+    @MainActor
+    private func enqueueDurationPrefetch(for urls: [URL]) {
+        guard !urls.isEmpty else { return }
+
+        // Only enqueue URLs that are currently missing duration (reduces queue churn).
+        let missingKeys = Set(audioFiles.filter { $0.duration == nil }.map { pathKey($0.url) })
+        guard !missingKeys.isEmpty else { return }
+
+        for url in urls {
+            let key = pathKey(url)
+            guard missingKeys.contains(key) else { continue }
+            if pendingDurationURLKeys.contains(key) { continue }
+            pendingDurationURLKeys.insert(key)
+            pendingDurationURLs.append(url)
+        }
+
+        startDurationPrefetchIfNeeded()
+    }
+
+    @MainActor
+    private func startDurationPrefetchIfNeeded() {
+        guard durationPrefetchTask == nil else { return }
+        durationPrefetchTask = Task.detached(priority: .background) { [weak self] in
+            guard let self else { return }
+            await self.runDurationPrefetchLoop()
+        }
+    }
+
+    @MainActor
+    private func cancelDurationPrefetch() {
+        durationPrefetchTask?.cancel()
+        durationPrefetchTask = nil
+        pendingDurationURLs.removeAll(keepingCapacity: true)
+        pendingDurationURLKeys.removeAll(keepingCapacity: true)
+        pendingDurationIndex = 0
+    }
+
+    private func popNextDurationURL() async -> URL? {
+        await MainActor.run {
+            guard pendingDurationIndex < pendingDurationURLs.count else {
+                pendingDurationURLs.removeAll(keepingCapacity: true)
+                pendingDurationURLKeys.removeAll(keepingCapacity: true)
+                pendingDurationIndex = 0
+                durationPrefetchTask = nil
+                return nil
+            }
+
+            let url = pendingDurationURLs[pendingDurationIndex]
+            pendingDurationIndex += 1
+            pendingDurationURLKeys.remove(pathKey(url))
+
+            // Compact occasionally to avoid O(n^2) removeFirst costs.
+            if pendingDurationIndex == pendingDurationURLs.count {
+                pendingDurationURLs.removeAll(keepingCapacity: true)
+                pendingDurationURLKeys.removeAll(keepingCapacity: true)
+                pendingDurationIndex = 0
+            } else if pendingDurationIndex > 32 && pendingDurationIndex * 2 > pendingDurationURLs.count {
+                pendingDurationURLs.removeFirst(pendingDurationIndex)
+                pendingDurationIndex = 0
+            }
+
+            return url
+        }
+    }
+
+    @MainActor
+    private func applyDuration(_ seconds: TimeInterval, for url: URL) {
+        let key = pathKey(url)
+        if let idx = audioFiles.firstIndex(where: { pathKey($0.url) == key }) {
+            let f = audioFiles[idx]
+            if f.duration == nil {
+                audioFiles[idx] = AudioFile(url: f.url, metadata: f.metadata, lyricsTimeline: f.lyricsTimeline, duration: seconds)
+            }
+        }
+        if let idx = filteredFiles.firstIndex(where: { pathKey($0.url) == key }) {
+            let f = filteredFiles[idx]
+            if f.duration == nil {
+                filteredFiles[idx] = AudioFile(url: f.url, metadata: f.metadata, lyricsTimeline: f.lyricsTimeline, duration: seconds)
+            }
+        }
+    }
+
+    private func runDurationPrefetchLoop() async {
+        while true {
+            if Task.isCancelled { break }
+
+            let busy = await MainActor.run { self.isAddingFiles || self.isRestoringPlaylist }
+            if busy {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                continue
+            }
+
+            guard let url = await popNextDurationURL() else { break }
+            if Task.isCancelled { break }
+
+            // Skip if no longer in the playlist, or already has a duration.
+            let needsWork = await MainActor.run { () -> Bool in
+                let k = self.pathKey(url)
+                guard let idx = self.audioFiles.firstIndex(where: { self.pathKey($0.url) == k }) else { return false }
+                return self.audioFiles[idx].duration == nil
+            }
+            if !needsWork { continue }
+
+            if let cached = await DurationCache.shared.cachedDurationIfValid(for: url) {
+                await MainActor.run { self.applyDuration(cached, for: url) }
+                continue
+            }
+
+            await durationGate.acquire()
+            let loaded = await DurationService.loadDurationSeconds(for: url)
+            await durationGate.release()
+
+            if Task.isCancelled { break }
+            guard let loaded else { continue }
+
+            await DurationCache.shared.storeDuration(loaded, for: url)
+            await MainActor.run { self.applyDuration(loaded, for: url) }
+        }
+
+        await MainActor.run {
+            self.durationPrefetchTask = nil
+        }
+    }
     
     // MARK: - 保存和加载播放列表
     func savePlaylist() {
@@ -792,6 +928,7 @@ final class PlaylistManager: ObservableObject {
 
         // 标记正在恢复播放列表，避免触发“首次添加自动播放”等逻辑（必须在主线程发布）
         await MainActor.run {
+            self.cancelDurationPrefetch()
             self.isRestoringPlaylist = true
         }
 
@@ -800,8 +937,9 @@ final class PlaylistManager: ObservableObject {
         restoredFiles.reserveCapacity(validURLs.count)
         var cacheHits = 0
         for url in validURLs {
+            let duration = await DurationCache.shared.cachedDurationIfValid(for: url)
             if let cached = await MetadataCache.shared.cachedMetadataIfValid(for: url) {
-                restoredFiles.append(AudioFile(url: url, metadata: cached))
+                restoredFiles.append(AudioFile(url: url, metadata: cached, duration: duration))
                 cacheHits += 1
                 continue
             }
@@ -816,7 +954,7 @@ final class PlaylistManager: ObservableObject {
                 genre: nil,
                 artwork: nil
             )
-            restoredFiles.append(AudioFile(url: url, metadata: metadata))
+            restoredFiles.append(AudioFile(url: url, metadata: metadata, duration: duration))
         }
         debugLog("恢复播放列表元数据缓存命中: \(cacheHits)/\(validURLs.count)")
 
@@ -826,6 +964,7 @@ final class PlaylistManager: ObservableObject {
             self.currentIndex = 0
             self.updateFilteredFiles()
             self.resetShuffleQueue()
+            self.enqueueDurationPrefetch(for: validURLs)
         }
 
         // 恢复完成；后续由 AudioPlayer.loadLastPlayedFile 按需定位到具体曲目
@@ -876,10 +1015,10 @@ final class PlaylistManager: ObservableObject {
                         continue
                     }
                     let existing = self.audioFiles[index]
-                    self.audioFiles[index] = AudioFile(url: existing.url, metadata: metadata, lyricsTimeline: existing.lyricsTimeline)
+                    self.audioFiles[index] = AudioFile(url: existing.url, metadata: metadata, lyricsTimeline: existing.lyricsTimeline, duration: existing.duration)
 
                     if let ap = audioPlayer, ap.currentFile?.url.path == existing.url.path {
-                        ap.currentFile = AudioFile(url: existing.url, metadata: metadata, lyricsTimeline: ap.currentFile?.lyricsTimeline)
+                        ap.currentFile = AudioFile(url: existing.url, metadata: metadata, lyricsTimeline: ap.currentFile?.lyricsTimeline, duration: ap.currentFile?.duration)
                     }
                 }
                 self.updateFilteredFiles()

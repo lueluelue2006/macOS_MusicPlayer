@@ -112,19 +112,29 @@ struct AudioMetadata {
 }
 
 struct AudioFile: Identifiable, Equatable {
-    let id = UUID()
+    let id: String
     let url: URL
     let metadata: AudioMetadata
     // Lazy-loaded lyrics timeline cache key by url
     var lyricsTimeline: LyricsTimeline?
+    // Lazily loaded (and disk-cached) duration in seconds
+    var duration: TimeInterval?
     
-    init(url: URL, metadata: AudioMetadata, lyricsTimeline: LyricsTimeline? = nil) {
+    init(url: URL, metadata: AudioMetadata, lyricsTimeline: LyricsTimeline? = nil, duration: TimeInterval? = nil) {
+        self.id = AudioFile.makeStableID(for: url)
         self.url = url
         self.metadata = metadata
         self.lyricsTimeline = lyricsTimeline
+        self.duration = duration
     }
     
     static func == (lhs: AudioFile, rhs: AudioFile) -> Bool {
         lhs.id == rhs.id
+    }
+
+    private static func makeStableID(for url: URL) -> String {
+        url.standardizedFileURL.path
+            .precomposedStringWithCanonicalMapping
+            .lowercased()
     }
 }

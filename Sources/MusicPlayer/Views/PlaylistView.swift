@@ -247,32 +247,32 @@ struct PlaylistView: View {
                     await LyricsService.shared.invalidate(for: file.url)
                     let result = await LyricsService.shared.loadLyrics(for: file.url)
                     await MainActor.run {
-                        switch result {
-                        case .success(let timeline):
-                            // 更新列表里的条目
-                            if let idx = playlistManager.audioFiles.firstIndex(where: { $0.url == file.url }) {
-                                let f = playlistManager.audioFiles[idx]
-                                playlistManager.audioFiles[idx] = AudioFile(url: f.url, metadata: f.metadata, lyricsTimeline: timeline)
-                            }
-                            // 如果正在播放当前歌曲，更新播放器里的时间轴
-                            if let current = audioPlayer.currentFile, current.url == file.url {
-                                audioPlayer.lyricsTimeline = timeline
-                                audioPlayer.currentFile = AudioFile(url: current.url, metadata: current.metadata, lyricsTimeline: timeline)
-                                // 重新载入底层播放器以确保持续播放但读取到新文件内容
-                                audioPlayer.reloadCurrentPreservingState()
-                            }
-                        case .failure:
-                            // 清空时间轴
-                            if let idx = playlistManager.audioFiles.firstIndex(where: { $0.url == file.url }) {
-                                let f = playlistManager.audioFiles[idx]
-                                playlistManager.audioFiles[idx] = AudioFile(url: f.url, metadata: f.metadata, lyricsTimeline: nil)
-                            }
-                            if let current = audioPlayer.currentFile, current.url == file.url {
-                                audioPlayer.lyricsTimeline = nil
-                                audioPlayer.currentFile = AudioFile(url: current.url, metadata: current.metadata, lyricsTimeline: nil)
-                                audioPlayer.reloadCurrentPreservingState()
-                            }
-                        }
+	                        switch result {
+	                        case .success(let timeline):
+	                            // 更新列表里的条目
+	                            if let idx = playlistManager.audioFiles.firstIndex(where: { $0.url == file.url }) {
+	                                let f = playlistManager.audioFiles[idx]
+	                                playlistManager.audioFiles[idx] = AudioFile(url: f.url, metadata: f.metadata, lyricsTimeline: timeline, duration: f.duration)
+	                            }
+	                            // 如果正在播放当前歌曲，更新播放器里的时间轴
+	                            if let current = audioPlayer.currentFile, current.url == file.url {
+	                                audioPlayer.lyricsTimeline = timeline
+	                                audioPlayer.currentFile = AudioFile(url: current.url, metadata: current.metadata, lyricsTimeline: timeline, duration: current.duration)
+	                                // 重新载入底层播放器以确保持续播放但读取到新文件内容
+	                                audioPlayer.reloadCurrentPreservingState()
+	                            }
+	                        case .failure:
+	                            // 清空时间轴
+	                            if let idx = playlistManager.audioFiles.firstIndex(where: { $0.url == file.url }) {
+	                                let f = playlistManager.audioFiles[idx]
+	                                playlistManager.audioFiles[idx] = AudioFile(url: f.url, metadata: f.metadata, lyricsTimeline: nil, duration: f.duration)
+	                            }
+	                            if let current = audioPlayer.currentFile, current.url == file.url {
+	                                audioPlayer.lyricsTimeline = nil
+	                                audioPlayer.currentFile = AudioFile(url: current.url, metadata: current.metadata, lyricsTimeline: nil, duration: current.duration)
+	                                audioPlayer.reloadCurrentPreservingState()
+	                            }
+	                        }
 
                         // 关闭窗口
                         selectedFileForEdit = nil
@@ -427,32 +427,40 @@ struct PlaylistItemView: View {
                     .frame(width: 36, height: 36)
 
                     // 歌曲信息
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack(spacing: 8) {
-                            Text(highlightedText(file.metadata.title, searchText: searchText))
-                                .font(.system(size: 14, weight: .semibold))
-                                .lineLimit(1)
-                                .foregroundStyle(titleStyle)
-                                .layoutPriority(1)
+	                    VStack(alignment: .leading, spacing: 5) {
+	                        HStack(spacing: 8) {
+	                            Text(highlightedText(file.metadata.title, searchText: searchText))
+	                                .font(.system(size: 14, weight: .semibold))
+	                                .lineLimit(1)
+	                                .foregroundStyle(titleStyle)
+	                                .layoutPriority(1)
 
-                            let badgeTextStyle: AnyShapeStyle = isVolumeAnalyzed ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText)
-                            let badgeStrokeStyle: AnyShapeStyle = isVolumeAnalyzed ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText.opacity(0.45))
-                            Text("均")
-                                .font(.system(size: 10, weight: .bold, design: .rounded))
-                                .foregroundStyle(badgeTextStyle)
-                                .frame(width: 18, height: 18)
-                                .background(
-                                    Circle()
-                                        .fill(isVolumeAnalyzed ? theme.accent.opacity(theme.scheme == .dark ? 0.20 : 0.15) : Color.clear)
-                                        .overlay(
-                                            Circle()
-                                                .stroke(badgeStrokeStyle, lineWidth: 1)
-                                                .opacity(isVolumeAnalyzed ? 0.85 : 1)
-                                        )
-                                )
-                                .help(isVolumeAnalyzed ? "音量均衡：已分析" : "音量均衡：未分析")
-                                .accessibilityLabel(isVolumeAnalyzed ? "音量均衡已分析" : "音量均衡未分析")
-                        }
+	                            let badgeTextStyle: AnyShapeStyle = isVolumeAnalyzed ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText)
+	                            let badgeStrokeStyle: AnyShapeStyle = isVolumeAnalyzed ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText.opacity(0.45))
+	                            Text("均")
+	                                .font(.system(size: 10, weight: .bold, design: .rounded))
+	                                .foregroundStyle(badgeTextStyle)
+	                                .frame(width: 18, height: 18)
+	                                .background(
+	                                    Circle()
+	                                        .fill(isVolumeAnalyzed ? theme.accent.opacity(theme.scheme == .dark ? 0.20 : 0.15) : Color.clear)
+	                                        .overlay(
+	                                            Circle()
+	                                                .stroke(badgeStrokeStyle, lineWidth: 1)
+	                                                .opacity(isVolumeAnalyzed ? 0.85 : 1)
+	                                        )
+	                                )
+	                                .help(isVolumeAnalyzed ? "音量均衡：已分析" : "音量均衡：未分析")
+	                                .accessibilityLabel(isVolumeAnalyzed ? "音量均衡已分析" : "音量均衡未分析")
+
+	                            Spacer(minLength: 8)
+
+	                            Text(durationLabel)
+	                                .font(.system(size: 11, weight: .medium))
+	                                .monospacedDigit()
+	                                .foregroundColor(theme.mutedText.opacity(file.duration == nil ? 0.55 : 0.9))
+	                                .accessibilityLabel(file.duration == nil ? "时长加载中" : "时长 \(durationLabel)")
+	                        }
 
                         Text("\(highlightedText(file.metadata.artist, searchText: searchText)) - \(highlightedText(file.metadata.album, searchText: searchText))")
                             .font(.system(size: 12))
@@ -554,9 +562,9 @@ struct PlaylistItemView: View {
         }
     }
     
-    private func helpText(for file: AudioFile) -> String {
-        let format = file.url.pathExtension.uppercased()
-        let buttonType = MetadataEditor.getEditButtonType(for: file.url)
+	    private func helpText(for file: AudioFile) -> String {
+	        let format = file.url.pathExtension.uppercased()
+	        let buttonType = MetadataEditor.getEditButtonType(for: file.url)
         
         switch buttonType {
         case .directEdit:
@@ -567,12 +575,29 @@ struct PlaylistItemView: View {
             return "\(format) 格式元数据支持有限（点击了解详情）"
         case .hidden:
             return "此格式不支持元数据编辑"
-        }
-    }
-    
-    private func highlightedText(_ text: String, searchText: String) -> AttributedString {
-        guard !searchText.isEmpty else {
-            return AttributedString(text)
+	        }
+	    }
+
+	    private var durationLabel: String {
+	        guard let seconds = file.duration else { return "--:--" }
+	        return formatDuration(seconds)
+	    }
+
+	    private func formatDuration(_ seconds: TimeInterval) -> String {
+	        guard seconds.isFinite, seconds > 0 else { return "--:--" }
+	        let total = Int(seconds.rounded(.towardZero))
+	        let h = total / 3600
+	        let m = (total % 3600) / 60
+	        let s = total % 60
+	        if h > 0 {
+	            return String(format: "%d:%02d:%02d", h, m, s)
+	        }
+	        return String(format: "%d:%02d", m, s)
+	    }
+	    
+	    private func highlightedText(_ text: String, searchText: String) -> AttributedString {
+	        guard !searchText.isEmpty else {
+	            return AttributedString(text)
         }
         
         var attributedString = AttributedString(text)

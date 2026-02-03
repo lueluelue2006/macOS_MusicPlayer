@@ -106,7 +106,7 @@ final class IPCServer {
             // Also clear in-memory timeline attached to the current track to avoid confusing "still showing old lyrics".
             audioPlayer.lyricsTimeline = nil
             if let current = audioPlayer.currentFile {
-                audioPlayer.currentFile = AudioFile(url: current.url, metadata: current.metadata, lyricsTimeline: nil)
+                audioPlayer.currentFile = AudioFile(url: current.url, metadata: current.metadata, lyricsTimeline: nil, duration: current.duration)
             }
             return IPCReply(id: request.id, ok: true)
 
