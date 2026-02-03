@@ -186,10 +186,6 @@ struct MusicPlayerCommands: Commands {
                     }
                 }
 
-                Button("复制打开命令并打开终端…") {
-                    NotificationSettingsHelper.copyOpenCommandAndOpenTerminal()
-                }
-
                 Button("发送测试通知") {
                     SystemNotifier.shared.notifyDeviceChanged(to: "测试设备", silent: notifyDeviceSwitchSilent)
                 }
