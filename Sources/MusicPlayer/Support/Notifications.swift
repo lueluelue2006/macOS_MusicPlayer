@@ -16,6 +16,9 @@ extension Notification.Name {
     /// 音量均衡分析面板
     static let showVolumeNormalizationAnalysis = Notification.Name("showVolumeNormalizationAnalysis")
 
+    /// 在退出/强制退出前请求关闭所有 Sheet（避免某些 modal 阻止 Cmd+Q / Quit 生效）
+    static let requestDismissAllSheets = Notification.Name("requestDismissAllSheets")
+
     /// App 内 Toast（右上角）
     static let showAppToast = Notification.Name("showAppToast")
 }

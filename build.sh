@@ -68,6 +68,8 @@ cat > MusicPlayer.app/Contents/Info.plist << EOF
     <string>MusicPlayer</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>NSPrincipalClass</key>
+    <string>MusicPlayerApplication</string>
 	<key>CFBundleShortVersionString</key>
 	<string>3.2</string>
     <key>CFBundleVersion</key>

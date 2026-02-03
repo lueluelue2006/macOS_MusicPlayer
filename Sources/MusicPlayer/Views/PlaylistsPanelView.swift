@@ -59,6 +59,9 @@ struct PlaylistsPanelView: View {
         .onChange(of: playlistsStore.selectedPlaylistID) { _ in
             reloadSelectedPlaylist()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .requestDismissAllSheets)) { _ in
+            showAddFromQueueSheet = false
+        }
     }
 
     private var playlistsSidebar: some View {

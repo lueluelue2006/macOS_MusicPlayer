@@ -27,7 +27,7 @@ struct ContentView: View {
 
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
-    var body: some View {
+    private var layoutView: some View {
         GeometryReader { geometry in
             if geometry.size.width < 800 {
                 // 小屏幕：垂直布局
@@ -80,48 +80,55 @@ struct ContentView: View {
                 .padding(.vertical, 12)
             }
         }
-        .background(theme.backgroundGradient)
-        .onAppear {
-            // 启动时确保搜索框不自动聚焦
-            NotificationCenter.default.post(name: .blurSearchField, object: nil)
-            // 一次性恢复逻辑移动到持久化的 PlaylistManager（避免窗口重开导致重复）
-            playlistManager.performInitialRestoreIfNeeded(audioPlayer: audioPlayer)
-            maybeAutoCheckForUpdates()
-        }
-        .onDisappear {
-            // 应用关闭时保存播放列表（不会影响后台播放）
-            playlistManager.savePlaylist()
-            updateCheckTask?.cancel()
-            updateCheckTask = nil
-        }
-        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-            handleGlobalDrop(providers: providers)
-            return true
-        }
-        .sheet(isPresented: $showVolumeNormalizationAnalysis) {
-            VolumeNormalizationAnalysisView(audioPlayer: audioPlayer, playlistManager: playlistManager)
-        }
-        .alert(alertMessage, isPresented: $showAlert) {
-            Button("确定", role: .cancel) { }
-        }
-        .overlay(alignment: .topTrailing) {
-            if showToast {
-                ToastBanner(
-                    title: toastTitle,
-                    subtitle: toastSubtitle,
-                    kind: toastKind,
-                    onTap: toastTapURL == nil ? nil : {
-                        if let url = toastTapURL { openURL(url) }
-                    },
-                    onClose: { dismissToast() }
-                )
-                .padding(.top, 12)
-                .padding(.trailing, 12)
-                .transition(.move(edge: .top).combined(with: .opacity))
+    }
+
+    var body: some View {
+        let base = AnyView(layoutView)
+
+        let withChrome = base
+            .background(theme.backgroundGradient)
+            .onAppear {
+                // 启动时确保搜索框不自动聚焦
+                NotificationCenter.default.post(name: .blurSearchField, object: nil)
+                // 一次性恢复逻辑移动到持久化的 PlaylistManager（避免窗口重开导致重复）
+                playlistManager.performInitialRestoreIfNeeded(audioPlayer: audioPlayer)
+                maybeAutoCheckForUpdates()
             }
-        }
+            .onDisappear {
+                // 应用关闭时保存播放列表（不会影响后台播放）
+                playlistManager.savePlaylist()
+                updateCheckTask?.cancel()
+                updateCheckTask = nil
+            }
+            .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+                handleGlobalDrop(providers: providers)
+                return true
+            }
+            .sheet(isPresented: $showVolumeNormalizationAnalysis) {
+                VolumeNormalizationAnalysisView(audioPlayer: audioPlayer, playlistManager: playlistManager)
+            }
+            .alert(alertMessage, isPresented: $showAlert) {
+                Button("确定", role: .cancel) { }
+            }
+            .overlay(alignment: .topTrailing) {
+                if showToast {
+                    ToastBanner(
+                        title: toastTitle,
+                        subtitle: toastSubtitle,
+                        kind: toastKind,
+                        onTap: toastTapURL == nil ? nil : {
+                            if let url = toastTapURL { openURL(url) }
+                        },
+                        onClose: { dismissToast() }
+                    )
+                    .padding(.top, 12)
+                    .padding(.trailing, 12)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+
         // 扬声器播放确认弹窗（仅在“耳机→扬声器”后，用户显式点击开始时出现一次）
-        .alert("通过扬声器播放？", isPresented: Binding(
+        let withSpeakerConfirm = withChrome.alert("通过扬声器播放？", isPresented: Binding(
             get: { audioPlayer.showSpeakerConfirm },
             set: { audioPlayer.showSpeakerConfirm = $0 }
         )) {
@@ -137,74 +144,87 @@ struct ContentView: View {
         } message: {
             Text("当前输出设备：\(audioPlayer.currentOutputDeviceName)\n为了避免误外放，请确认是否通过扬声器播放。")
         }
-        .onChange(of: playlistManager.audioFiles.count) { _ in
-            maybeAutoCheckForUpdates()
-        }
-        .onChange(of: playlistManager.isAddingFiles) { _ in
-            maybeAutoCheckForUpdates()
-        }
-        .onChange(of: playlistManager.isRestoringPlaylist) { _ in
-            maybeAutoCheckForUpdates()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .loadLastPlayedFile)) { notification in
-            if let userInfo = notification.userInfo,
-               let url = userInfo["url"] as? URL,
-               let time = userInfo["time"] as? TimeInterval {
-                if let file = playlistManager.audioFiles.first(where: { $0.url == url }),
-                   let index = playlistManager.audioFiles.firstIndex(where: { $0.url == url }) {
-                    playlistManager.currentIndex = index
-                    playlistManager.savePlaylist()
-                    // 恢复到上次曲目与进度，但默认不自动播放
-                    audioPlayer.play(file, autostart: false, bypassConfirm: true)
-                    audioPlayer.seek(to: time)
-                } else {
-                    showToastMessage("未能在播放列表中找到上次播放文件", kind: .warning)
+
+        let withUpdateTriggers = withSpeakerConfirm
+            .onChange(of: playlistManager.audioFiles.count) { _ in
+                maybeAutoCheckForUpdates()
+            }
+            .onChange(of: playlistManager.isAddingFiles) { _ in
+                maybeAutoCheckForUpdates()
+            }
+            .onChange(of: playlistManager.isRestoringPlaylist) { _ in
+                maybeAutoCheckForUpdates()
+            }
+
+        let withReceivers = withUpdateTriggers
+            .onReceive(NotificationCenter.default.publisher(for: .loadLastPlayedFile)) { notification in
+                if let userInfo = notification.userInfo,
+                   let url = userInfo["url"] as? URL,
+                   let time = userInfo["time"] as? TimeInterval {
+                    if let file = playlistManager.audioFiles.first(where: { $0.url == url }),
+                       let index = playlistManager.audioFiles.firstIndex(where: { $0.url == url }) {
+                        playlistManager.currentIndex = index
+                        playlistManager.savePlaylist()
+                        // 恢复到上次曲目与进度，但默认不自动播放
+                        audioPlayer.play(file, autostart: false, bypassConfirm: true)
+                        audioPlayer.seek(to: time)
+                    } else {
+                        showToastMessage("未能在播放列表中找到上次播放文件", kind: .warning)
+                    }
                 }
             }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .showVolumeCacheClearedAlert)) { _ in
-            alertMessage = "音量均衡缓存已清空"
-            showAlert = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .showDurationCacheClearedAlert)) { _ in
-            alertMessage = "时长缓存已清空"
-            showAlert = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .showArtworkCacheClearedAlert)) { _ in
-            alertMessage = "封面缩略图（内存）已清空"
-            showAlert = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .showLyricsCacheClearedAlert)) { _ in
-            alertMessage = "歌词缓存已清空"
-            showAlert = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .showAllCachesClearedAlert)) { _ in
-            alertMessage = "所有缓存已清空"
-            showAlert = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .showVolumeNormalizationAnalysis)) { _ in
-            showVolumeNormalizationAnalysis = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .audioPlayerDidFailToPlay)) { notification in
-            let raw = (notification.userInfo?["message"] as? String) ?? "播放失败"
-            let firstLine = raw.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true).first.map(String.init) ?? raw
-            showToastMessage(firstLine, kind: .error)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .showAppToast)) { notification in
-            guard let userInfo = notification.userInfo else { return }
+            .onReceive(NotificationCenter.default.publisher(for: .showVolumeCacheClearedAlert)) { _ in
+                alertMessage = "音量均衡缓存已清空"
+                showAlert = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showDurationCacheClearedAlert)) { _ in
+                alertMessage = "时长缓存已清空"
+                showAlert = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showArtworkCacheClearedAlert)) { _ in
+                alertMessage = "封面缩略图（内存）已清空"
+                showAlert = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showLyricsCacheClearedAlert)) { _ in
+                alertMessage = "歌词缓存已清空"
+                showAlert = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showAllCachesClearedAlert)) { _ in
+                alertMessage = "所有缓存已清空"
+                showAlert = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showVolumeNormalizationAnalysis)) { _ in
+                showVolumeNormalizationAnalysis = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .requestDismissAllSheets)) { _ in
+                showVolumeNormalizationAnalysis = false
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .audioPlayerDidFailToPlay)) { notification in
+                let raw = (notification.userInfo?["message"] as? String) ?? "播放失败"
+                let firstLine =
+                    raw
+                    .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true)
+                    .first
+                    .map(String.init) ?? raw
+                showToastMessage(firstLine, kind: .error)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showAppToast)) { notification in
+                guard let userInfo = notification.userInfo else { return }
 
-            let title = (userInfo["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let subtitle = (userInfo["subtitle"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let duration = (userInfo["duration"] as? TimeInterval) ?? 2.8
-            let tapURL =
-                (userInfo["url"] as? URL)
-                ?? ((userInfo["url"] as? String).flatMap { URL(string: $0) })
-            let kindRaw = (userInfo["kind"] as? String) ?? "info"
-            let kind = ToastKind(rawValue: kindRaw) ?? .info
+                let title = (userInfo["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let subtitle = (userInfo["subtitle"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let duration = (userInfo["duration"] as? TimeInterval) ?? 2.8
+                let tapURL =
+                    (userInfo["url"] as? URL)
+                    ?? ((userInfo["url"] as? String).flatMap { URL(string: $0) })
+                let kindRaw = (userInfo["kind"] as? String) ?? "info"
+                let kind = ToastKind(rawValue: kindRaw) ?? .info
 
-            guard !title.isEmpty else { return }
-            showToastMessage(title, subtitle: subtitle, kind: kind, duration: duration, tapURL: tapURL)
-        }
+                guard !title.isEmpty else { return }
+                showToastMessage(title, subtitle: subtitle, kind: kind, duration: duration, tapURL: tapURL)
+            }
+
+        return withReceivers
     }
 
     private func maybeAutoCheckForUpdates() {

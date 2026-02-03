@@ -39,9 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	               !flags.contains(.option),
 	               !flags.contains(.shift),
 	               event.charactersIgnoringModifiers?.lowercased() == "q" {
-	                DispatchQueue.main.async {
-	                    NSApplication.shared.terminate(nil)
-	                }
+	                AppTerminator.requestQuit()
 	                return nil
 	            }
 
