@@ -10,6 +10,12 @@ actor UpdateChecker {
         let releaseURL: URL
     }
 
+    enum CheckOutcome: Sendable {
+        case upToDate(currentVersion: String, latestVersion: String, releaseURL: URL)
+        case updateAvailable(UpdateInfo)
+        case failed(message: String, releaseURL: URL)
+    }
+
     private struct GitHubLatestRelease: Decodable {
         let tagName: String
         let htmlURL: String?
@@ -20,21 +26,35 @@ actor UpdateChecker {
         }
     }
 
-    func checkIfUpdateAvailable(currentVersion: String) async -> UpdateInfo? {
-        guard let current = Version.parse(currentVersion) else { return nil }
+    func check(currentVersion: String) async -> CheckOutcome {
+        let releasesURL = URL(string: "https://github.com/lueluelue2006/macOS_MusicPlayer/releases")!
+        guard let current = Version.parse(currentVersion) else {
+            return .failed(message: "当前版本号无效", releaseURL: releasesURL)
+        }
 
-        guard let latestRelease = try? await fetchLatestRelease() else { return nil }
-        let latestVersionString = latestRelease.tagName.trimmingCharacters(in: .whitespacesAndNewlines).trimmingPrefix("v")
-        guard let latest = Version.parse(latestVersionString) else { return nil }
+        do {
+            let latestRelease = try await fetchLatestRelease()
+            let latestVersionString = latestRelease.tagName.trimmingCharacters(in: .whitespacesAndNewlines).trimmingPrefix("v")
+            guard let latest = Version.parse(latestVersionString) else {
+                return .failed(message: "版本信息解析失败", releaseURL: releasesURL)
+            }
 
-        guard latest > current else { return nil }
-        guard let url = URL(string: latestRelease.htmlURL ?? "https://github.com/lueluelue2006/macOS_MusicPlayer/releases") else { return nil }
+            if latest > current {
+                return .updateAvailable(UpdateInfo(
+                    currentVersion: currentVersion,
+                    latestVersion: latestVersionString,
+                    releaseURL: releasesURL
+                ))
+            }
 
-        return UpdateInfo(
-            currentVersion: currentVersion,
-            latestVersion: latestVersionString,
-            releaseURL: url
-        )
+            return .upToDate(
+                currentVersion: currentVersion,
+                latestVersion: latestVersionString,
+                releaseURL: releasesURL
+            )
+        } catch {
+            return .failed(message: "检查更新失败", releaseURL: releasesURL)
+        }
     }
 
     private func fetchLatestRelease() async throws -> GitHubLatestRelease {
@@ -85,4 +105,3 @@ private extension String {
         return String(dropFirst(prefix.count))
     }
 }
-

@@ -16,12 +16,11 @@ struct ContentView: View {
     @State private var showToast: Bool = false
     @State private var toastTask: Task<Void, Never>?
 
-    // 更新检查（自动：每次启动，成功加载完歌曲后执行一次）
+    // 更新检查（自动：启动后，在播放列表成功加载完歌曲后执行一次；延迟执行避免与加载/恢复抢占资源）
     @Environment(\.openURL) private var openURL
     @State private var didAutoCheckForUpdatesThisLaunch: Bool = false
     @State private var updateCheckTask: Task<Void, Never>?
-    @State private var showUpdateAlert: Bool = false
-    @State private var updateInfo: UpdateChecker.UpdateInfo?
+    @State private var toastTapURL: URL?
 
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
@@ -102,21 +101,7 @@ struct ContentView: View {
         .alert(alertMessage, isPresented: $showAlert) {
             Button("确定", role: .cancel) { }
         }
-        .alert("发现新版本", isPresented: $showUpdateAlert) {
-            Button("稍后", role: .cancel) { }
-            Button("打开下载页") {
-                if let url = updateInfo?.releaseURL {
-                    openURL(url)
-                }
-            }
-        } message: {
-            if let info = updateInfo {
-                Text("当前版本：\(info.currentVersion)\n最新版本：\(info.latestVersion)\n\n是否前往 GitHub Releases 下载？")
-            } else {
-                Text("发现新版本，是否前往 GitHub Releases 下载？")
-            }
-        }
-        .overlay(alignment: .top) {
+        .overlay(alignment: .topTrailing) {
             if showToast {
                 Text(toastMessage)
                     .font(.callout)
@@ -132,6 +117,13 @@ struct ContentView: View {
                     )
                     .shadow(color: theme.subtleShadow, radius: 10, x: 0, y: 4)
                     .padding(.top, 12)
+                    .padding(.trailing, 12)
+                    .onTapGesture {
+                        if let url = toastTapURL {
+                            openURL(url)
+                        }
+                    }
+                    .help(toastTapURL == nil ? "" : "点击打开 GitHub Releases")
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
@@ -204,20 +196,50 @@ struct ContentView: View {
     }
 
     private func maybeAutoCheckForUpdates() {
-        guard !didAutoCheckForUpdatesThisLaunch else { return }
-        guard !playlistManager.audioFiles.isEmpty else { return }
-        guard !playlistManager.isAddingFiles else { return }
-        guard !playlistManager.isRestoringPlaylist else { return }
+        let ready =
+            !playlistManager.audioFiles.isEmpty &&
+            !playlistManager.isAddingFiles &&
+            !playlistManager.isRestoringPlaylist
 
-        didAutoCheckForUpdatesThisLaunch = true
-        updateCheckTask?.cancel()
+        // 若用户正在导入/恢复或播放列表为空：取消任何“待执行”的更新检查，避免与加载抢占资源
+        guard ready else {
+            updateCheckTask?.cancel()
+            updateCheckTask = nil
+            return
+        }
+
+        guard !didAutoCheckForUpdatesThisLaunch else { return }
+
+        // 已经排队等待执行，则不重复创建任务
+        guard updateCheckTask == nil else { return }
 
         let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "3.1"
-        updateCheckTask = Task {
-            guard let info = await UpdateChecker.shared.checkIfUpdateAvailable(currentVersion: currentVersion) else { return }
+        updateCheckTask = Task(priority: .background) {
+            // 延迟一点：让加载/恢复后的 UI 与磁盘/元数据任务先跑一会儿
+            do {
+                try await Task.sleep(nanoseconds: 3_000_000_000)
+            } catch {
+                return
+            }
+            if Task.isCancelled { return }
+
+            let outcome = await UpdateChecker.shared.check(currentVersion: currentVersion)
+            if Task.isCancelled { return }
             await MainActor.run {
-                self.updateInfo = info
-                self.showUpdateAlert = true
+                didAutoCheckForUpdatesThisLaunch = true
+                updateCheckTask = nil
+                switch outcome {
+                case .updateAvailable(let info):
+                    showToastMessage("发现新版本 \(info.latestVersion) · 点击打开下载页", duration: 3.0, tapURL: info.releaseURL)
+                case .upToDate(let current, let latest, let url):
+                    if latest == current {
+                        showToastMessage("已是最新版本 \(current)", duration: 2.0, tapURL: url)
+                    } else {
+                        showToastMessage("已是最新版本 \(current)（线上 \(latest)）", duration: 2.0, tapURL: url)
+                    }
+                case .failed(let message, let url):
+                    showToastMessage(message, duration: 2.0, tapURL: url)
+                }
             }
         }
     }
@@ -246,14 +268,15 @@ struct ContentView: View {
     }
 
     @MainActor
-    private func showToastMessage(_ message: String) {
+    private func showToastMessage(_ message: String, duration: TimeInterval = 2.8, tapURL: URL? = nil) {
         toastTask?.cancel()
         toastMessage = message
+        toastTapURL = tapURL
         withAnimation(.easeInOut(duration: 0.2)) {
             showToast = true
         }
         toastTask = Task {
-            try? await Task.sleep(nanoseconds: 2_800_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(max(0, duration) * 1_000_000_000))
             await MainActor.run {
                 withAnimation(.easeInOut(duration: 0.2)) {
                     showToast = false
