@@ -320,19 +320,11 @@ private struct ToastBanner: View {
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            if let onTap {
-                Button(action: onTap) {
-                    bannerContent
-                }
-                .buttonStyle(PlainButtonStyle())
-                .help("点击打开 GitHub Releases")
-            } else {
-                bannerContent
-            }
+            contentBody
 
             Button(action: onClose) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 11, weight: .bold))
+                    .font(.system(size: 12, weight: .bold))
                     .foregroundColor(theme.mutedText)
                     .padding(10)
             }
@@ -340,7 +332,9 @@ private struct ToastBanner: View {
             .help("关闭")
         }
         .background(backgroundShape)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
         .shadow(color: theme.subtleShadow, radius: 14, x: 0, y: 8)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var bannerContent: some View {
@@ -352,13 +346,13 @@ private struct ToastBanner: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(.primary)
                     .lineLimit(2)
 
                 if let subtitle, !subtitle.isEmpty {
                     Text(subtitle)
-                        .font(.system(size: 12))
+                        .font(.system(size: 13))
                         .foregroundColor(theme.mutedText)
                         .lineLimit(2)
                 }
@@ -368,8 +362,21 @@ private struct ToastBanner: View {
         }
         .padding(.leading, 14)
         .padding(.trailing, 30)
-        .padding(.vertical, 12)
+        .padding(.vertical, 14)
         .frame(minWidth: 320, maxWidth: 420, alignment: .leading)
+    }
+
+    private var contentBody: some View {
+        Group {
+            if let onTap {
+                Button(action: onTap) { bannerContent }
+                    .buttonStyle(PlainButtonStyle())
+                    .help("点击打开 GitHub Releases")
+            } else {
+                bannerContent
+            }
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 14))
     }
 
     private var indicatorStyle: AnyShapeStyle {
@@ -389,18 +396,21 @@ private struct ToastBanner: View {
 
     private var backgroundShape: some View {
         RoundedRectangle(cornerRadius: 14)
-            .fill(.ultraThinMaterial)
-            .overlay(
-                RoundedRectangle(cornerRadius: 14)
-                    .fill(theme.glassSurface)
-            )
+            .fill(backgroundFill)
             .overlay(
                 RoundedRectangle(cornerRadius: 14)
                     .stroke(borderColor, lineWidth: 1)
             )
     }
 
+    private var backgroundFill: Color {
+        if colorScheme == .dark {
+            return Color.black.opacity(0.72)
+        }
+        return Color.white.opacity(0.92)
+    }
+
     private var borderColor: Color {
-        colorScheme == .dark ? Color.white.opacity(0.16) : Color.black.opacity(0.10)
+        colorScheme == .dark ? Color.white.opacity(0.18) : Color.black.opacity(0.10)
     }
 }
