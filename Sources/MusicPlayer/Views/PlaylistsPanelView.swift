@@ -13,6 +13,12 @@ struct PlaylistsPanelView: View {
     @State private var isLoadingTracks: Bool = false
     @State private var loadTask: Task<Void, Never>?
 
+    // Add-from-queue multi-select sheet
+    @State private var showAddFromQueueSheet: Bool = false
+    @State private var addFromQueueTargetPlaylistID: UserPlaylist.ID?
+    @State private var addFromQueueSearchText: String = ""
+    @State private var addFromQueueSelectedKeys: Set<String> = []
+
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
@@ -43,6 +49,9 @@ struct PlaylistsPanelView: View {
         }
         .padding(.horizontal, 20)
         .padding(.bottom, 12)
+        .sheet(isPresented: $showAddFromQueueSheet) {
+            addFromQueueSheet
+        }
         .onAppear {
             playlistsStore.loadIfNeeded()
             reloadSelectedPlaylist()
@@ -221,8 +230,7 @@ struct PlaylistsPanelView: View {
 
             Menu {
                 Button("从当前队列添加") {
-                    playlistsStore.addTracks(playlistManager.audioFiles.map(\.url), to: playlist.id)
-                    reloadSelectedPlaylist()
+                    openAddFromQueueSheet(targetPlaylistID: playlist.id)
                 }
                 Button("添加正在播放") {
                     if let url = audioPlayer.currentFile?.url {
@@ -251,6 +259,18 @@ struct PlaylistsPanelView: View {
     }
 
     // MARK: - Actions
+
+    @MainActor
+    private func openAddFromQueueSheet(targetPlaylistID: UserPlaylist.ID) {
+        guard !playlistManager.audioFiles.isEmpty else {
+            postToast(title: "队列为空", subtitle: "先在“队列”里导入一些歌曲", kind: "info")
+            return
+        }
+        addFromQueueTargetPlaylistID = targetPlaylistID
+        addFromQueueSearchText = ""
+        addFromQueueSelectedKeys.removeAll(keepingCapacity: true)
+        showAddFromQueueSheet = true
+    }
 
     @MainActor
     private func renamePlaylist(_ playlist: UserPlaylist) {
@@ -396,5 +416,138 @@ struct PlaylistsPanelView: View {
         url.standardizedFileURL.path
             .precomposedStringWithCanonicalMapping
             .lowercased()
+    }
+
+    // MARK: - Add from queue sheet
+
+    private var addFromQueueCandidates: [AudioFile] {
+        let all = playlistManager.audioFiles
+        guard !addFromQueueSearchText.isEmpty else { return all }
+        let q = addFromQueueSearchText
+        return all.filter { f in
+            f.metadata.title.localizedCaseInsensitiveContains(q) ||
+                f.metadata.artist.localizedCaseInsensitiveContains(q) ||
+                f.metadata.album.localizedCaseInsensitiveContains(q) ||
+                f.url.lastPathComponent.localizedCaseInsensitiveContains(q)
+        }
+    }
+
+    private var addFromQueueSelectedFiles: [AudioFile] {
+        let keySet = addFromQueueSelectedKeys
+        guard !keySet.isEmpty else { return [] }
+        return playlistManager.audioFiles.filter { keySet.contains(pathKey($0.url)) }
+    }
+
+    @ViewBuilder
+    private var addFromQueueSheet: some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 10) {
+                Text("从队列添加")
+                    .font(.headline)
+                Spacer()
+                Button("全选") {
+                    for f in addFromQueueCandidates {
+                        addFromQueueSelectedKeys.insert(pathKey(f.url))
+                    }
+                }
+                .disabled(addFromQueueCandidates.isEmpty)
+                Button("全不选") {
+                    addFromQueueSelectedKeys.removeAll(keepingCapacity: true)
+                }
+                .disabled(addFromQueueSelectedKeys.isEmpty)
+            }
+
+            SearchBarView(searchText: $addFromQueueSearchText) { q in
+                addFromQueueSearchText = q
+            }
+
+            List(addFromQueueCandidates) { file in
+                Button {
+                    let k = pathKey(file.url)
+                    if addFromQueueSelectedKeys.contains(k) {
+                        addFromQueueSelectedKeys.remove(k)
+                    } else {
+                        addFromQueueSelectedKeys.insert(k)
+                    }
+                } label: {
+                    let selected = addFromQueueSelectedKeys.contains(pathKey(file.url))
+                    HStack(spacing: 10) {
+                        Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(selected ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText))
+                            .font(.system(size: 16, weight: .semibold))
+                            .frame(width: 18, height: 18)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(file.metadata.title)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundColor(.primary)
+                                .lineLimit(1)
+                            Text(file.url.lastPathComponent)
+                                .font(.caption2)
+                                .foregroundColor(theme.mutedText)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+                    }
+                    .padding(.vertical, 2)
+                }
+                .buttonStyle(.plain)
+            }
+            .listStyle(.plain)
+
+            // Bottom "selected files" area
+            VStack(alignment: .leading, spacing: 8) {
+                Text("已选 \(addFromQueueSelectedKeys.count) 首：")
+                    .font(.caption)
+                    .foregroundColor(theme.mutedText)
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(addFromQueueSelectedFiles, id: \.id) { f in
+                            Text(f.url.lastPathComponent)
+                                .font(.caption2)
+                                .foregroundColor(theme.mutedText.opacity(0.95))
+                                .lineLimit(1)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 90)
+                .padding(10)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(theme.mutedSurface)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(theme.stroke, lineWidth: 1)
+                        )
+                )
+            }
+
+            HStack {
+                Button("取消") {
+                    showAddFromQueueSheet = false
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Spacer()
+
+                Button("添加 \(addFromQueueSelectedKeys.count) 首") {
+                    guard let targetID = addFromQueueTargetPlaylistID else {
+                        showAddFromQueueSheet = false
+                        return
+                    }
+                    let urls = addFromQueueSelectedFiles.map(\.url)
+                    playlistsStore.addTracks(urls, to: targetID)
+                    showAddFromQueueSheet = false
+                    reloadSelectedPlaylist()
+                    postToast(title: "已添加 \(urls.count) 首", subtitle: nil, kind: "success")
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(addFromQueueSelectedKeys.isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(minWidth: 520, minHeight: 560)
     }
 }
