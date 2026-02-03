@@ -177,6 +177,10 @@ struct MusicPlayerCommands: Commands {
                 }
 
                 Button("打开系统通知设置…") {
+                    let bid = Bundle.main.bundleIdentifier ?? "io.github.lueluelue2006.macosmusicplayer"
+                    if NotificationSettingsHelper.openAppNotificationSettings(bundleIdentifier: bid) {
+                        return
+                    }
                     if !NotificationSettingsHelper.openSystemNotificationSettings() {
                         NotificationSettingsHelper.copyOpenCommandAndOpenTerminal()
                     }
@@ -219,7 +223,7 @@ struct MusicPlayerCommands: Commands {
 private enum NotificationSettingsHelper {
     private static let notificationsPaneCandidates: [URL] = [
         URL(string: "x-apple.systempreferences:com.apple.preference.notifications")!,
-        URL(string: "x-apple.systempreferences:com.apple.notifications-Settings.extension")!,
+        URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!,
     ]
 
     private static let settingsAppURL = URL(fileURLWithPath: "/System/Applications/System Settings.app")
@@ -259,6 +263,18 @@ private enum NotificationSettingsHelper {
     }
 
     static func openSystemNotificationSettingsOrFallback() {
+        let bid = Bundle.main.bundleIdentifier ?? "io.github.lueluelue2006.macosmusicplayer"
+        if openAppNotificationSettings(bundleIdentifier: bid) {
+            postToast(
+                title: "已打开系统通知设置",
+                subtitle: "若未自动定位到 MusicPlayer，请在列表中点击它",
+                kind: "warning",
+                duration: 5.0,
+                url: notificationsPaneCandidates.first
+            )
+            return
+        }
+
         if openSystemNotificationSettings() {
             postToast(
                 title: "通知权限未启用",
@@ -270,6 +286,29 @@ private enum NotificationSettingsHelper {
             return
         }
         copyOpenCommandAndOpenTerminal()
+    }
+
+    @discardableResult
+    static func openAppNotificationSettings(bundleIdentifier: String) -> Bool {
+        let encoded = bundleIdentifier.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? bundleIdentifier
+
+        let candidates = [
+            "x-apple.systempreferences:com.apple.preference.notifications?bundleIdentifier=\(encoded)",
+            "x-apple.systempreferences:com.apple.preference.notifications?bundleId=\(encoded)",
+            "x-apple.systempreferences:com.apple.preference.notifications?AppID=\(encoded)",
+            "x-apple.systempreferences:com.apple.preference.notifications?app=\(encoded)",
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension?bundleIdentifier=\(encoded)",
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension?bundle_identifier=\(encoded)",
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension?AppID=\(encoded)",
+        ].compactMap(URL.init(string:))
+
+        for url in candidates {
+            if NSWorkspace.shared.open(url) {
+                activateSystemSettingsSoon()
+                return true
+            }
+        }
+        return false
     }
 
     static func copyOpenCommandAndOpenTerminal() {
