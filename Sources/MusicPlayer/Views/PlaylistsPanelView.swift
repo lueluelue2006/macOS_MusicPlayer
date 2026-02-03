@@ -445,13 +445,19 @@ struct PlaylistsPanelView: View {
                 Text("从队列添加")
                     .font(.headline)
                 Spacer()
-                Button("全选") {
+                Button("本页全选") {
                     for f in addFromQueueCandidates {
                         addFromQueueSelectedKeys.insert(pathKey(f.url))
                     }
                 }
                 .disabled(addFromQueueCandidates.isEmpty)
-                Button("全不选") {
+                Button("本页全不选") {
+                    for f in addFromQueueCandidates {
+                        addFromQueueSelectedKeys.remove(pathKey(f.url))
+                    }
+                }
+                .disabled(addFromQueueCandidates.isEmpty)
+                Button("清空") {
                     addFromQueueSelectedKeys.removeAll(keepingCapacity: true)
                 }
                 .disabled(addFromQueueSelectedKeys.isEmpty)
