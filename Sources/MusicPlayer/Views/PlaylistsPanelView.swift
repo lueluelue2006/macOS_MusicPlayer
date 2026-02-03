@@ -110,8 +110,10 @@ struct PlaylistsPanelView: View {
                             if audioPlayer.currentFile != nil,
                                audioPlayer.persistPlaybackState,
                                playlistManager.playbackScope == .playlist(playlist.id) {
-                                Image(systemName: audioPlayer.isShuffling ? "shuffle.circle.fill" : "play.circle.fill")
-                                    .foregroundStyle(theme.accentGradient)
+                                ActivePlaybackScopeIndicator(
+                                    systemName: audioPlayer.isShuffling ? "shuffle.circle.fill" : "play.circle.fill",
+                                    isPlaying: audioPlayer.isPlaying
+                                )
                                     .help("正在以该歌单作为播放范围")
                             }
                         }
