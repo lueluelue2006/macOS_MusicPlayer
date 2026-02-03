@@ -166,7 +166,7 @@ struct ContentView: View {
             showAlert = true
         }
         .onReceive(NotificationCenter.default.publisher(for: .showArtworkCacheClearedAlert)) { _ in
-            alertMessage = "封面缩略图已清空"
+            alertMessage = "封面缩略图（内存）已清空"
             showAlert = true
         }
         .onReceive(NotificationCenter.default.publisher(for: .showLyricsCacheClearedAlert)) { _ in
