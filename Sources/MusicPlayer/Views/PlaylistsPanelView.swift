@@ -26,6 +26,15 @@ struct PlaylistsPanelView: View {
         playlistsStore.playlist(for: playlistsStore.selectedPlaylistID)
     }
 
+    private var currentHighlightedURL: URL? {
+        if audioPlayer.persistPlaybackState,
+           playlistManager.currentIndex >= 0,
+           playlistManager.currentIndex < playlistManager.audioFiles.count {
+            return playlistManager.audioFiles[playlistManager.currentIndex].url
+        }
+        return audioPlayer.currentFile?.url
+    }
+
     private var filteredTracks: [AudioFile] {
         guard !trackSearchText.isEmpty else { return loadedTracks }
         let q = trackSearchText
@@ -168,7 +177,7 @@ struct PlaylistsPanelView: View {
                     List(filteredTracks) { file in
                         PlaylistItemView(
                             file: file,
-                            isCurrentTrack: audioPlayer.currentFile?.url == file.url,
+                            isCurrentTrack: currentHighlightedURL == file.url,
                             isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
                             unplayableReason: trackUnplayableReasons[pathKey(file.url)],
                             searchText: trackSearchText

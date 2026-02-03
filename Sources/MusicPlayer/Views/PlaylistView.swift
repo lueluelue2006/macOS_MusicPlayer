@@ -33,6 +33,18 @@ struct PlaylistView: View {
     }
 
     @State private var panelMode: PanelMode = .queue
+
+    private var currentHighlightedURL: URL? {
+        // For normal playback (queue-based), rely on PlaylistManager selection to avoid any
+        // transient `AudioPlayer.currentFile` toggling during async loads.
+        if audioPlayer.persistPlaybackState,
+           playlistManager.currentIndex >= 0,
+           playlistManager.currentIndex < playlistManager.audioFiles.count {
+            return playlistManager.audioFiles[playlistManager.currentIndex].url
+        }
+        // For ephemeral playback (external open, not in queue), fall back to the loaded file.
+        return audioPlayer.currentFile?.url
+    }
     
     // 确保窗口在视图销毁时被清理
     init(audioPlayer: AudioPlayer, playlistManager: PlaylistManager, playlistsStore: PlaylistsStore) {
@@ -211,7 +223,7 @@ struct PlaylistView: View {
                         List(playlistManager.filteredFiles) { file in
                             PlaylistItemView(
                                 file: file,
-                                isCurrentTrack: audioPlayer.currentFile?.url == file.url,
+                                isCurrentTrack: currentHighlightedURL == file.url,
                                 isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
                                 unplayableReason: playlistManager.unplayableReason(for: file.url),
                                 searchText: playlistManager.searchText
