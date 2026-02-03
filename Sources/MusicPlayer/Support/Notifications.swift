@@ -8,6 +8,7 @@ extension Notification.Name {
 
     /// 缓存清理通知
     static let showVolumeCacheClearedAlert = Notification.Name("showVolumeCacheClearedAlert")
+    static let showDurationCacheClearedAlert = Notification.Name("showDurationCacheClearedAlert")
     static let showArtworkCacheClearedAlert = Notification.Name("showArtworkCacheClearedAlert")
     static let showLyricsCacheClearedAlert = Notification.Name("showLyricsCacheClearedAlert")
     static let showAllCachesClearedAlert = Notification.Name("showAllCachesClearedAlert")

@@ -165,6 +165,10 @@ struct ContentView: View {
             alertMessage = "音量均衡缓存已清空"
             showAlert = true
         }
+        .onReceive(NotificationCenter.default.publisher(for: .showDurationCacheClearedAlert)) { _ in
+            alertMessage = "时长缓存已清空"
+            showAlert = true
+        }
         .onReceive(NotificationCenter.default.publisher(for: .showArtworkCacheClearedAlert)) { _ in
             alertMessage = "封面缩略图（内存）已清空"
             showAlert = true

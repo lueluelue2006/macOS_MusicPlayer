@@ -53,6 +53,20 @@ struct MusicPlayerCommands: Commands {
                     }
                 }
 
+                Button("清空时长缓存") {
+                    Task { @MainActor in
+                        let confirmed = DestructiveConfirmation.confirm(
+                            title: "清空时长缓存？",
+                            message: "将删除歌曲时长缓存。之后列表会重新读取时长，可能耗时。",
+                            confirmTitle: "清除",
+                            cancelTitle: "不清除"
+                        )
+                        guard confirmed else { return }
+                        await DurationCache.shared.removeAll()
+                        NotificationCenter.default.post(name: .showDurationCacheClearedAlert, object: nil)
+                    }
+                }
+
                 Button("清空封面缩略图（内存）") {
                     Task { @MainActor in
                         let confirmed = DestructiveConfirmation.confirm(
@@ -87,12 +101,13 @@ struct MusicPlayerCommands: Commands {
                     Task { @MainActor in
                         let confirmed = DestructiveConfirmation.confirm(
                             title: "清空所有缓存？",
-                            message: "将清空音量均衡缓存、封面缩略图（内存）、歌词缓存。操作不可撤销。",
+                            message: "将清空音量均衡缓存、时长缓存、封面缩略图（内存）、歌词缓存。操作不可撤销。",
                             confirmTitle: "清除",
                             cancelTitle: "不清除"
                         )
                         guard confirmed else { return }
                         audioPlayer.clearVolumeCache()
+                        await DurationCache.shared.removeAll()
                         audioPlayer.clearArtworkCache()
                         await LyricsService.shared.invalidateAll()
                         NotificationCenter.default.post(name: .showAllCachesClearedAlert, object: nil)
