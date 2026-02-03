@@ -107,6 +107,13 @@ struct PlaylistsPanelView: View {
                                     .foregroundColor(theme.mutedText)
                             }
                             Spacer(minLength: 0)
+                            if audioPlayer.currentFile != nil,
+                               audioPlayer.persistPlaybackState,
+                               playlistManager.playbackScope == .playlist(playlist.id) {
+                                Image(systemName: audioPlayer.isShuffling ? "shuffle.circle.fill" : "play.circle.fill")
+                                    .foregroundStyle(theme.accentGradient)
+                                    .help("正在以该歌单作为播放范围")
+                            }
                         }
                         .tag(playlist.id)
                         .contextMenu {
@@ -165,7 +172,7 @@ struct PlaylistsPanelView: View {
                             searchText: trackSearchText
                         ) { selectedFile in
                             NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                            playTrackAppendOnly(selectedFile)
+                            playTrackInPlaylist(selectedFile, playlist: playlist)
                         } deleteAction: { fileToDelete in
                             NotificationCenter.default.post(name: .blurSearchField, object: nil)
                             playlistsStore.removeTrack(path: fileToDelete.url.path, from: playlist.id)
@@ -297,23 +304,33 @@ struct PlaylistsPanelView: View {
             cancelTitle: "不删除"
         )
         guard confirmed else { return }
+        if playlistManager.playbackScope == .playlist(playlist.id) {
+            playlistManager.setPlaybackScopeQueue()
+        }
         playlistsStore.deletePlaylist(playlist)
         reloadSelectedPlaylist()
     }
 
     @MainActor
-    private func playTrackAppendOnly(_ file: AudioFile) {
+    private func playTrackInPlaylist(_ file: AudioFile, playlist: UserPlaylist) {
         if let reason = trackUnplayableReasons[pathKey(file.url)] {
             postToast(title: "无法播放：\(reason)", subtitle: file.url.lastPathComponent, kind: "warning")
             return
         }
-
-        if let idx = playlistManager.ensureInQueue([file], focusURL: file.url),
-           let selected = playlistManager.selectFile(at: idx) {
-            audioPlayer.play(selected)
-        } else {
-            postToast(title: "未能加入播放列表", subtitle: file.url.lastPathComponent, kind: "warning")
+        let playable = loadedTracks.filter { trackUnplayableReasons[pathKey($0.url)] == nil }
+        guard !playable.isEmpty else {
+            postToast(title: "歌单里没有可播放的歌曲", subtitle: nil, kind: "warning")
+            return
         }
+        guard let idx = playlistManager.ensureInQueue(playable, focusURL: file.url),
+              let selected = playlistManager.selectFile(at: idx)
+        else {
+            postToast(title: "未能加入播放列表", subtitle: file.url.lastPathComponent, kind: "warning")
+            return
+        }
+
+        playlistManager.setPlaybackScopePlaylist(playlist.id, trackURLsInOrder: playable.map(\.url))
+        audioPlayer.play(selected)
     }
 
     @MainActor
@@ -331,6 +348,7 @@ struct PlaylistsPanelView: View {
             postToast(title: "已加入 \(playable.count) 首到播放列表", subtitle: nil, kind: "success")
             return
         }
+        playlistManager.setPlaybackScopePlaylist(playlist.id, trackURLsInOrder: playable.map(\.url))
         audioPlayer.play(selected)
     }
 
@@ -343,13 +361,14 @@ struct PlaylistsPanelView: View {
         trackUnplayableReasons = [:]
 
         guard let playlist = selectedPlaylist else { return }
+        let playlistID = playlist.id
         let paths = playlist.tracks.map(\.path)
         guard !paths.isEmpty else { return }
 
         isLoadingTracks = true
 
         let playlistManager = self.playlistManager
-        loadTask = Task.detached(priority: .background) { [paths, playlistManager] in
+        loadTask = Task.detached(priority: .background) { [paths, playlistManager, playlistID] in
             let fm = FileManager.default
             let gate = ConcurrencyGate(maxConcurrent: 4)
             func key(for url: URL) -> String {
@@ -405,6 +424,11 @@ struct PlaylistsPanelView: View {
                 self.loadedTracks = finalTracks
                 self.trackUnplayableReasons = finalReasons
                 self.isLoadingTracks = false
+
+                let playableURLs = finalTracks
+                    .filter { finalReasons[self.pathKey($0.url)] == nil }
+                    .map(\.url)
+                self.playlistManager.updatePlaybackScopePlaylistTracksIfActive(playlistID, trackURLsInOrder: playableURLs)
             }
         }
     }

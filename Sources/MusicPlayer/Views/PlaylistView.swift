@@ -218,6 +218,8 @@ struct PlaylistView: View {
                             ) { selectedFile in
                                 // 点击列表条目也顺便取消搜索聚焦
                                 NotificationCenter.default.post(name: .blurSearchField, object: nil)
+                                // 从队列播放：后续“下一首/随机/骰子”等都应作用于队列范围
+                                playlistManager.setPlaybackScopeQueue()
                                 if let index = playlistManager.audioFiles.firstIndex(of: selectedFile) {
                                     if let file = playlistManager.selectFile(at: index) {
                                         audioPlayer.play(file)

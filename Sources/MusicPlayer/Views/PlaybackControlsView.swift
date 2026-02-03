@@ -47,7 +47,7 @@ struct PlaybackControlsView: View {
                     .animation(AppTheme.quickSpring, value: previousButtonPressed)
                     .animation(AppTheme.quickSpring, value: previousHovered)
                 }
-                .disabled(playlistManager.audioFiles.isEmpty)
+                .disabled(playlistManager.playbackScopePlayableCount() == 0)
                 .buttonStyle(PlainButtonStyle())
                 .onHover { hovering in previousHovered = hovering }
                 .onLongPressGesture(minimumDuration: 0, maximumDistance: .infinity, pressing: { pressing in
@@ -146,7 +146,7 @@ struct PlaybackControlsView: View {
                     .animation(AppTheme.quickSpring, value: nextButtonPressed)
                     .animation(AppTheme.quickSpring, value: nextHovered)
                 }
-                .disabled(playlistManager.audioFiles.isEmpty)
+                .disabled(playlistManager.playbackScopePlayableCount() == 0)
                 .buttonStyle(PlainButtonStyle())
                 .onHover { hovering in nextHovered = hovering }
                 .onLongPressGesture(minimumDuration: 0, maximumDistance: .infinity, pressing: { pressing in
@@ -240,7 +240,7 @@ struct PlaybackControlsView: View {
                                     .shadow(color: Color.orange.opacity(0.3), radius: 4, x: 0, y: 2)
                             )
                     }
-                    .disabled(playlistManager.audioFiles.count < 2)
+                    .disabled(playlistManager.playbackScopePlayableCount() < 2)
                     .buttonStyle(PlainButtonStyle())
                     .help("随机播放一首新歌")
                 }

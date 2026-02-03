@@ -159,6 +159,7 @@ final class IPCServer {
             guard let raw = request.arguments?["index"], let idx = Int(raw) else {
                 return IPCReply(id: request.id, ok: false, message: "missing/invalid index")
             }
+            playlistManager.setPlaybackScopeQueue()
             guard let f = playlistManager.selectFile(at: idx) else {
                 return IPCReply(id: request.id, ok: false, message: "index out of range")
             }
@@ -169,6 +170,7 @@ final class IPCServer {
             guard let raw = request.arguments?["query"] else {
                 return IPCReply(id: request.id, ok: false, message: "missing query")
             }
+            playlistManager.setPlaybackScopeQueue()
             let query = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             let tokens = query
                 .split(whereSeparator: { $0.isWhitespace })

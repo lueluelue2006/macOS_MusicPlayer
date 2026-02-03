@@ -6,6 +6,8 @@ final class PlaylistManager: ObservableObject {
     @Published var currentIndex: Int = 0
     @Published var filteredFiles: [AudioFile] = []
     @Published var searchText: String = ""
+    /// Which collection playback controls operate on (queue vs a user playlist).
+    @Published private(set) var playbackScope: PlaybackScope = .queue
     @Published var scanSubfolders: Bool = true { // 默认开启子文件夹扫描
         didSet { saveScanSubfoldersPreference() }
     }
@@ -13,6 +15,12 @@ final class PlaylistManager: ObservableObject {
     
     private var shuffleQueue: [Int] = []
     private var shuffleIndex = 0
+
+    // Playlist-scope playback (order defined by user playlist, not by queue order).
+    private var playbackPlaylistTrackKeys: [String] = []
+    private var playbackPlaylistPositionByKey: [String: Int] = [:]
+    private var playlistShuffleQueueKeys: [String] = []
+    private var playlistShuffleIndex: Int = 0
     
     @Published var isRestoringPlaylist = false  // 标记是否正在恢复播放列表
     private var didPerformInitialRestore: Bool = false
@@ -50,6 +58,96 @@ final class PlaylistManager: ObservableObject {
     init() {
         playlistIOQueue.setSpecific(key: playlistIOQueueKey, value: ())
         loadScanSubfoldersPreference()
+    }
+
+    // MARK: - Playback scope
+
+    /// Switch playback controls to operate on the main queue.
+    func setPlaybackScopeQueue() {
+        if playbackScope != .queue {
+            playbackScope = .queue
+        }
+        playbackPlaylistTrackKeys.removeAll(keepingCapacity: true)
+        playbackPlaylistPositionByKey.removeAll(keepingCapacity: true)
+        resetPlaylistShuffleQueue()
+    }
+
+    /// Switch playback controls to operate on a specific user playlist (in its playlist order).
+    /// - Note: `trackURLsInOrder` should contain only playable tracks in the playlist's order.
+    func setPlaybackScopePlaylist(_ playlistID: UserPlaylist.ID, trackURLsInOrder: [URL]) {
+        playbackScope = .playlist(playlistID)
+        playbackPlaylistTrackKeys = trackURLsInOrder.map { pathKey($0) }
+        rebuildPlaybackPlaylistPositions()
+        resetPlaylistShuffleQueue()
+    }
+
+    /// Update the active playlist scope track list (e.g. after adding/removing tracks),
+    /// keeping the existing shuffle queue as stable as possible.
+    func updatePlaybackScopePlaylistTracksIfActive(_ playlistID: UserPlaylist.ID, trackURLsInOrder: [URL]) {
+        guard playbackScope == .playlist(playlistID) else { return }
+
+        let oldKeys = playbackPlaylistTrackKeys
+        let newKeys = trackURLsInOrder.map { pathKey($0) }
+
+        playbackPlaylistTrackKeys = newKeys
+        rebuildPlaybackPlaylistPositions()
+        updatePlaylistShuffleQueue(oldKeys: oldKeys, newKeys: newKeys)
+    }
+
+    /// Number of playable tracks in the current playback scope.
+    func playbackScopePlayableCount() -> Int {
+        switch playbackScope {
+        case .queue:
+            return audioFiles.indices.reduce(0) { acc, idx in
+                acc + (isUnplayableIndex(idx) ? 0 : 1)
+            }
+        case .playlist:
+            guard !playbackPlaylistTrackKeys.isEmpty else { return 0 }
+            var count = 0
+            for key in playbackPlaylistTrackKeys {
+                guard let idx = indexInQueue(forPathKey: key) else { continue }
+                if !isUnplayableIndex(idx) { count += 1 }
+            }
+            return count
+        }
+    }
+
+    private func rebuildPlaybackPlaylistPositions() {
+        playbackPlaylistPositionByKey.removeAll(keepingCapacity: true)
+        for (idx, key) in playbackPlaylistTrackKeys.enumerated() {
+            // Preserve the first occurrence if duplicates ever exist (shouldn't, but be defensive).
+            if playbackPlaylistPositionByKey[key] == nil {
+                playbackPlaylistPositionByKey[key] = idx
+            }
+        }
+    }
+
+    private func resetPlaylistShuffleQueue() {
+        playlistShuffleQueueKeys.removeAll(keepingCapacity: true)
+        playlistShuffleIndex = 0
+    }
+
+    private func updatePlaylistShuffleQueue(oldKeys: [String], newKeys: [String]) {
+        guard !playlistShuffleQueueKeys.isEmpty else { return }
+
+        let oldSet = Set(oldKeys)
+        let newSet = Set(newKeys)
+        let removed = oldSet.subtracting(newSet)
+        let added = newKeys.filter { !oldSet.contains($0) }
+
+        if !removed.isEmpty {
+            playlistShuffleQueueKeys.removeAll { removed.contains($0) }
+            playlistShuffleIndex = min(playlistShuffleIndex, playlistShuffleQueueKeys.count)
+        }
+
+        if !added.isEmpty {
+            // Insert newly added tracks into the remaining shuffle window (after current index).
+            let insertLowerBound = min(playlistShuffleIndex, playlistShuffleQueueKeys.count)
+            for key in added {
+                let pos = Int.random(in: insertLowerBound...playlistShuffleQueueKeys.count)
+                playlistShuffleQueueKeys.insert(key, at: pos)
+            }
+        }
     }
 
     private func debugLog(_ message: @autoclosure () -> String) {
@@ -269,9 +367,11 @@ final class PlaylistManager: ObservableObject {
                     toAppend.append(f)
                 }
             }
+            let oldCount = self.audioFiles.count
             self.audioFiles.append(contentsOf: toAppend)
             self.updateFilteredFiles()
             self.enqueueDurationPrefetch(for: toAppend.map { $0.url })
+            self.integrateNewQueueIndicesIntoShuffleQueue(oldCount: oldCount)
 
             self.savePlaylist()
 
@@ -544,6 +644,10 @@ final class PlaylistManager: ObservableObject {
         let removedURL = audioFiles[index].url
         audioFiles.remove(at: index)
         unplayableReasons.removeValue(forKey: pathKey(removedURL))
+
+        if audioFiles.isEmpty {
+            setPlaybackScopeQueue()
+        }
         
         if currentIndex >= index {
             currentIndex = max(0, currentIndex - 1)
@@ -563,6 +667,7 @@ final class PlaylistManager: ObservableObject {
         searchText = ""
         unplayableReasons.removeAll()
         resetShuffleQueue()
+        setPlaybackScopeQueue()
         savePlaylist() // 清空后保存
     }
     
@@ -620,9 +725,11 @@ final class PlaylistManager: ObservableObject {
 
         guard !toAppend.isEmpty else { return focusIndex }
 
+        let oldCount = audioFiles.count
         audioFiles.append(contentsOf: toAppend)
         updateFilteredFiles()
         enqueueDurationPrefetch(for: toAppend.map(\.url))
+        integrateNewQueueIndicesIntoShuffleQueue(oldCount: oldCount)
         savePlaylist()
 
         return focusIndex
@@ -630,20 +737,12 @@ final class PlaylistManager: ObservableObject {
     
     func nextFile(isShuffling: Bool) -> AudioFile? {
         guard !audioFiles.isEmpty else { return nil }
-        
-        if isShuffling {
-            return getNextShuffledFile()
-        } else {
-            let total = audioFiles.count
-            var attempts = 0
-            while attempts < total {
-                currentIndex = (currentIndex + 1) % total
-                attempts += 1
-                if !isUnplayableIndex(currentIndex) {
-                    return audioFiles[currentIndex]
-                }
-            }
-            return nil
+
+        switch playbackScope {
+        case .queue:
+            return nextFileInQueue(isShuffling: isShuffling)
+        case .playlist:
+            return nextFileInPlaylist(isShuffling: isShuffling)
         }
     }
 
@@ -652,6 +751,90 @@ final class PlaylistManager: ObservableObject {
     func peekNextFile(isShuffling: Bool) -> AudioFile? {
         guard !audioFiles.isEmpty else { return nil }
 
+        switch playbackScope {
+        case .queue:
+            return peekNextFileInQueue(isShuffling: isShuffling)
+        case .playlist:
+            return peekNextFileInPlaylist(isShuffling: isShuffling)
+        }
+    }
+    
+    func previousFile(isShuffling: Bool) -> AudioFile? {
+        guard !audioFiles.isEmpty else { return nil }
+
+        switch playbackScope {
+        case .queue:
+            return previousFileInQueue(isShuffling: isShuffling)
+        case .playlist:
+            return previousFileInPlaylist(isShuffling: isShuffling)
+        }
+    }
+    
+    func selectFile(at index: Int) -> AudioFile? {
+        guard index < audioFiles.count else { return nil }
+        currentIndex = index
+        savePlaylist() // 保存当前索引
+        return audioFiles[index]
+    }
+    
+    func getRandomFile() -> AudioFile? {
+        guard !audioFiles.isEmpty else { return nil }
+
+        switch playbackScope {
+        case .queue:
+            return getRandomFileInQueue()
+        case .playlist:
+            return getRandomFileInPlaylist()
+        }
+    }
+    
+    // 获取一个随机文件，但排除当前正在播放的
+    func getRandomFileExcludingCurrent() -> AudioFile? {
+        switch playbackScope {
+        case .queue:
+            return getRandomFileExcludingCurrentInQueue()
+        case .playlist:
+            return getRandomFileExcludingCurrentInPlaylist()
+        }
+    }
+
+    // MARK: - Playback in queue scope
+
+    private func nextFileInQueue(isShuffling: Bool) -> AudioFile? {
+        if isShuffling {
+            return getNextShuffledFile()
+        }
+
+        let total = audioFiles.count
+        var attempts = 0
+        while attempts < total {
+            currentIndex = (currentIndex + 1) % total
+            attempts += 1
+            if !isUnplayableIndex(currentIndex) {
+                return audioFiles[currentIndex]
+            }
+        }
+        return nil
+    }
+
+    private func previousFileInQueue(isShuffling: Bool) -> AudioFile? {
+        if isShuffling {
+            return getPreviousShuffledFile()
+        }
+
+        let total = audioFiles.count
+        var attempts = 0
+        while attempts < total {
+            currentIndex = currentIndex > 0 ? currentIndex - 1 : total - 1
+            attempts += 1
+            if !isUnplayableIndex(currentIndex) {
+                return audioFiles[currentIndex]
+            }
+        }
+        return nil
+    }
+
+    private func peekNextFileInQueue(isShuffling: Bool) -> AudioFile? {
         if isShuffling {
             // 确保洗牌队列存在（允许提前创建队列；不会影响 UI）
             if shuffleQueue.isEmpty || shuffleIndex >= shuffleQueue.count {
@@ -666,49 +849,22 @@ final class PlaylistManager: ObservableObject {
                 i += 1
             }
             return nil
-        } else {
-            let total = audioFiles.count
-            var attempts = 0
-            var idx = currentIndex
-            while attempts < total {
-                idx = (idx + 1) % total
-                attempts += 1
-                if !isUnplayableIndex(idx) {
-                    return audioFiles[idx]
-                }
-            }
-            return nil
         }
-    }
-    
-    func previousFile(isShuffling: Bool) -> AudioFile? {
-        guard !audioFiles.isEmpty else { return nil }
-        
-        if isShuffling {
-            return getPreviousShuffledFile()
-        } else {
-            let total = audioFiles.count
-            var attempts = 0
-            while attempts < total {
-                currentIndex = currentIndex > 0 ? currentIndex - 1 : total - 1
-                attempts += 1
-                if !isUnplayableIndex(currentIndex) {
-                    return audioFiles[currentIndex]
-                }
+
+        let total = audioFiles.count
+        var attempts = 0
+        var idx = currentIndex
+        while attempts < total {
+            idx = (idx + 1) % total
+            attempts += 1
+            if !isUnplayableIndex(idx) {
+                return audioFiles[idx]
             }
-            return nil
         }
+        return nil
     }
-    
-    func selectFile(at index: Int) -> AudioFile? {
-        guard index < audioFiles.count else { return nil }
-        currentIndex = index
-        savePlaylist() // 保存当前索引
-        return audioFiles[index]
-    }
-    
-    func getRandomFile() -> AudioFile? {
-        guard !audioFiles.isEmpty else { return nil }
+
+    private func getRandomFileInQueue() -> AudioFile? {
         createShuffleQueue()
         if !shuffleQueue.isEmpty {
             currentIndex = shuffleQueue[0]
@@ -717,9 +873,8 @@ final class PlaylistManager: ObservableObject {
         }
         return nil
     }
-    
-    // 获取一个随机文件，但排除当前正在播放的
-    func getRandomFileExcludingCurrent() -> AudioFile? {
+
+    private func getRandomFileExcludingCurrentInQueue() -> AudioFile? {
         guard audioFiles.count > 1 else { return nil }
 
         let candidates = audioFiles.indices.filter { $0 != currentIndex && !isUnplayableIndex($0) }
@@ -729,11 +884,221 @@ final class PlaylistManager: ObservableObject {
         savePlaylist() // 保存新的索引
         return audioFiles[idx]
     }
-    
+
+    // MARK: - Playback in playlist scope
+
+    private func nextFileInPlaylist(isShuffling: Bool) -> AudioFile? {
+        guard !playbackPlaylistTrackKeys.isEmpty else { return nil }
+        if isShuffling {
+            return getNextShuffledFileInPlaylist()
+        }
+
+        let total = playbackPlaylistTrackKeys.count
+        var attempts = 0
+        var position = currentPlaylistPosition() ?? -1
+        while attempts < total {
+            position = (position + 1) % total
+            attempts += 1
+            let key = playbackPlaylistTrackKeys[position]
+            guard let idx = indexInQueue(forPathKey: key) else { continue }
+            if isUnplayableIndex(idx) { continue }
+            currentIndex = idx
+            savePlaylist()
+            return audioFiles[idx]
+        }
+        return nil
+    }
+
+    private func previousFileInPlaylist(isShuffling: Bool) -> AudioFile? {
+        guard !playbackPlaylistTrackKeys.isEmpty else { return nil }
+        if isShuffling {
+            return getPreviousShuffledFileInPlaylist()
+        }
+
+        let total = playbackPlaylistTrackKeys.count
+        var attempts = 0
+        var position = currentPlaylistPosition() ?? 0
+        while attempts < total {
+            position = position > 0 ? (position - 1) : (total - 1)
+            attempts += 1
+            let key = playbackPlaylistTrackKeys[position]
+            guard let idx = indexInQueue(forPathKey: key) else { continue }
+            if isUnplayableIndex(idx) { continue }
+            currentIndex = idx
+            savePlaylist()
+            return audioFiles[idx]
+        }
+        return nil
+    }
+
+    private func peekNextFileInPlaylist(isShuffling: Bool) -> AudioFile? {
+        guard !playbackPlaylistTrackKeys.isEmpty else { return nil }
+
+        if isShuffling {
+            if playlistShuffleQueueKeys.isEmpty || playlistShuffleIndex >= playlistShuffleQueueKeys.count {
+                createPlaylistShuffleQueue()
+            }
+            var i = playlistShuffleIndex
+            while i < playlistShuffleQueueKeys.count {
+                let key = playlistShuffleQueueKeys[i]
+                if let idx = indexInQueue(forPathKey: key), !isUnplayableIndex(idx) {
+                    return audioFiles[idx]
+                }
+                i += 1
+            }
+            return nil
+        }
+
+        let total = playbackPlaylistTrackKeys.count
+        var attempts = 0
+        var position = currentPlaylistPosition() ?? -1
+        while attempts < total {
+            position = (position + 1) % total
+            attempts += 1
+            let key = playbackPlaylistTrackKeys[position]
+            if let idx = indexInQueue(forPathKey: key), !isUnplayableIndex(idx) {
+                return audioFiles[idx]
+            }
+        }
+        return nil
+    }
+
+    private func getRandomFileInPlaylist() -> AudioFile? {
+        createPlaylistShuffleQueue(startFromRandom: true)
+        guard let firstKey = playlistShuffleQueueKeys.first else { return nil }
+        guard let idx = indexInQueue(forPathKey: firstKey), !isUnplayableIndex(idx) else { return nil }
+        currentIndex = idx
+        savePlaylist()
+        return audioFiles[idx]
+    }
+
+    private func getRandomFileExcludingCurrentInPlaylist() -> AudioFile? {
+        guard playbackScopePlayableCount() > 1 else { return nil }
+
+        let currentKey = currentPathKeyInQueue()
+        var candidates: [String] = []
+        candidates.reserveCapacity(playbackPlaylistTrackKeys.count)
+        for key in playbackPlaylistTrackKeys {
+            if key == currentKey { continue }
+            guard let idx = indexInQueue(forPathKey: key) else { continue }
+            if isUnplayableIndex(idx) { continue }
+            candidates.append(key)
+        }
+        guard let chosenKey = candidates.randomElement(),
+              let idx = indexInQueue(forPathKey: chosenKey),
+              !isUnplayableIndex(idx)
+        else { return nil }
+
+        currentIndex = idx
+        savePlaylist()
+        return audioFiles[idx]
+    }
+
+    private func currentPathKeyInQueue() -> String? {
+        guard currentIndex >= 0, currentIndex < audioFiles.count else { return nil }
+        return pathKey(audioFiles[currentIndex].url)
+    }
+
+    private func currentPlaylistPosition() -> Int? {
+        guard let currentKey = currentPathKeyInQueue() else { return nil }
+        return playbackPlaylistPositionByKey[currentKey]
+    }
+
+    private func indexInQueue(forPathKey key: String) -> Int? {
+        for (idx, file) in audioFiles.enumerated() {
+            if pathKey(file.url) == key {
+                return idx
+            }
+        }
+        return nil
+    }
+
+    private func integrateNewQueueIndicesIntoShuffleQueue(oldCount: Int) {
+        guard oldCount >= 0, oldCount < audioFiles.count else { return }
+        guard !shuffleQueue.isEmpty else { return }
+
+        let newIndices = (oldCount..<audioFiles.count).filter { !isUnplayableIndex($0) }
+        guard !newIndices.isEmpty else { return }
+
+        let insertLowerBound = min(shuffleIndex, shuffleQueue.count)
+        for idx in newIndices {
+            let pos = Int.random(in: insertLowerBound...shuffleQueue.count)
+            shuffleQueue.insert(idx, at: pos)
+        }
+    }
+
     // 洗牌算法
     private func createShuffleQueue() {
         shuffleQueue = audioFiles.indices.filter { !isUnplayableIndex($0) }.shuffled()
         shuffleIndex = 0
+    }
+
+    private func createPlaylistShuffleQueue(startFromRandom: Bool = false) {
+        // Build a playable list in playlist order (skip missing/not-in-queue and unplayable).
+        var playableKeys: [String] = []
+        playableKeys.reserveCapacity(playbackPlaylistTrackKeys.count)
+        var seen = Set<String>()
+        for key in playbackPlaylistTrackKeys {
+            if seen.contains(key) { continue }
+            seen.insert(key)
+            guard let idx = indexInQueue(forPathKey: key) else { continue }
+            if isUnplayableIndex(idx) { continue }
+            playableKeys.append(key)
+        }
+
+        guard !playableKeys.isEmpty else {
+            playlistShuffleQueueKeys.removeAll(keepingCapacity: true)
+            playlistShuffleIndex = 0
+            return
+        }
+
+        if startFromRandom {
+            playlistShuffleQueueKeys = playableKeys.shuffled()
+            playlistShuffleIndex = min(1, playlistShuffleQueueKeys.count)
+            return
+        }
+
+        if let currentKey = currentPathKeyInQueue(),
+           playableKeys.contains(currentKey),
+           playableKeys.count > 1 {
+            var rest = playableKeys.filter { $0 != currentKey }
+            rest.shuffle()
+            playlistShuffleQueueKeys = [currentKey] + rest
+            playlistShuffleIndex = 1
+        } else {
+            playlistShuffleQueueKeys = playableKeys.shuffled()
+            playlistShuffleIndex = 0
+        }
+    }
+
+    private func getNextShuffledFileInPlaylist() -> AudioFile? {
+        if playlistShuffleQueueKeys.isEmpty || playlistShuffleIndex >= playlistShuffleQueueKeys.count {
+            createPlaylistShuffleQueue()
+        }
+
+        while playlistShuffleIndex < playlistShuffleQueueKeys.count {
+            let key = playlistShuffleQueueKeys[playlistShuffleIndex]
+            playlistShuffleIndex += 1
+            guard let idx = indexInQueue(forPathKey: key) else { continue }
+            if isUnplayableIndex(idx) { continue }
+            currentIndex = idx
+            savePlaylist()
+            return audioFiles[idx]
+        }
+        return nil
+    }
+
+    private func getPreviousShuffledFileInPlaylist() -> AudioFile? {
+        while playlistShuffleIndex > 0 {
+            playlistShuffleIndex -= 1
+            let key = playlistShuffleQueueKeys[playlistShuffleIndex]
+            guard let idx = indexInQueue(forPathKey: key) else { continue }
+            if isUnplayableIndex(idx) { continue }
+            currentIndex = idx
+            savePlaylist()
+            return audioFiles[idx]
+        }
+        return nil
     }
     
     private func getNextShuffledFile() -> AudioFile? {
@@ -767,6 +1132,7 @@ final class PlaylistManager: ObservableObject {
     private func resetShuffleQueue() {
         shuffleQueue.removeAll()
         shuffleIndex = 0
+        resetPlaylistShuffleQueue()
     }
 
     // MARK: - 子文件夹扫描偏好持久化
