@@ -76,7 +76,7 @@ private struct Version: Comparable, Sendable {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
-        // Accept: "3.1", "v3.1", "3.1.0", "3.1-beta" (will parse leading numeric parts).
+        // Accept: "3.2", "v3.2", "3.2.0", "3.2-beta" (will parse leading numeric parts).
         let normalized = trimmed.trimmingPrefix("v")
         let parts = normalized
             .split(whereSeparator: { !($0.isNumber || $0 == ".") })
