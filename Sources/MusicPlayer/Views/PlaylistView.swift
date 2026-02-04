@@ -287,7 +287,7 @@ struct PlaylistView: View {
 	                            )
 	                            .listRowBackground(Color.clear)
 	                            .listRowSeparator(.hidden)
-	                            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+	                            .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 2, trailing: 0))
 	                        }
                         .listStyle(PlainListStyle())
                         .background(Color.clear)
@@ -591,7 +591,7 @@ struct PlaylistItemView: View {
                 .frame(width: 36, height: 36)
 
                 // 歌曲信息
-                VStack(alignment: .leading, spacing: 5) {
+                VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 8) {
                         Text(highlightedText(file.metadata.title, searchText: searchText))
                             .font(.system(size: 14, weight: .semibold))
@@ -661,7 +661,7 @@ struct PlaylistItemView: View {
             .onTapGesture { playAction(file) }
             // 让按钮的可点击区域覆盖整行（含顶部/底部留白），避免只“选中”但点不到播放
             .padding(.leading, 16)
-            .padding(.vertical, 14)
+            .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
 
             // 操作按钮组
@@ -695,7 +695,7 @@ struct PlaylistItemView: View {
                 .buttonStyle(PlainButtonStyle())
             }
             .padding(.trailing, 16)
-            .padding(.vertical, 14)
+            .padding(.vertical, 8)
             .opacity(isHovered ? 1 : 0.6)
         }
         .background(

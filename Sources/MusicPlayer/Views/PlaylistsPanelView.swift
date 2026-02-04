@@ -211,7 +211,7 @@ struct PlaylistsPanelView: View {
 	                        )
 	                        .listRowBackground(Color.clear)
 	                        .listRowSeparator(.hidden)
-	                        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+	                        .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 2, trailing: 0))
 	                    }
                     .listStyle(PlainListStyle())
                     .scrollContentBackground(.hidden)
