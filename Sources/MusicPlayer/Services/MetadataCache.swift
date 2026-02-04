@@ -62,6 +62,14 @@ actor MetadataCache {
             return nil
         }
 
+        // Self-heal: cached metadata might have been produced by lossy decoding (e.g. "?????")
+        // even though the file actually contains valid Unicode tags.
+        if looksCorrupted(entry.title) || looksCorrupted(entry.artist) || looksCorrupted(entry.album) {
+            entries.removeValue(forKey: key)
+            scheduleSave()
+            return nil
+        }
+
         return AudioMetadata(
             title: entry.title,
             artist: entry.artist,
@@ -187,5 +195,17 @@ actor MetadataCache {
         }
         return normalized
     }
-}
 
+    private func looksCorrupted(_ s: String) -> Bool {
+        guard !s.isEmpty else { return false }
+        if s.contains("\u{FFFD}") { return true } // Unicode replacement character
+        if s.contains("???") { return true }
+
+        var qCount = 0
+        for ch in s where ch == "?" { qCount += 1 }
+        if qCount < 3 { return false }
+
+        let ratio = Double(qCount) / Double(max(1, s.count))
+        return ratio >= 0.4
+    }
+}

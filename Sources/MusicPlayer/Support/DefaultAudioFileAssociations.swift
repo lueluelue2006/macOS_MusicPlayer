@@ -44,10 +44,13 @@ enum DefaultAudioFileAssociations {
         var already = 0
         var failed: [Target] = []
 
+        // Use `.all` so double-click ("open") uses this app, not only "viewer" role.
+        let role: LSRolesMask = .all
+
         for target in supportedTargets {
             let current = LSCopyDefaultRoleHandlerForContentType(
                 target.contentTypeIdentifier as CFString,
-                .viewer
+                role
             )?.takeRetainedValue() as String?
 
             if current == bundleID {
@@ -57,7 +60,7 @@ enum DefaultAudioFileAssociations {
 
             let status = LSSetDefaultRoleHandlerForContentType(
                 target.contentTypeIdentifier as CFString,
-                .viewer,
+                role,
                 bundleID as CFString
             )
 
@@ -76,4 +79,3 @@ enum DefaultAudioFileAssociations {
         )
     }
 }
-

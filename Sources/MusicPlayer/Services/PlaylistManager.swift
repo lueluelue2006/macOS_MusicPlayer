@@ -787,14 +787,12 @@ final class PlaylistManager: ObservableObject {
             "AVURLAssetAllowsCellularAccessKey": false
         ])
         
-        // 强制重新加载元数据
+        // 强制重新加载元数据（优先 commonMetadata；部分 MP3 在 load(.metadata) 场景会返回空数组）
         do {
             // 使用现代异步API加载元数据，增加 20s 超时保护
-            let metadata = try await AsyncTimeout.withTimeout(20) {
-                try await asset.load(.metadata)
+            return try await AsyncTimeout.withTimeout(20) {
+                await AudioMetadata.load(from: asset, includeArtwork: false)
             }
-            // 结合 asset 进行 ID3v1 回退
-            return await AudioMetadata.load(from: metadata, asset: asset, includeArtwork: false)
         } catch is TimeoutError {
             debugLog("加载元数据超时(20s)，使用回退解析: \(url.lastPathComponent)")
             return await AudioMetadata.load(from: asset, includeArtwork: false)
