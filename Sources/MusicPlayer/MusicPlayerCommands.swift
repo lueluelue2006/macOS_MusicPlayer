@@ -26,6 +26,18 @@ struct MusicPlayerCommands: Commands {
                 NotificationCenter.default.post(name: .focusSearchField, object: nil)
             }
             .keyboardShortcut("f", modifiers: [.command])
+
+            Divider()
+
+            Button("切到队列") {
+                NotificationCenter.default.post(name: .switchPlaylistPanelToQueue, object: nil)
+            }
+            .keyboardShortcut("1", modifiers: [.command])
+
+            Button("切到歌单") {
+                NotificationCenter.default.post(name: .switchPlaylistPanelToPlaylists, object: nil)
+            }
+            .keyboardShortcut("2", modifiers: [.command])
         }
 
         CommandGroup(after: .appSettings) {

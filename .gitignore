@@ -2,6 +2,7 @@
 .build/
 .build-intel/
 MusicPlayer.app/
+MusicPlayer-intel.app/
 .clang-module-cache/
 .home/
 EmbeddedOutput/

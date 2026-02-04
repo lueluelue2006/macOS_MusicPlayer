@@ -32,7 +32,13 @@ struct PlaylistView: View {
         case playlists = 1
     }
 
-    @State private var panelMode: PanelMode = .queue
+    /// Persist last opened panel (queue vs playlists) so relaunch returns to where user left off.
+    @AppStorage("userPlaylistPanelMode") private var panelModeRaw: Int = PanelMode.queue.rawValue
+
+    private var panelMode: PanelMode {
+        get { PanelMode(rawValue: panelModeRaw) ?? .queue }
+        nonmutating set { panelModeRaw = newValue.rawValue }
+    }
 
     private var currentHighlightedURL: URL? {
         // For normal playback (queue-based), rely on PlaylistManager selection to avoid any
@@ -66,9 +72,9 @@ struct PlaylistView: View {
                         .fontWeight(.bold)
                         .foregroundColor(.primary)
 
-                    Picker("", selection: $panelMode) {
-                        Text("队列").tag(PanelMode.queue)
-                        Text("歌单").tag(PanelMode.playlists)
+                    Picker("", selection: $panelModeRaw) {
+                        Text("队列").tag(PanelMode.queue.rawValue)
+                        Text("歌单").tag(PanelMode.playlists.rawValue)
                     }
                     .pickerStyle(.segmented)
                     .frame(width: 150)
@@ -156,11 +162,15 @@ struct PlaylistView: View {
                         }
                         .buttonStyle(PlainButtonStyle())
 
-                        Button(action: { saveQueueAsPlaylist() }) {
+                        Button(action: {
+                            Task {
+                                await playlistManager.refreshAllMetadata(audioPlayer: audioPlayer)
+                            }
+                        }) {
                             HStack(spacing: 6) {
-                                Image(systemName: "square.and.arrow.down")
+                                Image(systemName: "arrow.clockwise")
                                     .font(.caption)
-                                Text("保存队列")
+                                Text("完全刷新")
                                     .font(.caption)
                                     .fontWeight(.medium)
                             }
@@ -171,13 +181,13 @@ struct PlaylistView: View {
                                     .fill(theme.mutedSurface)
                                     .overlay(
                                         RoundedRectangle(cornerRadius: 12)
-                                            .stroke(theme.stroke, lineWidth: 1)
+                                            .stroke(theme.accentGradient, lineWidth: 1)
                                     )
                             )
-                            .foregroundColor(theme.mutedText)
+                            .foregroundStyle(theme.accentGradient)
                         }
                         .buttonStyle(PlainButtonStyle())
-                        .help("将当前队列保存为一个歌单（按文件路径引用，不会复制文件）")
+                        .help("完全刷新：重载元数据、歌词、封面（清空歌词/封面缓存；保留音量均衡缓存）")
                         .disabled(playlistManager.audioFiles.isEmpty)
                     }
                 }
@@ -289,10 +299,16 @@ struct PlaylistView: View {
         .onAppear {
             AppFocusState.shared.activeSearchTarget = (panelMode == .queue) ? .queue : .playlists
         }
-        .onChange(of: panelMode) { _ in
+        .onChange(of: panelModeRaw) { _ in
             AppFocusState.shared.activeSearchTarget = (panelMode == .queue) ? .queue : .playlists
             // 切换面板时清掉旧的搜索框焦点，避免 Cmd+F 来回跳
             NotificationCenter.default.post(name: .blurSearchField, object: nil)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .switchPlaylistPanelToQueue)) { _ in
+            panelMode = .queue
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .switchPlaylistPanelToPlaylists)) { _ in
+            panelMode = .playlists
         }
         .onChange(of: showingMetadataEdit) { isShowing in
             if isShowing, let file = selectedFileForEdit {
@@ -323,18 +339,6 @@ struct PlaylistView: View {
         playlistsStore.createPlaylist(name: name ?? "")
     }
 
-    @MainActor
-    private func saveQueueAsPlaylist() {
-        let name = TextInputPrompt.prompt(
-            title: "保存队列为歌单",
-            message: "输入歌单名称",
-            defaultValue: "我的歌单",
-            okTitle: "保存",
-            cancelTitle: "取消"
-        )
-        playlistsStore.createPlaylist(name: name ?? "我的歌单", trackURLs: playlistManager.audioFiles.map(\.url))
-    }
-    
     private func showMetadataEditWindow(for file: AudioFile) {
         // 如果已经有窗口打开，先关闭它
         if let existingWindow = metadataEditWindow {
@@ -744,8 +748,10 @@ struct PlaylistItemView: View {
         if let range = text.range(of: searchText, options: .caseInsensitive) {
             let nsRange = NSRange(range, in: text)
             if let attributedRange = Range(nsRange, in: attributedString) {
-                attributedString[attributedRange].backgroundColor = theme.accent.opacity(0.25)
-                attributedString[attributedRange].foregroundColor = (colorScheme == .dark ? Color.white : Color.black)
+                // 搜索命中高亮：更亮的“荧光笔黄”，在暗色背景上也足够醒目
+                let highlightYellow = Color(red: 1.0, green: 0.90, blue: 0.15)
+                attributedString[attributedRange].backgroundColor = highlightYellow.opacity(theme.scheme == .dark ? 0.92 : 0.78)
+                attributedString[attributedRange].foregroundColor = Color.black.opacity(0.95)
             }
         }
         

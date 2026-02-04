@@ -397,6 +397,13 @@ final class IPCServer {
         data["outputDeviceName"] = audioPlayer.currentOutputDeviceName
         data["playlistCount"] = "\(playlistManager.audioFiles.count)"
         data["currentIndex"] = "\(playlistManager.currentIndex)"
+        switch playlistManager.playbackScope {
+        case .queue:
+            data["playbackScope"] = "queue"
+        case .playlist(let id):
+            data["playbackScope"] = "playlist"
+            data["playbackScopePlaylistID"] = id.uuidString
+        }
         data["currentTime"] = String(format: "%.3f", audioPlayer.playbackClock.currentTime)
         data["duration"] = String(format: "%.3f", audioPlayer.playbackClock.duration)
 

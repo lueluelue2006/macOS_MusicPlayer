@@ -91,7 +91,7 @@ struct ContentView: View {
                 // 启动时确保搜索框不自动聚焦
                 NotificationCenter.default.post(name: .blurSearchField, object: nil)
                 // 一次性恢复逻辑移动到持久化的 PlaylistManager（避免窗口重开导致重复）
-                playlistManager.performInitialRestoreIfNeeded(audioPlayer: audioPlayer)
+                playlistManager.performInitialRestoreIfNeeded(audioPlayer: audioPlayer, playlistsStore: playlistsStore)
                 maybeAutoCheckForUpdates()
             }
             .onDisappear {
@@ -166,8 +166,8 @@ struct ContentView: View {
                         playlistManager.currentIndex = index
                         playlistManager.savePlaylist()
                         // 恢复到上次曲目与进度，但默认不自动播放
+                        audioPlayer.prepareInitialSeekForRestore(to: time)
                         audioPlayer.play(file, autostart: false, bypassConfirm: true)
-                        audioPlayer.seek(to: time)
                     } else {
                         showToastMessage("未能在播放列表中找到上次播放文件", kind: .warning)
                     }
@@ -245,7 +245,7 @@ struct ContentView: View {
         // 已经排队等待执行，则不重复创建任务
         guard updateCheckTask == nil else { return }
 
-        let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "3.2"
+        let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "3.3"
         updateCheckTask = Task(priority: .background) {
             // 延迟一点：让加载/恢复后的 UI 与磁盘/元数据任务先跑一会儿
             do {

@@ -21,4 +21,8 @@ extension Notification.Name {
 
     /// App 内 Toast（右上角）
     static let showAppToast = Notification.Name("showAppToast")
+
+    /// 左侧面板（队列/歌单）切换
+    static let switchPlaylistPanelToQueue = Notification.Name("switchPlaylistPanelToQueue")
+    static let switchPlaylistPanelToPlaylists = Notification.Name("switchPlaylistPanelToPlaylists")
 }

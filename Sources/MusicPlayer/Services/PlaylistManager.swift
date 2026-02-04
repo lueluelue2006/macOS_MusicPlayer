@@ -50,6 +50,14 @@ final class PlaylistManager: ObservableObject {
     private let metadataGate = ConcurrencyGate(maxConcurrent: 4) // 限制元数据加载并发
     private let durationGate = ConcurrencyGate(maxConcurrent: 2) // 限制时长计算并发（更轻量但也需要控速）
 
+    // MARK: - Playback scope persistence
+    private let userPlaybackScopeKindKey = "userPlaybackScopeKind"
+    private let userPlaybackScopePlaylistIDKey = "userPlaybackScopePlaylistID"
+    private enum PlaybackScopePersistenceKind: String {
+        case queue
+        case playlist
+    }
+
     @MainActor private var durationPrefetchTask: Task<Void, Never>?
     @MainActor private var pendingDurationURLs: [URL] = []
     @MainActor private var pendingDurationURLKeys: Set<String> = []
@@ -70,6 +78,7 @@ final class PlaylistManager: ObservableObject {
         playbackPlaylistTrackKeys.removeAll(keepingCapacity: true)
         playbackPlaylistPositionByKey.removeAll(keepingCapacity: true)
         resetPlaylistShuffleQueue()
+        persistPlaybackScope(.queue)
     }
 
     /// Switch playback controls to operate on a specific user playlist (in its playlist order).
@@ -79,6 +88,7 @@ final class PlaylistManager: ObservableObject {
         playbackPlaylistTrackKeys = trackURLsInOrder.map { pathKey($0) }
         rebuildPlaybackPlaylistPositions()
         resetPlaylistShuffleQueue()
+        persistPlaybackScope(.playlist(playlistID))
     }
 
     /// Update the active playlist scope track list (e.g. after adding/removing tracks),
@@ -92,6 +102,152 @@ final class PlaylistManager: ObservableObject {
         playbackPlaylistTrackKeys = newKeys
         rebuildPlaybackPlaylistPositions()
         updatePlaylistShuffleQueue(oldKeys: oldKeys, newKeys: newKeys)
+    }
+
+    private func persistPlaybackScope(_ scope: PlaybackScope) {
+        let d = UserDefaults.standard
+        switch scope {
+        case .queue:
+            d.set(PlaybackScopePersistenceKind.queue.rawValue, forKey: userPlaybackScopeKindKey)
+            d.removeObject(forKey: userPlaybackScopePlaylistIDKey)
+        case .playlist(let id):
+            d.set(PlaybackScopePersistenceKind.playlist.rawValue, forKey: userPlaybackScopeKindKey)
+            d.set(id.uuidString, forKey: userPlaybackScopePlaylistIDKey)
+        }
+    }
+
+    /// Restore last used playback scope (queue vs a specific user playlist).
+    ///
+    /// - Important: Call this after the queue (`audioFiles`) has been restored, otherwise playlist-scope
+    ///   playback won't be able to map tracks to queue indices.
+    func restorePlaybackScopeIfNeeded(playlistsStore: PlaylistsStore) async {
+        let d = UserDefaults.standard
+        guard
+            let rawKind = d.string(forKey: userPlaybackScopeKindKey),
+            let kind = PlaybackScopePersistenceKind(rawValue: rawKind)
+        else {
+            return
+        }
+
+        switch kind {
+        case .queue:
+            await MainActor.run { [weak self] in
+                self?.setPlaybackScopeQueue()
+            }
+
+        case .playlist:
+            guard
+                let rawID = d.string(forKey: userPlaybackScopePlaylistIDKey),
+                let playlistID = UUID(uuidString: rawID)
+            else {
+                await MainActor.run { [weak self] in
+                    self?.setPlaybackScopeQueue()
+                }
+                return
+            }
+
+            let playlist: UserPlaylist? = await MainActor.run {
+                playlistsStore.playlist(for: playlistID)
+            }
+            guard let playlist else {
+                await MainActor.run { [weak self] in
+                    self?.setPlaybackScopeQueue()
+                }
+                return
+            }
+
+            let fm = FileManager.default
+            let urlsInOrder = playlist.tracks
+                .map { URL(fileURLWithPath: $0.path) }
+                .filter { fm.fileExists(atPath: $0.path) }
+
+            if urlsInOrder.isEmpty {
+                await MainActor.run { [weak self] in
+                    self?.setPlaybackScopeQueue()
+                }
+                return
+            }
+
+            // Ensure playlist tracks exist in queue, but keep it lightweight:
+            // - Prefer disk caches (duration/metadata)
+            // - Fall back to filename-only placeholder (no AVAsset scan on startup)
+            let existingQueueKeys: Set<String> = await MainActor.run {
+                Set(self.audioFiles.map { self.pathKey($0.url) })
+            }
+
+            var toAppend: [AudioFile] = []
+            toAppend.reserveCapacity(8)
+            var needsHydration: [URL] = []
+            needsHydration.reserveCapacity(8)
+
+            for url in urlsInOrder {
+                let key = pathKey(url)
+                if existingQueueKeys.contains(key) { continue }
+
+                let duration = await DurationCache.shared.cachedDurationIfValid(for: url)
+                if let cached = await MetadataCache.shared.cachedMetadataIfValid(for: url) {
+                    toAppend.append(AudioFile(url: url, metadata: cached, duration: duration))
+                } else {
+                    let title = url.deletingPathExtension().lastPathComponent
+                    let meta = AudioMetadata(
+                        title: title.isEmpty ? "未知标题" : title,
+                        artist: "未知艺术家",
+                        album: "未知专辑",
+                        year: nil,
+                        genre: nil,
+                        artwork: nil
+                    )
+                    toAppend.append(AudioFile(url: url, metadata: meta, duration: duration))
+                    needsHydration.append(url)
+                }
+            }
+
+            let filesToAppend = toAppend
+            if !filesToAppend.isEmpty {
+                await MainActor.run { [weak self] in
+                    _ = self?.ensureInQueue(filesToAppend, focusURL: nil)
+                }
+            }
+
+            await MainActor.run { [weak self] in
+                self?.setPlaybackScopePlaylist(playlistID, trackURLsInOrder: urlsInOrder)
+            }
+
+            // Best-effort: hydrate missing metadata in background (only for the newly appended tracks).
+            let hydrationURLs = needsHydration
+            guard !hydrationURLs.isEmpty else { return }
+            Task.detached(priority: .utility) { [weak self] in
+                guard let self else { return }
+                let results: [(URL, AudioMetadata)] = await withTaskGroup(of: (URL, AudioMetadata).self) { group in
+                    for url in hydrationURLs {
+                        group.addTask { [weak self] in
+                            guard let self else {
+                                return (url, AudioMetadata(title: "未知标题", artist: "未知艺术家", album: "未知专辑", year: nil, genre: nil, artwork: nil))
+                            }
+                            let metadata = await self.loadCachedMetadata(from: url)
+                            return (url, metadata)
+                        }
+                    }
+                    var collected: [(URL, AudioMetadata)] = []
+                    collected.reserveCapacity(hydrationURLs.count)
+                    for await item in group {
+                        collected.append(item)
+                    }
+                    return collected
+                }
+
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    for (url, metadata) in results {
+                        if let index = self.audioFiles.firstIndex(where: { self.pathKey($0.url) == self.pathKey(url) }) {
+                            let existing = self.audioFiles[index]
+                            self.audioFiles[index] = AudioFile(url: existing.url, metadata: metadata, lyricsTimeline: existing.lyricsTimeline, duration: existing.duration)
+                        }
+                    }
+                    self.updateFilteredFiles()
+                }
+            }
+        }
     }
 
     /// Number of playable tracks in the current playback scope.
@@ -158,19 +314,26 @@ final class PlaylistManager: ObservableObject {
 
     // MARK: - Initial restore (once per launch)
     @MainActor
-    func performInitialRestoreIfNeeded(audioPlayer: AudioPlayer) {
+    func performInitialRestoreIfNeeded(audioPlayer: AudioPlayer, playlistsStore: PlaylistsStore) {
         guard !didPerformInitialRestore else { return }
         didPerformInitialRestore = true
+
+        // Ensure user playlists are available for restoring playback scope.
+        playlistsStore.loadIfNeeded()
 
         initialRestoreTask?.cancel()
         initialRestoreTask = Task.detached(priority: .userInitiated) { [weak self, weak audioPlayer] in
             guard let self, let audioPlayer else { return }
             await self.loadSavedPlaylist(audioPlayer: audioPlayer)
+            let skipRestore = await MainActor.run {
+                // 若本次启动是通过 Finder/Dock 外部文件打开，则不恢复上次播放/播放范围
+                audioPlayer.consumeSkipRestoreThisLaunch()
+            }
+            if skipRestore { return }
+
+            await self.restorePlaybackScopeIfNeeded(playlistsStore: playlistsStore)
+
             await MainActor.run {
-                // 若本次启动是通过 Finder/Dock 外部文件打开，则不恢复上次播放
-                if audioPlayer.consumeSkipRestoreThisLaunch() {
-                    return
-                }
                 if audioPlayer.currentFile == nil {
                     audioPlayer.loadLastPlayedFile()
                 }

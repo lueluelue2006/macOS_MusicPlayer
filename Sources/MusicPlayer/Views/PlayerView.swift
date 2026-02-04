@@ -603,12 +603,15 @@ struct StaticLyricsView: View {
     
     var body: some View {
         ScrollView {
-            VStack(alignment: .center, spacing: 8) {
+            // 将“行间距”做进每行的 padding，这样点击/双击不会在两行之间出现“无效区域”
+            VStack(alignment: .center, spacing: 0) {
                 ForEach(timeline.lines) { line in
-                    Text(line.text)
+                    Text(line.text.isEmpty ? " " : line.text)
                         .font(.body)
                         .foregroundColor(.primary)
                         .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 4)
+                        .contentShape(Rectangle())
                 }
             }
             .frame(maxWidth: .infinity)
@@ -669,27 +672,29 @@ struct StaticLyricsView: View {
                 .padding(.horizontal, 4)
 
                 // Lyrics list with programmatic scroll — 默认渲染完整歌词
-	                ScrollView {
-	                    LazyVStack(alignment: .center, spacing: 10) {
-	                        let activeLineID: Int? = {
-	                            guard let idx = timeline.currentIndex(at: playbackClock.currentTime),
-	                                  idx >= 0, idx < timeline.lines.count else { return nil }
-	                            return timeline.lines[idx].id
-	                        }()
-	                        ForEach(timeline.lines) { line in
-	                            let isActive = (activeLineID == line.id)
-                            Text(line.text.isEmpty ? " " : line.text)
-                                .font(isActive ? .title3.bold() : .body)
-                                .foregroundColor(isActive ? theme.accent : .primary)
-                                .opacity(isActive ? 1.0 : 0.75)
-                                .frame(maxWidth: .infinity, alignment: .center)
-                                .contentShape(Rectangle())
-                                .id(line.id)
-                                .onTapGesture(count: 2) {
-                                    if let t = line.timestamp {
-                                        onSeek(t)
-                                    }
-                                }
+		                ScrollView {
+		                    // 将“行间距”做进每行的 padding，这样双击跳转不会在两行之间出现“无效区域”
+		                    LazyVStack(alignment: .center, spacing: 0) {
+		                        let activeLineID: Int? = {
+		                            guard let idx = timeline.currentIndex(at: playbackClock.currentTime),
+		                                  idx >= 0, idx < timeline.lines.count else { return nil }
+		                            return timeline.lines[idx].id
+		                        }()
+		                        ForEach(timeline.lines) { line in
+		                            let isActive = (activeLineID == line.id)
+	                            Text(line.text.isEmpty ? " " : line.text)
+	                                .font(isActive ? .title3.bold() : .body)
+	                                .foregroundColor(isActive ? theme.accent : .primary)
+	                                .opacity(isActive ? 1.0 : 0.75)
+	                                .frame(maxWidth: .infinity, alignment: .center)
+	                                .padding(.vertical, 5)
+	                                .contentShape(Rectangle())
+	                                .id(line.id)
+	                                .onTapGesture(count: 2) {
+	                                    if let t = line.timestamp {
+	                                        onSeek(t)
+	                                    }
+	                                }
                         }
                     }
                     .padding(.vertical, 8)

@@ -127,6 +127,17 @@ final class AudioPlayer: NSObject, ObservableObject {
         Swift.max(min, Swift.min(max, value))
     }
 
+    /// 用于“跨启动恢复/初始定位”的 seek time 规整：
+    /// - 若 time 明显超出 duration（例如来自上一首歌的残留进度），则回退到 0，避免被 clamp 到末尾导致“进度拉到最后”。
+    /// - 另外避免设置到精确 duration（部分情况下会表现为立刻播放完）。
+    private func clampInitialSeekTime(_ time: TimeInterval, duration: TimeInterval) -> TimeInterval {
+        guard duration.isFinite, duration > 0 else { return 0 }
+        guard time.isFinite else { return 0 }
+        if time > duration + 1.0 { return 0 }
+        let safeMax = Swift.max(0, duration - 0.05)
+        return clamp(time, min: 0, max: safeMax)
+    }
+
     private func clampPlaybackRate(_ value: Float) -> Float {
         clamp(value, min: 0.5, max: 2.0)
     }
@@ -452,7 +463,7 @@ final class AudioPlayer: NSObject, ObservableObject {
             self.applyVolumeNormalization(for: url, mode: .immediate, allowBackgroundAnalysis: allowBackgroundAnalysis)
 
             if let t = self.pendingSeekTime {
-                let clamped = max(0, min(t, self.playbackClock.duration))
+                let clamped = self.clampInitialSeekTime(t, duration: self.playbackClock.duration)
                 prepared.currentTime = clamped
                 self.playbackClock.currentTime = clamped
                 self.pendingSeekTime = nil
@@ -465,7 +476,7 @@ final class AudioPlayer: NSObject, ObservableObject {
                 self.isPlaying = true
                 self.startTimer()
                 if self.persistPlaybackState {
-                    self.saveLastPlayedFile(file)
+                    self.saveLastPlayedFile(file, initialTime: self.playbackClock.currentTime)
                 }
             } else {
                 self.isPlaying = false
@@ -573,12 +584,12 @@ final class AudioPlayer: NSObject, ObservableObject {
                     self.applyVolumeNormalization(for: url, mode: .immediate, allowBackgroundAnalysis: allowBackgroundAnalysis)
 
                     // 若存在待应用的初始进度（如跨启动恢复），在真正开播前先定位
-	                    if let t = self.pendingSeekTime {
-	                        let clamped = max(0, min(t, self.playbackClock.duration))
-	                        newPlayer.currentTime = clamped
-	                        self.playbackClock.currentTime = clamped
-	                        self.pendingSeekTime = nil
-	                    }
+                    if let t = self.pendingSeekTime {
+                        let clamped = self.clampInitialSeekTime(t, duration: self.playbackClock.duration)
+                        newPlayer.currentTime = clamped
+                        self.playbackClock.currentTime = clamped
+                        self.pendingSeekTime = nil
+                    }
 
                     // 加载歌词（异步）
                     self.loadLyricsIfNeeded(for: file)
@@ -592,7 +603,7 @@ final class AudioPlayer: NSObject, ObservableObject {
                             // 若封面尚未加载（例如刚切歌、或 autostart=true 但封面任务被取消），在开播时再确保触发一次
                             self.loadArtworkIfNeeded(for: url)
                             if self.persistPlaybackState {
-                                self.saveLastPlayedFile(file)
+                                self.saveLastPlayedFile(file, initialTime: self.playbackClock.currentTime)
                             }
                         } else {
                             self.isPlaying = false
@@ -613,9 +624,11 @@ final class AudioPlayer: NSObject, ObservableObject {
                         self.isPlaying = false
                         self.stopTimer()
                         if self.persistPlaybackState { self.saveLastPlayedFile(file) }
+                        // 恢复时（autostart=false）也保存一次进度，避免“路径已更新但时间仍是上一首歌”的错配长期残留。
+                        self.saveCurrentProgress()
                     }
-                }
-            } catch is TimeoutError {
+	                }
+	            } catch is TimeoutError {
                 await MainActor.run {
                     guard generation == self.loadGeneration else { return }
                     self.debugLog("加载音频超时(20s): \(url.lastPathComponent)")
@@ -761,15 +774,21 @@ final class AudioPlayer: NSObject, ObservableObject {
         }
     }
     
-	    func seek(to time: TimeInterval) {
-        if let player = player {
-            player.currentTime = time
-	        } else {
-	            // 播放器尚未就绪：记录为待应用的初始进度
-	            pendingSeekTime = time
-	        }
-	        playbackClock.currentTime = time
-	    }
+		    func seek(to time: TimeInterval) {
+	        if let player = player {
+	            player.currentTime = time
+		        } else {
+		            // 播放器尚未就绪：记录为待应用的初始进度
+		            pendingSeekTime = time
+		        }
+		        playbackClock.currentTime = time
+		    }
+
+        /// 用于跨启动恢复：强制写入 `pendingSeekTime`，让 `play(... autostart: false ...)` 在加载播放器时应用并做防错 clamp。
+        func prepareInitialSeekForRestore(to time: TimeInterval) {
+            pendingSeekTime = time
+            playbackClock.currentTime = time
+        }
 
     /// 重新载入当前曲目的底层播放器，尽量保留播放/进度状态（用于完全刷新、外部文件被覆盖的情况）
 	    func reloadCurrentPreservingState() {
@@ -964,10 +983,13 @@ final class AudioPlayer: NSObject, ObservableObject {
     }
     
     // MARK: - 保存和加载上次播放的歌曲
-    private func saveLastPlayedFile(_ file: AudioFile) {
+    private func saveLastPlayedFile(_ file: AudioFile, initialTime: TimeInterval? = nil) {
         let userDefaults = UserDefaults.standard
         userDefaults.set(file.url.path, forKey: "lastPlayedFilePath")
-        // 不在这里保存时间，因为刚开始播放时 currentTime 是 0
+        // 注意：仅在“真正开始播放”时才传入 initialTime，避免恢复（autostart=false）时把旧进度覆盖为 0。
+        if let t = initialTime {
+            userDefaults.set(max(0, t), forKey: "lastPlayedFileTime")
+        }
     }
     
 		    private func saveCurrentProgress() {

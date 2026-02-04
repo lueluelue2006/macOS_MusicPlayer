@@ -87,7 +87,7 @@ struct PlaylistsPanelView: View {
                     Text("还没有歌单")
                         .font(.subheadline)
                         .foregroundColor(theme.mutedText)
-                    Text("在上方切到“歌单”后，可新建歌单或保存当前队列。")
+                    Text("点击上方“新建歌单”开始使用。")
                         .font(.caption)
                         .foregroundColor(theme.mutedText.opacity(0.9))
                         .fixedSize(horizontal: false, vertical: true)
@@ -168,7 +168,7 @@ struct PlaylistsPanelView: View {
                         Text(playlist.tracks.isEmpty ? "歌单为空" : "未找到匹配歌曲")
                             .font(.subheadline)
                             .foregroundColor(theme.mutedText)
-                        Text(playlist.tracks.isEmpty ? "可在右上角“更多”里从队列添加。" : "试试更短的关键词。")
+                        Text(playlist.tracks.isEmpty ? "可在右上角点击“从队列添加”。" : "试试更短的关键词。")
                             .font(.caption)
                             .foregroundColor(theme.mutedText.opacity(0.9))
                     }
@@ -237,44 +237,24 @@ struct PlaylistsPanelView: View {
 
             Spacer()
 
-            Button("加入队列") {
-                appendPlaylistToQueue(playlist, autostart: false)
-            }
-            .buttonStyle(.bordered)
-            .disabled(isLoadingTracks || loadedTracks.isEmpty)
-
-            Button("播放（追加）") {
-                appendPlaylistToQueue(playlist, autostart: true)
+            Button("从队列添加") {
+                openAddFromQueueSheet(targetPlaylistID: playlist.id)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(isLoadingTracks || loadedTracks.isEmpty)
+            .disabled(playlistManager.audioFiles.isEmpty)
+            .help(playlistManager.audioFiles.isEmpty ? "队列为空：先在“队列”里导入一些歌曲" : "")
 
-            Menu {
-                Button("从当前队列添加") {
-                    openAddFromQueueSheet(targetPlaylistID: playlist.id)
+            Button("添加正在播放") {
+                if let url = audioPlayer.currentFile?.url {
+                    playlistsStore.addTracks([url], to: playlist.id)
+                    reloadSelectedPlaylist()
+                } else {
+                    postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
                 }
-                Button("添加正在播放") {
-                    if let url = audioPlayer.currentFile?.url {
-                        playlistsStore.addTracks([url], to: playlist.id)
-                        reloadSelectedPlaylist()
-                    } else {
-                        postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
-                    }
-                }
-                Divider()
-                Button("重命名歌单…") {
-                    renamePlaylist(playlist)
-                }
-                Button("删除歌单", role: .destructive) {
-                    deletePlaylist(playlist)
-                }
-            } label: {
-                Image(systemName: "ellipsis.circle")
-                    .font(.system(size: 18))
-                    .foregroundColor(theme.mutedText)
             }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
+            .buttonStyle(.bordered)
+            .disabled(audioPlayer.currentFile == nil)
+            .help(audioPlayer.currentFile == nil ? "没有正在播放的歌曲" : "")
         }
         .padding(.top, 4)
     }
@@ -340,25 +320,6 @@ struct PlaylistsPanelView: View {
             return
         }
 
-        playlistManager.setPlaybackScopePlaylist(playlist.id, trackURLsInOrder: playable.map(\.url))
-        audioPlayer.play(selected)
-    }
-
-    @MainActor
-    private func appendPlaylistToQueue(_ playlist: UserPlaylist, autostart: Bool) {
-        let playable = loadedTracks.filter { trackUnplayableReasons[pathKey($0.url)] == nil }
-        guard !playable.isEmpty else {
-            postToast(title: "歌单里没有可播放的歌曲", subtitle: nil, kind: "warning")
-            return
-        }
-
-        let focusURL = playable.first?.url
-        let focusIndex = playlistManager.ensureInQueue(playable, focusURL: focusURL)
-
-        guard autostart, let idx = focusIndex, let selected = playlistManager.selectFile(at: idx) else {
-            postToast(title: "已加入 \(playable.count) 首到播放列表", subtitle: nil, kind: "success")
-            return
-        }
         playlistManager.setPlaybackScopePlaylist(playlist.id, trackURLsInOrder: playable.map(\.url))
         audioPlayer.play(selected)
     }
@@ -499,6 +460,17 @@ struct PlaylistsPanelView: View {
                     addFromQueueSelectedKeys.removeAll(keepingCapacity: true)
                 }
                 .disabled(addFromQueueSelectedKeys.isEmpty)
+
+                Button {
+                    showAddFromQueueSheet = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(theme.mutedText)
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .help("关闭（Esc）")
             }
 
             SearchBarView(searchText: $addFromQueueSearchText, onSearchChanged: { q in
