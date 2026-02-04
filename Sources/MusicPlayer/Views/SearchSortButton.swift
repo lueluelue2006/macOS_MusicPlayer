@@ -14,7 +14,13 @@ struct SearchSortButton: View {
         let option = sortState.option(for: target)
 
         Button {
-            isPresented.toggle()
+            // Make popover feel snappy: avoid implicit animations on show/hide.
+            var transaction = Transaction()
+            transaction.animation = nil
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                isPresented.toggle()
+            }
         } label: {
             Image(systemName: option.field == .original ? "arrow.up.arrow.down" : "arrow.up.arrow.down.circle.fill")
                 .foregroundColor(theme.mutedText)
@@ -25,6 +31,10 @@ struct SearchSortButton: View {
         .buttonStyle(.plain)
         .popover(isPresented: $isPresented, arrowEdge: .bottom) {
             SearchSortPopover(target: target, isPresented: $isPresented)
+                .transaction { t in
+                    t.animation = nil
+                    t.disablesAnimations = true
+                }
         }
         .help("排序：\(option.field.displayName)（\(option.direction.displayName)）\n\(helpSuffix)")
     }
@@ -56,39 +66,25 @@ private struct SearchSortPopover: View {
                 .help("关闭")
             }
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text("排序字段")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Picker("", selection: Binding(
-                    get: { option.field },
-                    set: { newField in
-                        sortState.setOption(SearchSortOption(field: newField, direction: option.direction), for: target)
-                    }
-                )) {
-                    ForEach(SearchSortField.allCases) { field in
-                        Text(field.displayName).tag(field)
-                    }
+            sortSection(
+                title: "排序字段",
+                items: SearchSortField.allCases,
+                isSelected: { $0 == option.field },
+                titleFor: { $0.displayName },
+                onSelect: { field in
+                    sortState.setOption(SearchSortOption(field: field, direction: option.direction), for: target)
                 }
-                .pickerStyle(.inline)
-            }
+            )
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text("顺序")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Picker("", selection: Binding(
-                    get: { option.direction },
-                    set: { newDirection in
-                        sortState.setOption(SearchSortOption(field: option.field, direction: newDirection), for: target)
-                    }
-                )) {
-                    ForEach(SearchSortDirection.allCases) { direction in
-                        Text(direction.displayName).tag(direction)
-                    }
+            sortSection(
+                title: "顺序",
+                items: SearchSortDirection.allCases,
+                isSelected: { $0 == option.direction },
+                titleFor: { $0.displayName },
+                onSelect: { direction in
+                    sortState.setOption(SearchSortOption(field: option.field, direction: direction), for: target)
                 }
-                .pickerStyle(.inline)
-            }
+            )
 
             Divider()
 
@@ -100,5 +96,38 @@ private struct SearchSortPopover: View {
         .padding(12)
         .frame(width: 240)
     }
-}
 
+    private func sortSection<T: Identifiable>(
+        title: String,
+        items: [T],
+        isSelected: @escaping (T) -> Bool,
+        titleFor: @escaping (T) -> String,
+        onSelect: @escaping (T) -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(items) { item in
+                    Button {
+                        onSelect(item)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: isSelected(item) ? "largecircle.fill.circle" : "circle")
+                                .foregroundColor(isSelected(item) ? .accentColor : .secondary)
+                            Text(titleFor(item))
+                                .foregroundColor(.primary)
+                            Spacer(minLength: 0)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+}
