@@ -8,6 +8,7 @@ struct PlaylistsPanelView: View {
     let onRequestEditMetadata: (AudioFile) -> Void
 
     @ObservedObject private var weights = PlaybackWeights.shared
+    @ObservedObject private var sortState = SearchSortState.shared
 
     @State private var trackSearchText: String = ""
     @State private var loadedTracks: [AudioFile] = []
@@ -38,14 +39,19 @@ struct PlaylistsPanelView: View {
     }
 
     private var filteredTracks: [AudioFile] {
-        guard !trackSearchText.isEmpty else { return loadedTracks }
-        let q = trackSearchText
-        return loadedTracks.filter { f in
-            f.metadata.title.localizedCaseInsensitiveContains(q) ||
-                f.metadata.artist.localizedCaseInsensitiveContains(q) ||
-                f.metadata.album.localizedCaseInsensitiveContains(q) ||
-                f.url.lastPathComponent.localizedCaseInsensitiveContains(q)
-        }
+        let base: [AudioFile] = {
+            guard !trackSearchText.isEmpty else { return loadedTracks }
+            let q = trackSearchText
+            return loadedTracks.filter { f in
+                f.metadata.title.localizedCaseInsensitiveContains(q) ||
+                    f.metadata.artist.localizedCaseInsensitiveContains(q) ||
+                    f.metadata.album.localizedCaseInsensitiveContains(q) ||
+                    f.url.lastPathComponent.localizedCaseInsensitiveContains(q)
+            }
+        }()
+
+        guard let playlist = selectedPlaylist else { return base }
+        return sortState.option(for: .playlists).applying(to: base, weightScope: .playlist(playlist.id))
     }
 
     var body: some View {
@@ -451,15 +457,18 @@ struct PlaylistsPanelView: View {
     // MARK: - Add from queue sheet
 
     private var addFromQueueCandidates: [AudioFile] {
-        let all = playlistManager.audioFiles
-        guard !addFromQueueSearchText.isEmpty else { return all }
-        let q = addFromQueueSearchText
-        return all.filter { f in
-            f.metadata.title.localizedCaseInsensitiveContains(q) ||
-                f.metadata.artist.localizedCaseInsensitiveContains(q) ||
-                f.metadata.album.localizedCaseInsensitiveContains(q) ||
-                f.url.lastPathComponent.localizedCaseInsensitiveContains(q)
+        var all = playlistManager.audioFiles
+        if !addFromQueueSearchText.isEmpty {
+            let q = addFromQueueSearchText
+            all = all.filter { f in
+                f.metadata.title.localizedCaseInsensitiveContains(q) ||
+                    f.metadata.artist.localizedCaseInsensitiveContains(q) ||
+                    f.metadata.album.localizedCaseInsensitiveContains(q) ||
+                    f.url.lastPathComponent.localizedCaseInsensitiveContains(q)
+            }
         }
+
+        return sortState.option(for: .addFromQueue).applying(to: all, weightScope: .queue)
     }
 
     private var addFromQueueSelectedFiles: [AudioFile] {

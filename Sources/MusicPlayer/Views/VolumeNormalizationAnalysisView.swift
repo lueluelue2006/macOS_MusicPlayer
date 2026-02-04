@@ -3,6 +3,8 @@ import SwiftUI
 struct VolumeNormalizationAnalysisView: View {
     @ObservedObject var audioPlayer: AudioPlayer
     @ObservedObject var playlistManager: PlaylistManager
+    @ObservedObject private var sortState = SearchSortState.shared
+    @ObservedObject private var weights = PlaybackWeights.shared
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
 
@@ -30,7 +32,7 @@ struct VolumeNormalizationAnalysisView: View {
             files = files.filter { !audioPlayer.hasVolumeNormalizationCache(for: $0.url) }
         }
 
-        return files
+        return sortState.option(for: .volumeAnalysis).applying(to: files, weightScope: .queue)
     }
 
     private var analyzedCountInPlaylist: Int {
@@ -43,6 +45,8 @@ struct VolumeNormalizationAnalysisView: View {
 
     var body: some View {
         let _ = audioPlayer.volumeNormalizationCacheCount // drive refresh
+        let _ = weights.revision // drive refresh for weight-based sorting
+        let sortOption = sortState.option(for: .volumeAnalysis)
         VStack(spacing: 0) {
             HStack {
                 Text("音量均衡分析")
@@ -182,6 +186,46 @@ struct VolumeNormalizationAnalysisView: View {
                             }
                         }
                     Toggle("仅看未分析", isOn: $showOnlyMissing)
+
+                    Menu {
+                        Picker("排序字段", selection: Binding(
+                            get: { sortOption.field },
+                            set: { newField in
+                                sortState.setOption(SearchSortOption(field: newField, direction: sortOption.direction), for: .volumeAnalysis)
+                            }
+                        )) {
+                            ForEach(SearchSortField.allCases) { field in
+                                Text(field.displayName).tag(field)
+                            }
+                        }
+                        .pickerStyle(.inline)
+
+                        Picker("顺序", selection: Binding(
+                            get: { sortOption.direction },
+                            set: { newDirection in
+                                sortState.setOption(SearchSortOption(field: sortOption.field, direction: newDirection), for: .volumeAnalysis)
+                            }
+                        )) {
+                            ForEach(SearchSortDirection.allCases) { direction in
+                                Text(direction.displayName).tag(direction)
+                            }
+                        }
+                        .pickerStyle(.inline)
+
+                        Divider()
+
+                        Button("恢复原顺序") {
+                            sortState.setOption(.default, for: .volumeAnalysis)
+                        }
+                        .disabled(sortOption.field == .original && sortOption.direction == .ascending)
+                    } label: {
+                        Image(systemName: sortOption.field == .original ? "arrow.up.arrow.down" : "arrow.up.arrow.down.circle.fill")
+                            .foregroundColor(theme.mutedText)
+                            .font(.headline)
+                            .frame(width: 28, height: 28)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .help("排序：\(sortOption.field.displayName)（\(sortOption.direction.displayName)）\n仅影响列表显示，不改变队列顺序。")
                 }
             }
             .padding(16)
