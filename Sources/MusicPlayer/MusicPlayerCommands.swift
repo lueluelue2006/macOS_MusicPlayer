@@ -89,6 +89,48 @@ struct MusicPlayerCommands: Commands {
                     }
                 }
 
+                Button("清空随机权重（当前播放范围）") {
+                    Task { @MainActor in
+                        let confirmed = DestructiveConfirmation.confirm(
+                            title: "清空随机权重？",
+                            message: "将清空当前播放范围（队列/歌单）的“随机权重”设置。之后随机/洗牌将按默认权重(1.0×)。",
+                            confirmTitle: "清除",
+                            cancelTitle: "不清除"
+                        )
+                        guard confirmed else { return }
+                        let scope: PlaybackWeights.Scope = {
+                            switch playlistManager.playbackScope {
+                            case .queue: return .queue
+                            case .playlist(let id): return .playlist(id)
+                            }
+                        }()
+                        PlaybackWeights.shared.clear(scope: scope)
+                        NotificationCenter.default.post(
+                            name: .showAppToast,
+                            object: nil,
+                            userInfo: ["title": "随机权重已清空", "kind": "success", "duration": 2.0]
+                        )
+                    }
+                }
+
+                Button("清空随机权重（全部）") {
+                    Task { @MainActor in
+                        let confirmed = DestructiveConfirmation.confirm(
+                            title: "清空全部随机权重？",
+                            message: "将清空队列与所有歌单的“随机权重”设置。操作不可撤销。",
+                            confirmTitle: "清除",
+                            cancelTitle: "不清除"
+                        )
+                        guard confirmed else { return }
+                        PlaybackWeights.shared.clearAll()
+                        NotificationCenter.default.post(
+                            name: .showAppToast,
+                            object: nil,
+                            userInfo: ["title": "全部随机权重已清空", "kind": "success", "duration": 2.0]
+                        )
+                    }
+                }
+
                 Button("清空封面缩略图（内存）") {
                     Task { @MainActor in
                         let confirmed = DestructiveConfirmation.confirm(

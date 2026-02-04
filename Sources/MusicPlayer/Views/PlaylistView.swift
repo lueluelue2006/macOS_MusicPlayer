@@ -230,50 +230,55 @@ struct PlaylistView: View {
                     if playlistManager.filteredFiles.isEmpty {
                         EmptyPlaylistView()
                     } else {
-                        List(playlistManager.filteredFiles) { file in
-                            PlaylistItemView(
-                                file: file,
-                                isCurrentTrack: currentHighlightedURL == file.url,
-                                isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
-                                unplayableReason: playlistManager.unplayableReason(for: file.url),
-                                searchText: playlistManager.searchText
-                            ) { selectedFile in
-                                // 点击列表条目也顺便取消搜索聚焦
-                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                                // 从队列播放：后续“下一首/随机/骰子”等都应作用于队列范围
-                                playlistManager.setPlaybackScopeQueue()
-                                if let index = playlistManager.audioFiles.firstIndex(of: selectedFile) {
-                                    if let file = playlistManager.selectFile(at: index) {
-                                        audioPlayer.play(file)
-                                    }
-                                }
-                            } deleteAction: { fileToDelete in
-                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                                // 删除前判断是否命中当前播放
-                                let isDeletingCurrent = (audioPlayer.currentFile?.url == fileToDelete.url)
-                                if let index = playlistManager.audioFiles.firstIndex(of: fileToDelete) {
-                                    // 先执行删除
-                                    playlistManager.removeFile(at: index)
-                                    
-                                    // 若删除的是当前播放，根据播放模式处理
-                                    if isDeletingCurrent {
-                                        // 删除后剩余文件列表（从真实数据源拿）
-                                        let remaining = playlistManager.audioFiles
-                                        
-                                        // 如果后续需要顺序“下一首”，可在此提供闭包：playNext: { playlistManager.nextAfterDeletion(from: index) }
-                                        // 现阶段按约定：单曲循环->停止并清空；随机->随机一首；其他->停止并清空
-                                        audioPlayer.handleCurrentTrackRemoved(remainingFiles: remaining, playNext: nil)
-                                    }
-                                }
-                            } editAction: { fileToEdit in
-                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                                selectedFileForEdit = fileToEdit
-                                showingMetadataEdit = true
-                            }
-                            .listRowBackground(Color.clear)
-                            .listRowSeparator(.hidden)
-                            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
-                        }
+	                        List(playlistManager.filteredFiles) { file in
+	                            PlaylistItemView(
+	                                file: file,
+	                                isCurrentTrack: currentHighlightedURL == file.url,
+	                                isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
+	                                unplayableReason: playlistManager.unplayableReason(for: file.url),
+	                                searchText: playlistManager.searchText,
+	                                playAction: { selectedFile in
+	                                    // 点击列表条目也顺便取消搜索聚焦
+	                                    NotificationCenter.default.post(name: .blurSearchField, object: nil)
+	                                    // 从队列播放：后续“下一首/随机/骰子”等都应作用于队列范围
+	                                    playlistManager.setPlaybackScopeQueue()
+	                                    if let index = playlistManager.audioFiles.firstIndex(of: selectedFile) {
+	                                        if let file = playlistManager.selectFile(at: index) {
+	                                            audioPlayer.play(file)
+	                                        }
+	                                    }
+	                                },
+	                                deleteAction: { fileToDelete in
+	                                    NotificationCenter.default.post(name: .blurSearchField, object: nil)
+	                                    // 删除前判断是否命中当前播放
+	                                    let isDeletingCurrent = (audioPlayer.currentFile?.url == fileToDelete.url)
+	                                    if let index = playlistManager.audioFiles.firstIndex(of: fileToDelete) {
+	                                        // 先执行删除
+	                                        playlistManager.removeFile(at: index)
+	                                        
+	                                        // 若删除的是当前播放，根据播放模式处理
+	                                        if isDeletingCurrent {
+	                                            // 删除后剩余文件列表（从真实数据源拿）
+	                                            let remaining = playlistManager.audioFiles
+	                                            
+	                                            // 如果后续需要顺序“下一首”，可在此提供闭包：playNext: { playlistManager.nextAfterDeletion(from: index) }
+	                                            // 现阶段按约定：单曲循环->停止并清空；随机->随机一首；其他->停止并清空
+	                                            audioPlayer.handleCurrentTrackRemoved(remainingFiles: remaining, playNext: nil)
+	                                        }
+	                                    }
+	                                },
+	                                editAction: { fileToEdit in
+	                                    NotificationCenter.default.post(name: .blurSearchField, object: nil)
+	                                    selectedFileForEdit = fileToEdit
+	                                    showingMetadataEdit = true
+	                                },
+	                                weightScope: .queue,
+	                                showsWeightControl: true
+	                            )
+	                            .listRowBackground(Color.clear)
+	                            .listRowSeparator(.hidden)
+	                            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+	                        }
                         .listStyle(PlainListStyle())
                         .background(Color.clear)
                         .scrollContentBackground(.hidden)
@@ -536,9 +541,12 @@ struct PlaylistItemView: View {
     let playAction: (AudioFile) -> Void
     let deleteAction: (AudioFile) -> Void
     let editAction: (AudioFile) -> Void
+    let weightScope: PlaybackWeights.Scope?
+    let showsWeightControl: Bool
     @State private var isHovered = false
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+    @ObservedObject private var weights = PlaybackWeights.shared
     private var iconStyle: AnyShapeStyle {
         if isCurrentTrack { return AnyShapeStyle(theme.accentGradient) }
         if unplayableReason != nil { return AnyShapeStyle(Color.orange) }
@@ -552,76 +560,83 @@ struct PlaylistItemView: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            // 播放按钮（扩大可点击区域：占满除操作按钮外的整行空间）
-            Button(action: { playAction(file) }) {
-                HStack(alignment: .center, spacing: 14) {
-                    // 播放图标
-                    ZStack {
-                        let iconName: String = {
-                            if isCurrentTrack { return "speaker.wave.2.fill" }
-                            if unplayableReason != nil { return "exclamationmark.triangle.fill" }
-                            return "play.circle.fill"
-                        }()
-                        Image(systemName: iconName)
-                            .foregroundStyle(iconStyle)
-                            .font(.system(size: 22))
-                            .frame(width: 28, height: 28)
-                            .help(unplayableReason.map { "不可播放：\($0)" } ?? "")
-                    }
-                    .frame(width: 36, height: 36)
-
-                    // 歌曲信息
-	                    VStack(alignment: .leading, spacing: 5) {
-	                        HStack(spacing: 8) {
-	                            Text(highlightedText(file.metadata.title, searchText: searchText))
-	                                .font(.system(size: 14, weight: .semibold))
-	                                .lineLimit(1)
-	                                .foregroundStyle(titleStyle)
-	                                .layoutPriority(1)
-
-	                            let badgeTextStyle: AnyShapeStyle = isVolumeAnalyzed ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText)
-	                            let badgeStrokeStyle: AnyShapeStyle = isVolumeAnalyzed ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText.opacity(0.45))
-	                            Text("均")
-	                                .font(.system(size: 10, weight: .bold, design: .rounded))
-	                                .foregroundStyle(badgeTextStyle)
-	                                .frame(width: 18, height: 18)
-	                                .background(
-	                                    Circle()
-	                                        .fill(isVolumeAnalyzed ? theme.accent.opacity(theme.scheme == .dark ? 0.20 : 0.15) : Color.clear)
-	                                        .overlay(
-	                                            Circle()
-	                                                .stroke(badgeStrokeStyle, lineWidth: 1)
-	                                                .opacity(isVolumeAnalyzed ? 0.85 : 1)
-	                                        )
-	                                )
-	                                .help(isVolumeAnalyzed ? "音量均衡：已分析" : "音量均衡：未分析")
-	                                .accessibilityLabel(isVolumeAnalyzed ? "音量均衡已分析" : "音量均衡未分析")
-
-	                            Spacer(minLength: 8)
-
-	                            Text(durationLabel)
-	                                .font(.system(size: 11, weight: .medium))
-	                                .monospacedDigit()
-	                                .foregroundColor(theme.mutedText.opacity(file.duration == nil ? 0.55 : 0.9))
-	                                .accessibilityLabel(file.duration == nil ? "时长加载中" : "时长 \(durationLabel)")
-	                        }
-
-                        Text("\(highlightedText(file.metadata.artist, searchText: searchText)) - \(highlightedText(file.metadata.album, searchText: searchText))")
-                            .font(.system(size: 12))
-                            .foregroundColor(theme.mutedText)
-                            .lineLimit(1)
-
-                        Text(file.url.lastPathComponent)
-                            .font(.system(size: 11))
-                            .foregroundColor(theme.mutedText.opacity(0.7))
-                            .lineLimit(1)
-                    }
-
-                    Spacer(minLength: 0)
+            // 播放点击区域（覆盖整行，避免只“选中”但点不到播放）
+            HStack(alignment: .center, spacing: 14) {
+                // 播放图标
+                ZStack {
+                    let iconName: String = {
+                        if isCurrentTrack { return "speaker.wave.2.fill" }
+                        if unplayableReason != nil { return "exclamationmark.triangle.fill" }
+                        return "play.circle.fill"
+                    }()
+                    Image(systemName: iconName)
+                        .foregroundStyle(iconStyle)
+                        .font(.system(size: 22))
+                        .frame(width: 28, height: 28)
+                        .help(unplayableReason.map { "不可播放：\($0)" } ?? "")
                 }
-                .contentShape(Rectangle())
+                .frame(width: 36, height: 36)
+
+                // 歌曲信息
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        Text(highlightedText(file.metadata.title, searchText: searchText))
+                            .font(.system(size: 14, weight: .semibold))
+                            .lineLimit(1)
+                            .foregroundStyle(titleStyle)
+                            .layoutPriority(1)
+
+                        let badgeTextStyle: AnyShapeStyle = isVolumeAnalyzed ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText)
+                        let badgeStrokeStyle: AnyShapeStyle = isVolumeAnalyzed ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText.opacity(0.45))
+                        Text("均")
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .foregroundStyle(badgeTextStyle)
+                            .frame(width: 18, height: 18)
+                            .background(
+                                Circle()
+                                    .fill(isVolumeAnalyzed ? theme.accent.opacity(theme.scheme == .dark ? 0.20 : 0.15) : Color.clear)
+                                    .overlay(
+                                        Circle()
+                                            .stroke(badgeStrokeStyle, lineWidth: 1)
+                                            .opacity(isVolumeAnalyzed ? 0.85 : 1)
+                                    )
+                            )
+                            .help(isVolumeAnalyzed ? "音量均衡：已分析" : "音量均衡：未分析")
+                            .accessibilityLabel(isVolumeAnalyzed ? "音量均衡已分析" : "音量均衡未分析")
+
+                        Spacer(minLength: 8)
+
+                        VStack(alignment: .trailing, spacing: 4) {
+                            Text(durationLabel)
+                                .font(.system(size: 11, weight: .medium))
+                                .monospacedDigit()
+                                .foregroundColor(theme.mutedText.opacity(file.duration == nil ? 0.55 : 0.9))
+                                .accessibilityLabel(file.duration == nil ? "时长加载中" : "时长 \(durationLabel)")
+
+                            if showsWeightControl, let scope = weightScope {
+                                let level = weights.level(for: file.url, scope: scope)
+                                WeightDotsView(level: level) { newLevel in
+                                    weights.setLevel(newLevel, for: file.url, scope: scope)
+                                }
+                            }
+                        }
+                    }
+
+                    Text("\(highlightedText(file.metadata.artist, searchText: searchText)) - \(highlightedText(file.metadata.album, searchText: searchText))")
+                        .font(.system(size: 12))
+                        .foregroundColor(theme.mutedText)
+                        .lineLimit(1)
+
+                    Text(file.url.lastPathComponent)
+                        .font(.system(size: 11))
+                        .foregroundColor(theme.mutedText.opacity(0.7))
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 0)
             }
-            .buttonStyle(PlainButtonStyle())
+            .contentShape(Rectangle())
+            .onTapGesture { playAction(file) }
             // 让按钮的可点击区域覆盖整行（含顶部/底部留白），避免只“选中”但点不到播放
             .padding(.leading, 16)
             .padding(.vertical, 14)

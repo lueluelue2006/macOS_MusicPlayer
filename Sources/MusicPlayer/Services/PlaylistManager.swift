@@ -66,6 +66,15 @@ final class PlaylistManager: ObservableObject {
     init() {
         playlistIOQueue.setSpecific(key: playlistIOQueueKey, value: ())
         loadScanSubfoldersPreference()
+
+        // When weights change, regenerate shuffle queues on next usage.
+        NotificationCenter.default.addObserver(
+            forName: .playbackWeightsDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.resetShuffleQueue()
+        }
     }
 
     // MARK: - Playback scope
@@ -285,6 +294,7 @@ final class PlaylistManager: ObservableObject {
 
     private func updatePlaylistShuffleQueue(oldKeys: [String], newKeys: [String]) {
         guard !playlistShuffleQueueKeys.isEmpty else { return }
+        guard case .playlist(let playlistID) = playbackScope else { return }
 
         let oldSet = Set(oldKeys)
         let newSet = Set(newKeys)
@@ -300,7 +310,11 @@ final class PlaylistManager: ObservableObject {
             // Insert newly added tracks into the remaining shuffle window (after current index).
             let insertLowerBound = min(playlistShuffleIndex, playlistShuffleQueueKeys.count)
             for key in added {
-                let pos = Int.random(in: insertLowerBound...playlistShuffleQueueKeys.count)
+                let weight = PlaybackWeights.shared.multiplier(forKey: key, scope: .playlist(playlistID))
+                let u = Double.random(in: 0...1)
+                let remaining = max(0, playlistShuffleQueueKeys.count - insertLowerBound)
+                let fraction = pow(u, weight) // higher weight -> closer to 0 -> earlier
+                let pos = insertLowerBound + Int((fraction * Double(remaining + 1)).rounded(.down))
                 playlistShuffleQueueKeys.insert(key, at: pos)
             }
         }
@@ -1041,7 +1055,7 @@ final class PlaylistManager: ObservableObject {
         guard audioFiles.count > 1 else { return nil }
 
         let candidates = audioFiles.indices.filter { $0 != currentIndex && !isUnplayableIndex($0) }
-        guard let idx = candidates.randomElement() else { return nil }
+        guard let idx = weightedRandomIndex(indices: candidates, scope: .queue) else { return nil }
 
         currentIndex = idx
         savePlaylist() // 保存新的索引
@@ -1137,6 +1151,7 @@ final class PlaylistManager: ObservableObject {
 
     private func getRandomFileExcludingCurrentInPlaylist() -> AudioFile? {
         guard playbackScopePlayableCount() > 1 else { return nil }
+        guard case .playlist(let playlistID) = playbackScope else { return nil }
 
         let currentKey = currentPathKeyInQueue()
         var candidates: [String] = []
@@ -1147,7 +1162,7 @@ final class PlaylistManager: ObservableObject {
             if isUnplayableIndex(idx) { continue }
             candidates.append(key)
         }
-        guard let chosenKey = candidates.randomElement(),
+        guard let chosenKey = weightedRandomKey(keys: candidates, scope: .playlist(playlistID)),
               let idx = indexInQueue(forPathKey: chosenKey),
               !isUnplayableIndex(idx)
         else { return nil }
@@ -1185,14 +1200,19 @@ final class PlaylistManager: ObservableObject {
 
         let insertLowerBound = min(shuffleIndex, shuffleQueue.count)
         for idx in newIndices {
-            let pos = Int.random(in: insertLowerBound...shuffleQueue.count)
+            let weight = PlaybackWeights.shared.multiplier(for: audioFiles[idx].url, scope: .queue)
+            let u = Double.random(in: 0...1)
+            let remaining = max(0, shuffleQueue.count - insertLowerBound)
+            let fraction = pow(u, weight) // higher weight -> closer to 0 -> earlier
+            let pos = insertLowerBound + Int((fraction * Double(remaining + 1)).rounded(.down))
             shuffleQueue.insert(idx, at: pos)
         }
     }
 
     // 洗牌算法
     private func createShuffleQueue() {
-        shuffleQueue = audioFiles.indices.filter { !isUnplayableIndex($0) }.shuffled()
+        let playable = audioFiles.indices.filter { !isUnplayableIndex($0) }
+        shuffleQueue = weightedShuffleIndices(playable, scope: .queue)
         shuffleIndex = 0
     }
 
@@ -1216,7 +1236,11 @@ final class PlaylistManager: ObservableObject {
         }
 
         if startFromRandom {
-            playlistShuffleQueueKeys = playableKeys.shuffled()
+            if case .playlist(let playlistID) = playbackScope {
+                playlistShuffleQueueKeys = weightedShuffleKeys(playableKeys, scope: .playlist(playlistID))
+            } else {
+                playlistShuffleQueueKeys = playableKeys.shuffled()
+            }
             playlistShuffleIndex = min(1, playlistShuffleQueueKeys.count)
             return
         }
@@ -1225,13 +1249,83 @@ final class PlaylistManager: ObservableObject {
            playableKeys.contains(currentKey),
            playableKeys.count > 1 {
             var rest = playableKeys.filter { $0 != currentKey }
-            rest.shuffle()
+            if case .playlist(let playlistID) = playbackScope {
+                rest = weightedShuffleKeys(rest, scope: .playlist(playlistID))
+            } else {
+                rest.shuffle()
+            }
             playlistShuffleQueueKeys = [currentKey] + rest
             playlistShuffleIndex = 1
         } else {
-            playlistShuffleQueueKeys = playableKeys.shuffled()
+            if case .playlist(let playlistID) = playbackScope {
+                playlistShuffleQueueKeys = weightedShuffleKeys(playableKeys, scope: .playlist(playlistID))
+            } else {
+                playlistShuffleQueueKeys = playableKeys.shuffled()
+            }
             playlistShuffleIndex = 0
         }
+    }
+
+    // MARK: - Weighted shuffle/random helpers
+
+    private func weightedRandomIndex(indices: [Int], scope: PlaybackWeights.Scope) -> Int? {
+        guard !indices.isEmpty else { return nil }
+        var total: Double = 0
+        total = indices.reduce(into: 0) { acc, idx in
+            acc += PlaybackWeights.shared.multiplier(for: audioFiles[idx].url, scope: scope)
+        }
+        guard total.isFinite, total > 0 else { return indices.randomElement() }
+
+        var r = Double.random(in: 0..<total)
+        for idx in indices {
+            r -= PlaybackWeights.shared.multiplier(for: audioFiles[idx].url, scope: scope)
+            if r <= 0 { return idx }
+        }
+        return indices.last
+    }
+
+    private func weightedRandomKey(keys: [String], scope: PlaybackWeights.Scope) -> String? {
+        guard !keys.isEmpty else { return nil }
+        let total = keys.reduce(into: 0.0) { acc, key in
+            acc += PlaybackWeights.shared.multiplier(forKey: key, scope: scope)
+        }
+        guard total.isFinite, total > 0 else { return keys.randomElement() }
+
+        var r = Double.random(in: 0..<total)
+        for key in keys {
+            r -= PlaybackWeights.shared.multiplier(forKey: key, scope: scope)
+            if r <= 0 { return key }
+        }
+        return keys.last
+    }
+
+    /// Efraimidis–Spirakis: weighted random permutation without replacement.
+    private func weightedShuffleIndices(_ indices: [Int], scope: PlaybackWeights.Scope) -> [Int] {
+        guard indices.count >= 2 else { return indices }
+        var keyed: [(Double, Int)] = []
+        keyed.reserveCapacity(indices.count)
+        for idx in indices {
+            let w = max(0.000_001, PlaybackWeights.shared.multiplier(for: audioFiles[idx].url, scope: scope))
+            let u = max(Double.leastNonzeroMagnitude, Double.random(in: 0...1))
+            let k = -log(u) / w
+            keyed.append((k, idx))
+        }
+        keyed.sort { $0.0 < $1.0 }
+        return keyed.map { $0.1 }
+    }
+
+    private func weightedShuffleKeys(_ keys: [String], scope: PlaybackWeights.Scope) -> [String] {
+        guard keys.count >= 2 else { return keys }
+        var keyed: [(Double, String)] = []
+        keyed.reserveCapacity(keys.count)
+        for key in keys {
+            let w = max(0.000_001, PlaybackWeights.shared.multiplier(forKey: key, scope: scope))
+            let u = max(Double.leastNonzeroMagnitude, Double.random(in: 0...1))
+            let k = -log(u) / w
+            keyed.append((k, key))
+        }
+        keyed.sort { $0.0 < $1.0 }
+        return keyed.map { $0.1 }
     }
 
     private func getNextShuffledFileInPlaylist() -> AudioFile? {

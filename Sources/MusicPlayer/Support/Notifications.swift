@@ -22,6 +22,9 @@ extension Notification.Name {
     /// App 内 Toast（右上角）
     static let showAppToast = Notification.Name("showAppToast")
 
+    /// 随机权重变更（用于重置洗牌队列等）
+    static let playbackWeightsDidChange = Notification.Name("playbackWeightsDidChange")
+
     /// 左侧面板（队列/歌单）切换
     static let switchPlaylistPanelToQueue = Notification.Name("switchPlaylistPanelToQueue")
     static let switchPlaylistPanelToPlaylists = Notification.Name("switchPlaylistPanelToPlaylists")

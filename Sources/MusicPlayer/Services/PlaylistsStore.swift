@@ -60,6 +60,7 @@ final class PlaylistsStore: ObservableObject {
         if selectedPlaylistID == playlist.id {
             selectedPlaylistID = playlists.first?.id
         }
+        PlaybackWeights.shared.removePlaylist(playlist.id)
         saveNow()
     }
 
@@ -102,6 +103,7 @@ final class PlaylistsStore: ObservableObject {
         playlists[idx].tracks.removeAll { pathKey($0.path) == targetKey }
         if playlists[idx].tracks.count != before {
             playlists[idx].updatedAt = Date()
+            PlaybackWeights.shared.removeTrack(URL(fileURLWithPath: path), fromPlaylist: playlistID)
             saveNow()
         }
     }

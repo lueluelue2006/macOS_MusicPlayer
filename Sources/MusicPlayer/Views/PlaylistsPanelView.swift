@@ -173,33 +173,38 @@ struct PlaylistsPanelView: View {
                             .foregroundColor(theme.mutedText.opacity(0.9))
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    List(filteredTracks) { file in
-                        PlaylistItemView(
-                            file: file,
-                            isCurrentTrack: currentHighlightedURL == file.url,
-                            isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
-                            unplayableReason: trackUnplayableReasons[pathKey(file.url)],
-                            searchText: trackSearchText
-                        ) { selectedFile in
-                            NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                            playTrackInPlaylist(selectedFile, playlist: playlist)
-                        } deleteAction: { fileToDelete in
-                            NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                            playlistsStore.removeTrack(path: fileToDelete.url.path, from: playlist.id)
-                            reloadSelectedPlaylist()
-                        } editAction: { fileToEdit in
-                            NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                            if trackUnplayableReasons[pathKey(fileToEdit.url)] != nil {
-                                postToast(title: "文件不存在，无法编辑", subtitle: fileToEdit.url.lastPathComponent, kind: "warning")
-                                return
-                            }
-                            onRequestEditMetadata(fileToEdit)
-                        }
-                        .listRowBackground(Color.clear)
-                        .listRowSeparator(.hidden)
-                        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
-                    }
+	                } else {
+	                    List(filteredTracks) { file in
+	                        PlaylistItemView(
+	                            file: file,
+	                            isCurrentTrack: currentHighlightedURL == file.url,
+	                            isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
+	                            unplayableReason: trackUnplayableReasons[pathKey(file.url)],
+	                            searchText: trackSearchText,
+	                            playAction: { selectedFile in
+	                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
+	                                playTrackInPlaylist(selectedFile, playlist: playlist)
+	                            },
+	                            deleteAction: { fileToDelete in
+	                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
+	                                playlistsStore.removeTrack(path: fileToDelete.url.path, from: playlist.id)
+	                                reloadSelectedPlaylist()
+	                            },
+	                            editAction: { fileToEdit in
+	                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
+	                                if trackUnplayableReasons[pathKey(fileToEdit.url)] != nil {
+	                                    postToast(title: "文件不存在，无法编辑", subtitle: fileToEdit.url.lastPathComponent, kind: "warning")
+	                                    return
+	                                }
+	                                onRequestEditMetadata(fileToEdit)
+	                            },
+	                            weightScope: .playlist(playlist.id),
+	                            showsWeightControl: true
+	                        )
+	                        .listRowBackground(Color.clear)
+	                        .listRowSeparator(.hidden)
+	                        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+	                    }
                     .listStyle(PlainListStyle())
                     .scrollContentBackground(.hidden)
                     .background(Color.clear)
