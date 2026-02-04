@@ -8,6 +8,8 @@ actor UpdateChecker {
         let currentVersion: String
         let latestVersion: String
         let releaseURL: URL
+        let assetName: String?
+        let assetURL: URL?
     }
 
     enum CheckOutcome: Sendable {
@@ -19,10 +21,22 @@ actor UpdateChecker {
     private struct GitHubLatestRelease: Decodable {
         let tagName: String
         let htmlURL: String?
+        let assets: [GitHubAsset]
 
         enum CodingKeys: String, CodingKey {
             case tagName = "tag_name"
             case htmlURL = "html_url"
+            case assets
+        }
+    }
+
+    private struct GitHubAsset: Decodable {
+        let name: String
+        let browserDownloadURL: String
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case browserDownloadURL = "browser_download_url"
         }
     }
 
@@ -40,10 +54,13 @@ actor UpdateChecker {
             }
 
             if latest > current {
+                let asset = selectBestAsset(from: latestRelease.assets)
                 return .updateAvailable(UpdateInfo(
                     currentVersion: currentVersion,
                     latestVersion: latestVersionString,
-                    releaseURL: releasesURL
+                    releaseURL: releasesURL,
+                    assetName: asset?.name,
+                    assetURL: asset?.url
                 ))
             }
 
@@ -66,6 +83,37 @@ actor UpdateChecker {
 
         let (data, _) = try await URLSession.shared.data(for: req)
         return try JSONDecoder().decode(GitHubLatestRelease.self, from: data)
+    }
+
+    private struct SelectedAsset: Sendable {
+        let name: String
+        let url: URL
+    }
+
+    private func selectBestAsset(from assets: [GitHubAsset]) -> SelectedAsset? {
+        let dmgAssets: [SelectedAsset] =
+            assets
+            .compactMap { a in
+                guard a.name.lowercased().hasSuffix(".dmg") else { return nil }
+                guard let url = URL(string: a.browserDownloadURL) else { return nil }
+                return SelectedAsset(name: a.name, url: url)
+            }
+
+        guard !dmgAssets.isEmpty else { return nil }
+
+#if arch(x86_64)
+        // Intel / Rosetta: prefer "-intel.dmg"
+        if let preferred = dmgAssets.first(where: { $0.name.lowercased().contains("-intel.dmg") }) {
+            return preferred
+        }
+#else
+        // Apple Silicon: prefer non-intel dmg
+        if let preferred = dmgAssets.first(where: { !$0.name.lowercased().contains("-intel.dmg") }) {
+            return preferred
+        }
+#endif
+
+        return dmgAssets.first
     }
 }
 

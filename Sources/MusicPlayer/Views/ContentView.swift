@@ -24,6 +24,7 @@ struct ContentView: View {
     @State private var didAutoCheckForUpdatesThisLaunch: Bool = false
     @State private var updateCheckTask: Task<Void, Never>?
     @State private var toastTapURL: URL?
+    @State private var toastTapUpdate: UpdateChecker.UpdateInfo?
 
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
@@ -116,8 +117,12 @@ struct ContentView: View {
                         title: toastTitle,
                         subtitle: toastSubtitle,
                         kind: toastKind,
-                        onTap: toastTapURL == nil ? nil : {
-                            if let url = toastTapURL { openURL(url) }
+                        onTap: (toastTapURL == nil && toastTapUpdate == nil) ? nil : {
+                            if let info = toastTapUpdate {
+                                Task { await startSelfUpdate(info) }
+                            } else if let url = toastTapURL {
+                                openURL(url)
+                            }
                         },
                         onClose: { dismissToast() }
                     )
@@ -245,7 +250,7 @@ struct ContentView: View {
         // 已经排队等待执行，则不重复创建任务
         guard updateCheckTask == nil else { return }
 
-        let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "3.3"
+        let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "3.3.1"
         updateCheckTask = Task(priority: .background) {
             // 延迟一点：让加载/恢复后的 UI 与磁盘/元数据任务先跑一会儿
             do {
@@ -262,13 +267,23 @@ struct ContentView: View {
                 updateCheckTask = nil
                 switch outcome {
                 case .updateAvailable(let info):
-                    showToastMessage(
-                        "发现新版本 \(info.latestVersion)",
-                        subtitle: "点击打开 GitHub Releases 下载",
-                        kind: .update,
-                        duration: 10.0,
-                        tapURL: info.releaseURL
-                    )
+                    if info.assetURL != nil {
+                        showToastMessage(
+                            "发现新版本 \(info.latestVersion)",
+                            subtitle: "点击自动更新（下载并安装后自动重启）",
+                            kind: .update,
+                            duration: 10.0,
+                            tapUpdate: info
+                        )
+                    } else {
+                        showToastMessage(
+                            "发现新版本 \(info.latestVersion)",
+                            subtitle: "点击打开 GitHub Releases 下载",
+                            kind: .update,
+                            duration: 10.0,
+                            tapURL: info.releaseURL
+                        )
+                    }
                 case .upToDate(let current, let latest, let url):
                     if latest == current {
                         showToastMessage("已是最新版本 \(current)", kind: .success, duration: 2.0, tapURL: url)
@@ -311,13 +326,15 @@ struct ContentView: View {
         subtitle: String? = nil,
         kind: ToastKind = .info,
         duration: TimeInterval = 2.8,
-        tapURL: URL? = nil
+        tapURL: URL? = nil,
+        tapUpdate: UpdateChecker.UpdateInfo? = nil
     ) {
         toastTask?.cancel()
         toastTitle = message
         toastSubtitle = subtitle
         toastKind = kind
         toastTapURL = tapURL
+        toastTapUpdate = tapUpdate
         withAnimation(.easeInOut(duration: 0.2)) {
             showToast = true
         }
@@ -334,8 +351,30 @@ struct ContentView: View {
         toastTask?.cancel()
         toastTask = nil
         toastTapURL = nil
+        toastTapUpdate = nil
         withAnimation(.easeInOut(duration: 0.2)) {
             showToast = false
+        }
+    }
+
+    @MainActor
+    private func startSelfUpdate(_ info: UpdateChecker.UpdateInfo) async {
+        showToastMessage(
+            "正在下载并安装 \(info.latestVersion)…",
+            subtitle: "将自动覆盖安装到 /Applications 并重启",
+            kind: .update,
+            duration: 60.0
+        )
+        do {
+            try await SelfUpdater.shared.startUpdateIfPossible(info: info)
+        } catch {
+            showToastMessage(
+                "自动更新失败",
+                subtitle: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription,
+                kind: .error,
+                duration: 4.0,
+                tapURL: info.releaseURL
+            )
         }
     }
 }
