@@ -7,6 +7,8 @@ struct PlaylistsPanelView: View {
 
     let onRequestEditMetadata: (AudioFile) -> Void
 
+    @ObservedObject private var weights = PlaybackWeights.shared
+
     @State private var trackSearchText: String = ""
     @State private var loadedTracks: [AudioFile] = []
     @State private var trackUnplayableReasons: [String: String] = [:]
@@ -260,6 +262,23 @@ struct PlaylistsPanelView: View {
             .buttonStyle(.bordered)
             .disabled(audioPlayer.currentFile == nil)
             .help(audioPlayer.currentFile == nil ? "没有正在播放的歌曲" : "")
+
+            Button {
+                let result = weights.syncPlaylistOverridesToQueue(from: playlist.id)
+                if result.total == 0 {
+                    postToast(title: "歌单没有设置随机权重", subtitle: "先在歌单里点一下 5 个方块设置权重", kind: "info")
+                    return
+                }
+                if result.changed == 0 {
+                    postToast(title: "队列权重已是最新", subtitle: "无需同步（\(result.total) 条权重一致）", kind: "info")
+                    return
+                }
+                postToast(title: "已同步权重到队列", subtitle: "应用了 \(result.changed)/\(result.total) 条权重", kind: "success")
+            } label: {
+                Label("同步权重", systemImage: "arrow.triangle.2.circlepath")
+            }
+            .buttonStyle(.bordered)
+            .help("将本歌单的随机权重同步到队列（只同步非默认权重，不会清空队列里其他歌曲的权重）")
         }
         .padding(.top, 4)
     }

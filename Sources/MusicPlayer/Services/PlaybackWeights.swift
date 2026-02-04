@@ -9,6 +9,11 @@ import Foundation
 final class PlaybackWeights: ObservableObject {
     static let shared = PlaybackWeights()
 
+    struct SyncResult: Sendable {
+        let total: Int
+        let changed: Int
+    }
+
     enum Scope: Equatable, Sendable {
         case queue
         case playlist(UserPlaylist.ID)
@@ -170,6 +175,38 @@ final class PlaybackWeights: ObservableObject {
         }
         lock.unlock()
         if removed { bumpAndSave() }
+    }
+
+    /// Copy weight overrides from a playlist scope into the queue scope.
+    ///
+    /// Notes:
+    /// - Only non-default levels are stored, so this copies *overrides* and will not wipe queue weights
+    ///   for tracks that are default (green) in the playlist.
+    /// - Returns how many overrides were present and how many actually changed in the queue scope.
+    func syncPlaylistOverridesToQueue(from playlistID: UserPlaylist.ID) -> SyncResult {
+        loadIfNeeded()
+        let pid = playlistID.uuidString
+
+        lock.lock()
+        let source = playlistLevels[pid] ?? [:]
+        if source.isEmpty {
+            lock.unlock()
+            return SyncResult(total: 0, changed: 0)
+        }
+
+        var changed = 0
+        for (key, raw) in source {
+            let clamped = max(0, min(4, raw))
+            guard clamped != 0 else { continue }
+            if queueLevels[key] != clamped {
+                queueLevels[key] = clamped
+                changed += 1
+            }
+        }
+        lock.unlock()
+
+        if changed > 0 { bumpAndSave() }
+        return SyncResult(total: source.count, changed: changed)
     }
 
     private func bumpAndSave() {
