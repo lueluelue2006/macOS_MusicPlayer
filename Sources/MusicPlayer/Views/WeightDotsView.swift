@@ -8,20 +8,26 @@ struct WeightDotsView: View {
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
     var body: some View {
-        HStack(spacing: 5) {
-            ForEach(Array(PlaybackWeights.Level.allCases.enumerated()), id: \.offset) { (_, l) in
+        let levels = PlaybackWeights.Level.allCases
+        HStack(spacing: 0) {
+            ForEach(Array(levels.enumerated()), id: \.offset) { (i, l) in
                 Button {
                     onSelect(l)
                 } label: {
-                    Circle()
-                        .fill(color(for: l))
-                        .frame(width: 7, height: 7)
+                    let isSelected = (l == level)
+                    RoundedRectangle(cornerRadius: 2, style: .continuous)
+                        .fill(isSelected ? color(for: l) : theme.mutedText.opacity(0.12))
+                        .frame(width: 10, height: 10)
                         .overlay(
-                            Circle()
-                                .stroke(theme.stroke.opacity(0.7), lineWidth: 0.8)
+                            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                                .stroke(theme.stroke.opacity(isSelected ? 0.9 : 0.55), lineWidth: 1.0)
                         )
-                        .opacity(l.rawValue <= level.rawValue ? 1.0 : 0.18)
-                        .padding(.vertical, 2)
+                        .shadow(color: isSelected ? color(for: l).opacity(0.75) : .clear, radius: 6, x: 0, y: 0)
+                        .shadow(color: isSelected ? color(for: l).opacity(0.35) : .clear, radius: 14, x: 0, y: 0)
+                        // Bigger hitbox, but keep layout tight.
+                        .frame(width: 14, height: 14)
+                        // Remove dead zone between controls: allocate spacing to the left cell.
+                        .padding(.trailing, i == (levels.count - 1) ? 0 : 2)
                 }
                 .buttonStyle(.plain)
                 .help(helpText(for: l))
@@ -51,4 +57,3 @@ struct WeightDotsView: View {
         return "随机权重 \(String(format: "%.1f", m)) 倍"
     }
 }
-
