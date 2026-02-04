@@ -619,13 +619,7 @@ struct PlaylistItemView: View {
 
                         Spacer(minLength: 8)
 
-                        VStack(alignment: .trailing, spacing: 4) {
-                            Text(durationLabel)
-                                .font(.system(size: 11, weight: .medium))
-                                .monospacedDigit()
-                                .foregroundColor(theme.mutedText.opacity(file.duration == nil ? 0.55 : 0.9))
-                                .accessibilityLabel(file.duration == nil ? "时长加载中" : "时长 \(durationLabel)")
-
+                        HStack(alignment: .center, spacing: 8) {
                             if showsWeightControl, let scope = weightScope {
                                 let level = weights.level(for: file.url, scope: scope)
                                 WeightDotsView(level: level) { newLevel in
@@ -641,6 +635,12 @@ struct PlaylistItemView: View {
                                         .onTapGesture { }
                                 )
                             }
+
+                            Text(durationLabel)
+                                .font(.system(size: 11, weight: .medium))
+                                .monospacedDigit()
+                                .foregroundColor(theme.mutedText.opacity(file.duration == nil ? 0.55 : 0.9))
+                                .accessibilityLabel(file.duration == nil ? "时长加载中" : "时长 \(durationLabel)")
                         }
                     }
 
