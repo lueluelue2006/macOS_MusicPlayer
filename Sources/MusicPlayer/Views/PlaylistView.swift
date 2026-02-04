@@ -456,7 +456,6 @@ struct SearchBarView: View {
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
     var body: some View {
-        let sortOption = sortState.option(for: focusTarget)
         HStack(spacing: 12) {
             Image(systemName: "magnifyingglass")
                 .foregroundColor(theme.mutedText)
@@ -492,45 +491,7 @@ struct SearchBarView: View {
                 .buttonStyle(PlainButtonStyle())
             }
 
-            Menu {
-                Picker("排序字段", selection: Binding(
-                    get: { sortOption.field },
-                    set: { newField in
-                        sortState.setOption(SearchSortOption(field: newField, direction: sortOption.direction), for: focusTarget)
-                    }
-                )) {
-                    ForEach(SearchSortField.allCases) { field in
-                        Text(field.displayName).tag(field)
-                    }
-                }
-                .pickerStyle(.inline)
-
-                Picker("顺序", selection: Binding(
-                    get: { sortOption.direction },
-                    set: { newDirection in
-                        sortState.setOption(SearchSortOption(field: sortOption.field, direction: newDirection), for: focusTarget)
-                    }
-                )) {
-                    ForEach(SearchSortDirection.allCases) { direction in
-                        Text(direction.displayName).tag(direction)
-                    }
-                }
-                .pickerStyle(.inline)
-
-                Divider()
-
-                Button("恢复原顺序") {
-                    sortState.setOption(.default, for: focusTarget)
-                }
-                .disabled(sortOption.field == .original && sortOption.direction == .ascending)
-            } label: {
-                Image(systemName: sortOption.field == .original ? "arrow.up.arrow.down" : "arrow.up.arrow.down.circle.fill")
-                    .foregroundColor(theme.mutedText)
-                    .font(.headline)
-                    .frame(width: 28, height: 28)
-            }
-            .menuStyle(.borderlessButton)
-            .help("排序：\(sortOption.field.displayName)（\(sortOption.direction.displayName)）\n仅影响列表显示，不改变队列/歌单顺序。")
+            SearchSortButton(target: focusTarget, helpSuffix: "仅影响列表显示，不改变队列/歌单顺序。")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
