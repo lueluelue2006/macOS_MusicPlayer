@@ -210,14 +210,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
-    private static func isAudioFile(_ url: URL) -> Bool {
-        let exts = [
-            "mp3", "m4a", "aac",
-            "wav", "aif", "aiff", "aifc", "caf",
-            "flac", "ogg"
-        ]
-        return exts.contains(url.pathExtension.lowercased())
-    }
+	    private static func isAudioFile(_ url: URL) -> Bool {
+	        let exts = [
+	            "mp3", "m4a", "aac",
+	            "wav", "aif", "aiff", "aifc", "caf",
+	            "flac"
+	        ]
+	        return exts.contains(url.pathExtension.lowercased())
+	    }
 
     // 重新激活应用（例如所有窗口被关闭后点击 Dock 图标）
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

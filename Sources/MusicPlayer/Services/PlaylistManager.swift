@@ -1405,14 +1405,14 @@ final class PlaylistManager: ObservableObject {
         d.set(scanSubfolders, forKey: userScanSubfoldersKey)
     }
     
-    private func isAudioFile(_ url: URL) -> Bool {
-        let audioExtensions = [
-            "mp3", "m4a", "aac", // MPEG family
-            "wav", "aif", "aiff", "aifc", "caf", // PCM/CoreAudio
-            "flac", "ogg" // 非系统内置播放格式，识别但可能无法解码
-        ]
-        return audioExtensions.contains(url.pathExtension.lowercased())
-    }
+	    private func isAudioFile(_ url: URL) -> Bool {
+	        let audioExtensions = [
+	            "mp3", "m4a", "aac", // MPEG family
+	            "wav", "aif", "aiff", "aifc", "caf", // PCM/CoreAudio
+	            "flac" // Lossless
+	        ]
+	        return audioExtensions.contains(url.pathExtension.lowercased())
+	    }
 
     // 统一的路径键（大小写不敏感，标准化 URL）
     private func pathKey(_ url: URL) -> String {

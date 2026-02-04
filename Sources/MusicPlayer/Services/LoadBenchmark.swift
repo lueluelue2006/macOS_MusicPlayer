@@ -195,13 +195,13 @@ enum LoadBenchmark {
 
     // MARK: - Internals
 
-    private static func collectAudioFiles(in folder: URL, limit: Int) -> [URL] {
-        let fm = FileManager.default
-        let allowed = Set([
-            "mp3", "m4a", "aac",
-            "wav", "aif", "aiff", "aifc", "caf",
-            "flac", "ogg", "opus"
-        ])
+	    private static func collectAudioFiles(in folder: URL, limit: Int) -> [URL] {
+	        let fm = FileManager.default
+	        let allowed = Set([
+	            "mp3", "m4a", "aac",
+	            "wav", "aif", "aiff", "aifc", "caf",
+	            "flac"
+	        ])
 
         let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
         guard let enumerator = fm.enumerator(

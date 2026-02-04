@@ -54,7 +54,7 @@ else
 🎵 音乐播放器 - MusicPlayer $VERSION
 
 • 支持静态与动态歌词显示（.lrc）
-• 常见音频格式：MP3, WAV, M4A, AAC, FLAC, OGG, AIFF
+• 常见音频格式：MP3, WAV, M4A, AAC, FLAC, AIFF, CAF
 • 安装：将 MusicPlayer.app **拖入** Applications
 • 首次运行受阻：系统设置 → 隐私与安全性 → 仍要打开；或在终端执行
   xattr -dr com.apple.quarantine /Applications/MusicPlayer.app

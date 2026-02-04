@@ -59,6 +59,66 @@ struct MusicPlayerCommands: Commands {
 
             Divider()
 
+            Menu("文件关联") {
+                Button("设为默认打开方式…") {
+                    Task { @MainActor in
+                        guard Bundle.main.bundleURL.pathExtension.lowercased() == "app" else {
+                            let alert = NSAlert()
+                            alert.messageText = "无法设置默认打开方式"
+                            alert.informativeText = "当前不是以 .app 形式运行（例如 swift build 产物）。请使用 MusicPlayer.app 启动后再设置。"
+                            alert.addButton(withTitle: "确定")
+                            alert.runModal()
+                            return
+                        }
+
+                        let formats = DefaultAudioFileAssociations.supportedTargets.map(\.label).joined(separator: "\n• ")
+                        let alert = NSAlert()
+                        alert.messageText = "设为默认打开方式？"
+                        alert.informativeText =
+                            "将 MusicPlayer 设为以下音频格式的默认打开方式（仅对当前用户生效）：\n\n• \(formats)\n\n提示：可在 Finder 里对任意文件点“显示简介 → 打开方式”改回。"
+                        alert.alertStyle = .informational
+
+                        let cancelButton = alert.addButton(withTitle: "取消")
+                        cancelButton.keyEquivalent = "\r"
+                        cancelButton.keyEquivalentModifierMask = []
+
+                        let confirmButton = alert.addButton(withTitle: "设为默认")
+                        confirmButton.keyEquivalent = ""
+                        confirmButton.keyEquivalentModifierMask = []
+
+                        guard alert.runModal() == .alertSecondButtonReturn else { return }
+
+                        let result = DefaultAudioFileAssociations.setAsDefaultViewerForSupportedAudio()
+                        if result.failed.isEmpty {
+                            if result.changed == 0 {
+                                NotificationSettingsHelper.postToast(
+                                    title: "默认打开方式已是 MusicPlayer",
+                                    subtitle: "无需修改（\(result.total) 项均已设置）",
+                                    kind: "success",
+                                    duration: 2.6
+                                )
+                            } else {
+                                NotificationSettingsHelper.postToast(
+                                    title: "已设为默认打开方式",
+                                    subtitle: "已更新 \(result.changed) 项（共 \(result.total) 项）",
+                                    kind: "success",
+                                    duration: 3.0
+                                )
+                            }
+                        } else {
+                            NotificationSettingsHelper.postToast(
+                                title: "部分格式未能设为默认",
+                                subtitle: "成功 \(result.changed + result.alreadyDefault)/\(result.total)，失败 \(result.failed.count)（可在 Finder 手动设置）",
+                                kind: "warning",
+                                duration: 5.0
+                            )
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
             Menu("缓存") {
                 Button("清空音量均衡缓存") {
                     Task { @MainActor in

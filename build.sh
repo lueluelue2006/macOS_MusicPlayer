@@ -80,62 +80,51 @@ cat > MusicPlayer.app/Contents/Info.plist << EOF
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
-    <key>CFBundleDocumentTypes</key>
-    <array>
-        <!-- 主流音频格式：作为默认处理程序（Owner） -->
-        <dict>
-            <key>CFBundleTypeName</key>
-            <string>Audio (Common)</string>
-            <key>LSItemContentTypes</key>
-            <array>
-                <string>public.mp3</string>
-                <string>public.mpeg-4-audio</string>
-                <string>com.microsoft.waveform-audio</string>
-                <string>public.aiff-audio</string>
-                <string>public.aifc-audio</string>
-                <string>com.apple.coreaudio-format</string>
-            </array>
-            <key>CFBundleTypeRole</key>
-            <string>Viewer</string>
-            <key>LSHandlerRank</key>
+	    <key>CFBundleDocumentTypes</key>
+	    <array>
+	        <!-- 可播放的音频格式：作为默认处理程序（Owner） -->
+	        <dict>
+	            <key>CFBundleTypeName</key>
+	            <string>Audio (Common)</string>
+	            <key>LSItemContentTypes</key>
+	            <array>
+	                <string>public.mp3</string>
+	                <string>com.apple.m4a-audio</string>
+	                <string>public.mpeg-4-audio</string>
+	                <string>public.aac-audio</string>
+	                <string>com.microsoft.waveform-audio</string>
+	                <string>public.aiff-audio</string>
+	                <string>public.aifc-audio</string>
+	                <string>com.apple.coreaudio-format</string>
+	                <string>org.xiph.flac</string>
+	            </array>
+	            <key>CFBundleTypeRole</key>
+	            <string>Viewer</string>
+	            <key>LSHandlerRank</key>
             <string>Owner</string>
         </dict>
         <!-- 扩展名匹配（补充），同样作为默认处理程序 -->
         <dict>
             <key>CFBundleTypeExtensions</key>
-            <array>
-                <string>mp3</string>
-                <string>m4a</string>
-                <string>aac</string>
-                <string>wav</string>
-                <string>aif</string>
-                <string>aiff</string>
-                <string>aifc</string>
-                <string>caf</string>
-            </array>
-            <key>CFBundleTypeName</key>
-            <string>Audio Extensions</string>
-            <key>CFBundleTypeRole</key>
-            <string>Viewer</string>
-            <key>LSHandlerRank</key>
-            <string>Owner</string>
-        </dict>
-        <!-- 非系统内置格式，仅作为候选（不抢默认） -->
-        <dict>
-            <key>CFBundleTypeExtensions</key>
-            <array>
-                <string>flac</string>
-                <string>ogg</string>
-                <string>opus</string>
-            </array>
-            <key>CFBundleTypeName</key>
-            <string>Other Audio</string>
-            <key>CFBundleTypeRole</key>
-            <string>Viewer</string>
-            <key>LSHandlerRank</key>
-            <string>Alternate</string>
-        </dict>
-    </array>
+	            <array>
+	                <string>mp3</string>
+	                <string>m4a</string>
+	                <string>aac</string>
+	                <string>wav</string>
+	                <string>aif</string>
+	                <string>aiff</string>
+	                <string>aifc</string>
+	                <string>caf</string>
+	                <string>flac</string>
+	            </array>
+	            <key>CFBundleTypeName</key>
+	            <string>Audio Extensions</string>
+	            <key>CFBundleTypeRole</key>
+	            <string>Viewer</string>
+	            <key>LSHandlerRank</key>
+	            <string>Owner</string>
+	        </dict>
+	    </array>
 </dict>
 </plist>
 EOF
@@ -165,7 +154,7 @@ echo "   - 将音频文件拖拽到应用中即可播放"
 echo "   - 元数据编辑：蓝色铅笔=直接编辑(M4A/MP4/AAC)，橙色铅笔=生成FFmpeg命令"
 echo "   - 歌词嵌入助手：在‘生成FFmpeg命令’页面底部，填入歌曲与.lrc路径，一键复制嵌入命令"
 echo "   - Finder 复制完整路径：选中文件后按 Option+Command+C"
-echo "   - 支持 MP3, WAV, M4A, AAC, FLAC, OGG, AIFF 格式"
+echo "   - 支持 MP3, WAV, M4A, AAC, FLAC, AIFF, CAF 格式"
 echo "   - 若系统未出现通知授权弹窗，建议将应用移动到 /Applications 后执行："
 echo "       xattr -dr com.apple.quarantine /Applications/MusicPlayer.app"
 echo "       codesign --force --deep --sign - /Applications/MusicPlayer.app"

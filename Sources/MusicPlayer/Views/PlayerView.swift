@@ -91,7 +91,7 @@ struct PlayerView: View {
                 .padding(.horizontal)
                 
                 // 当前播放信息
-                CurrentTrackView(audioPlayer: audioPlayer)
+                CurrentTrackView(audioPlayer: audioPlayer, playlistManager: playlistManager)
                 
                 // 歌词显示/切换（不再通过悬停禁用外层滚动，避免“被限制住”的体验）
                 LyricsContainerView(audioPlayer: audioPlayer)
@@ -238,6 +238,8 @@ struct FlowingBorder: View {
 
 struct CurrentTrackView: View {
     @ObservedObject var audioPlayer: AudioPlayer
+    @ObservedObject var playlistManager: PlaylistManager
+    @ObservedObject private var weights = PlaybackWeights.shared
     @State private var showEphemeralTip: Bool = false
     @State private var showRatePicker: Bool = false
     @State private var glowRotation: Double = 0
@@ -418,6 +420,12 @@ struct CurrentTrackView: View {
                     }
 
                     Spacer()
+
+                    WeightDotsView(level: weights.level(for: currentFile.url, scope: weightScope())) { newLevel in
+                        weights.setLevel(newLevel, for: currentFile.url, scope: weightScope())
+                    }
+                    .padding(.vertical, 2)
+                    .help("随机权重（当前范围：\(weightScopeLabel())）")
                 }
                 .padding(.horizontal, 24)
                 
@@ -519,6 +527,24 @@ struct CurrentTrackView: View {
             } else {
                 showEphemeralTip = false
             }
+        }
+    }
+
+    private func weightScope() -> PlaybackWeights.Scope {
+        switch playlistManager.playbackScope {
+        case .queue:
+            return .queue
+        case .playlist(let id):
+            return .playlist(id)
+        }
+    }
+
+    private func weightScopeLabel() -> String {
+        switch playlistManager.playbackScope {
+        case .queue:
+            return "队列"
+        case .playlist:
+            return "歌单"
         }
     }
 
