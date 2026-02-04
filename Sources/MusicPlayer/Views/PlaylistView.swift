@@ -242,11 +242,17 @@ struct PlaylistView: View {
 	                                    NotificationCenter.default.post(name: .blurSearchField, object: nil)
 	                                    // 从队列播放：后续“下一首/随机/骰子”等都应作用于队列范围
 	                                    playlistManager.setPlaybackScopeQueue()
-	                                    if let index = playlistManager.audioFiles.firstIndex(of: selectedFile) {
-	                                        if let file = playlistManager.selectFile(at: index) {
-	                                            audioPlayer.play(file)
+	                                    guard let index = playlistManager.audioFiles.firstIndex(of: selectedFile),
+	                                          let file = playlistManager.selectFile(at: index)
+	                                    else { return }
+	                                    // 若点击的是“当前已加载/正在播放”的曲目，不要重启到 0:00。
+	                                    if audioPlayer.currentFile?.url == file.url {
+	                                        if !audioPlayer.isPlaying {
+	                                            audioPlayer.resume()
 	                                        }
+	                                        return
 	                                    }
+	                                    audioPlayer.play(file)
 	                                },
 	                                deleteAction: { fileToDelete in
 	                                    NotificationCenter.default.post(name: .blurSearchField, object: nil)
@@ -618,6 +624,15 @@ struct PlaylistItemView: View {
                                 WeightDotsView(level: level) { newLevel in
                                     weights.setLevel(newLevel, for: file.url, scope: scope)
                                 }
+                                // Safety boundary: avoid accidental clicks changing playback when user misses the squares.
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 4)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .fill(Color.clear)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture { }
+                                )
                             }
                         }
                     }
