@@ -71,9 +71,9 @@ cat > MusicPlayer.app/Contents/Info.plist << EOF
     <key>NSPrincipalClass</key>
     <string>MusicPlayerApplication</string>
 	<key>CFBundleShortVersionString</key>
-	<string>3.3.2</string>
+	<string>3.3.3</string>
 	    <key>CFBundleVersion</key>
-	    <string>3.3.2</string>
+	    <string>3.3.3</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
