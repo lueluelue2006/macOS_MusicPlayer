@@ -1,8 +1,8 @@
-# 安装与运行（DMG）— 快速开始（v3.2）
+# 安装与运行（DMG）— 快速开始
 
 下载（Releases）：https://github.com/lueluelue2006/macOS_MusicPlayer/releases
 
-1) 下载发布页面中的 DMG 安装包（文件名示例：MusicPlayer-v3.2.dmg）
+1) 下载发布页面中的 DMG 安装包（文件名示例：MusicPlayer-vX.Y(.Z).dmg）
 2) 双击打开 DMG，将“MusicPlayer.app”**拖入**“应用程序”或任意文件夹
 3) 首次运行故障排除（无法验证开发者或者显示“文件已损坏”）
    - 方法一（推荐）：打开“系统设置 → 隐私与安全性”，在底部“安全性”区域找到被阻止的“MusicPlayer”，点击“仍要打开”。随后再次从“应用程序”启动。
