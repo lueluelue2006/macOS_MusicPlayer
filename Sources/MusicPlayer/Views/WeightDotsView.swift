@@ -26,8 +26,12 @@ struct WeightDotsView: View {
                         .shadow(color: isSelected ? color(for: l).opacity(0.35) : .clear, radius: 14, x: 0, y: 0)
                         // Bigger hitbox, but keep layout tight.
                         .frame(width: 14, height: 14)
-                        // Remove dead zone between controls: allocate spacing to the left cell.
-                        .padding(.trailing, i == (levels.count - 1) ? 0 : 2)
+                        // Remove dead zone between controls:
+                        // - Keep a small visual gap (2px) between squares.
+                        // - Split the gap hitbox 50/50 to left and right.
+                        .padding(.leading, i == 0 ? 0 : 1)
+                        .padding(.trailing, i == (levels.count - 1) ? 0 : 1)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .help(helpText(for: l))
