@@ -352,6 +352,13 @@ struct MusicPlayerCommands: Commands {
                     Text("设备切换通知静音（默认）")
                 }
             }
+
+            Divider()
+
+            Button("检查更新…") {
+                NotificationCenter.default.post(name: .manualCheckForUpdates, object: nil)
+            }
+            .help("检查 GitHub Releases 是否有新版本")
         }
     }
 }

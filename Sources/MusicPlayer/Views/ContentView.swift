@@ -204,6 +204,9 @@ struct ContentView: View {
             .onReceive(NotificationCenter.default.publisher(for: .requestDismissAllSheets)) { _ in
                 showVolumeNormalizationAnalysis = false
             }
+            .onReceive(NotificationCenter.default.publisher(for: .manualCheckForUpdates)) { _ in
+                manualCheckForUpdates()
+            }
             .onReceive(NotificationCenter.default.publisher(for: .audioPlayerDidFailToPlay)) { notification in
                 let raw = (notification.userInfo?["message"] as? String) ?? "播放失败"
                 let firstLine =
@@ -258,41 +261,58 @@ struct ContentView: View {
             } catch {
                 return
             }
-            if Task.isCancelled { return }
+            await runUpdateCheck(currentVersion: currentVersion, markLaunchChecked: true)
+        }
+    }
 
-            let outcome = await UpdateChecker.shared.check(currentVersion: currentVersion)
-            if Task.isCancelled { return }
-            await MainActor.run {
+    @MainActor
+    private func manualCheckForUpdates() {
+        updateCheckTask?.cancel()
+        updateCheckTask = nil
+
+        let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "3.6.4"
+        showToastMessage("正在检查更新…", kind: .update, duration: 2.0)
+        updateCheckTask = Task(priority: .userInitiated) {
+            await runUpdateCheck(currentVersion: currentVersion, markLaunchChecked: true)
+        }
+    }
+
+    private func runUpdateCheck(currentVersion: String, markLaunchChecked: Bool) async {
+        if Task.isCancelled { return }
+        let outcome = await UpdateChecker.shared.check(currentVersion: currentVersion)
+        if Task.isCancelled { return }
+        await MainActor.run {
+            if markLaunchChecked {
                 didAutoCheckForUpdatesThisLaunch = true
-                updateCheckTask = nil
-                switch outcome {
-                case .updateAvailable(let info):
-                    if info.assetURL != nil {
-                        showToastMessage(
-                            "发现新版本 \(info.latestVersion)",
-                            subtitle: "点击自动更新（下载并安装后自动重启）",
-                            kind: .update,
-                            duration: 10.0,
-                            tapUpdate: info
-                        )
-                    } else {
-                        showToastMessage(
-                            "发现新版本 \(info.latestVersion)",
-                            subtitle: "点击打开 GitHub Releases 下载",
-                            kind: .update,
-                            duration: 10.0,
-                            tapURL: info.releaseURL
-                        )
-                    }
-                case .upToDate(let current, let latest, let url):
-                    if latest == current {
-                        showToastMessage("已是最新版本 \(current)", kind: .success, duration: 2.0, tapURL: url)
-                    } else {
-                        showToastMessage("已是最新版本 \(current)", subtitle: "线上最新：\(latest)", kind: .success, duration: 2.0, tapURL: url)
-                    }
-                case .failed(let message, let url):
-                    showToastMessage(message, subtitle: "点击打开 GitHub Releases", kind: .warning, duration: 2.0, tapURL: url)
+            }
+            updateCheckTask = nil
+            switch outcome {
+            case .updateAvailable(let info):
+                if info.assetURL != nil {
+                    showToastMessage(
+                        "发现新版本 \(info.latestVersion)",
+                        subtitle: "点击自动更新（下载并安装后自动重启）",
+                        kind: .update,
+                        duration: 10.0,
+                        tapUpdate: info
+                    )
+                } else {
+                    showToastMessage(
+                        "发现新版本 \(info.latestVersion)",
+                        subtitle: "点击打开 GitHub Releases 下载",
+                        kind: .update,
+                        duration: 10.0,
+                        tapURL: info.releaseURL
+                    )
                 }
+            case .upToDate(let current, let latest, let url):
+                if latest == current {
+                    showToastMessage("已是最新版本 \(current)", kind: .success, duration: 2.0, tapURL: url)
+                } else {
+                    showToastMessage("已是最新版本 \(current)", subtitle: "线上最新：\(latest)", kind: .success, duration: 2.0, tapURL: url)
+                }
+            case .failed(let message, let url):
+                showToastMessage(message, subtitle: "点击打开 GitHub Releases", kind: .warning, duration: 2.0, tapURL: url)
             }
         }
     }

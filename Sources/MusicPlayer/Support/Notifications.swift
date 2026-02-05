@@ -28,4 +28,7 @@ extension Notification.Name {
     /// 左侧面板（队列/歌单）切换
     static let switchPlaylistPanelToQueue = Notification.Name("switchPlaylistPanelToQueue")
     static let switchPlaylistPanelToPlaylists = Notification.Name("switchPlaylistPanelToPlaylists")
+
+    /// 手动检查更新（菜单触发）
+    static let manualCheckForUpdates = Notification.Name("manualCheckForUpdates")
 }
