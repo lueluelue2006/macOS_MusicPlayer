@@ -295,31 +295,36 @@ struct PlaylistsPanelView: View {
 
 	            Spacer()
 
-	            VStack(alignment: .trailing, spacing: 10) {
-	                HStack(spacing: 10) {
-	                    Button("从队列添加") {
-	                        openAddFromQueueSheet(targetPlaylistID: playlist.id)
+		            VStack(alignment: .trailing, spacing: 10) {
+		                HStack(spacing: 10) {
+		                    Button("从队列添加") {
+		                        openAddFromQueueSheet(targetPlaylistID: playlist.id)
+		                    }
+		                    .buttonStyle(.borderedProminent)
+		                    .disabled(playlistManager.audioFiles.isEmpty)
+		                    .help(playlistManager.audioFiles.isEmpty ? "队列为空：先在“队列”里导入一些歌曲" : "")
+
+	                    let canAddNowPlaying = (audioPlayer.currentFile != nil)
+	                    Button("添加正在播放") {
+	                        if let url = audioPlayer.currentFile?.url {
+	                            playlistsStore.addTracks([url], to: playlist.id)
+	                            reloadSelectedPlaylist()
+	                        } else {
+	                            postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
+	                        }
 	                    }
 	                    .buttonStyle(.borderedProminent)
-	                    .disabled(playlistManager.audioFiles.isEmpty)
-	                    .help(playlistManager.audioFiles.isEmpty ? "队列为空：先在“队列”里导入一些歌曲" : "")
+	                    // Keep layout stable, but hide the whole control (including the chrome)
+	                    // when there's nothing to add, so it doesn't show an empty grey pill.
+	                    .opacity(canAddNowPlaying ? 1 : 0)
+	                    .allowsHitTesting(canAddNowPlaying)
+	                    .accessibilityHidden(!canAddNowPlaying)
+	                    .help(canAddNowPlaying ? "将正在播放的歌曲加入该歌单" : "")
+	                }
 
-                    Button("添加正在播放") {
-                        if let url = audioPlayer.currentFile?.url {
-                            playlistsStore.addTracks([url], to: playlist.id)
-                            reloadSelectedPlaylist()
-                        } else {
-                            postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(audioPlayer.currentFile == nil)
-                    .help(audioPlayer.currentFile == nil ? "没有正在播放的歌曲" : "")
-                }
-
-                HStack(spacing: 10) {
-                    let nowPlayingID = nowPlayingIDInPlaylist(playlist)
-                    if nowPlayingID != nil {
+	                HStack(spacing: 10) {
+	                    let nowPlayingID = nowPlayingIDInPlaylist(playlist)
+	                    if nowPlayingID != nil {
                         Button {
                             requestScrollToNowPlayingInPlaylist(playlist)
                         } label: {
