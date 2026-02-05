@@ -301,14 +301,15 @@ struct PlaylistsPanelView: View {
 
 	                HStack(spacing: 10) {
 	                    let nowPlayingID = nowPlayingIDInPlaylist(playlist)
-	                    Button {
-	                        requestScrollToNowPlayingInPlaylist(playlist)
-	                    } label: {
-	                        Label("定位正在播放", systemImage: "scope")
+	                    if nowPlayingID != nil {
+	                        Button {
+	                            requestScrollToNowPlayingInPlaylist(playlist)
+	                        } label: {
+	                            Label("定位正在播放", systemImage: "scope")
+	                        }
+	                        .buttonStyle(.bordered)
+	                        .help("定位到正在播放的歌曲（会自动清空搜索）")
 	                    }
-	                    .buttonStyle(.bordered)
-	                    .disabled(nowPlayingID == nil)
-	                    .help(nowPlayingID == nil ? "当前播放歌曲不在该歌单" : "定位到正在播放的歌曲（会自动清空搜索）")
 
 	                    Button {
 	                        let result = weights.syncPlaylistOverridesToQueue(from: playlist.id)
