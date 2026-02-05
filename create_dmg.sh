@@ -11,9 +11,11 @@ cd "$SCRIPT_DIR"
 
 # 配置参数（基于脚本目录）
 APP_NAME="MusicPlayer"
-VERSION="3.6"
-DMG_NAME="MusicPlayer-v${VERSION}"
-SOURCE_APP="${SCRIPT_DIR}/MusicPlayer.app"
+VERSION="3.6.1"
+APP_BUNDLE="${APP_BUNDLE:-MusicPlayer.app}"
+DMG_SUFFIX="${DMG_SUFFIX:-}"
+DMG_NAME="MusicPlayer-v${VERSION}${DMG_SUFFIX}"
+SOURCE_APP="${SCRIPT_DIR}/${APP_BUNDLE}"
 DMG_TEMP_DIR="${SCRIPT_DIR}/dmg-temp"
 DMG_CONTENTS_DIR="${SCRIPT_DIR}/dmg-contents"
 
