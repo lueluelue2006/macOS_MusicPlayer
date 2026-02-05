@@ -19,9 +19,24 @@ SOURCE_APP="${SCRIPT_DIR}/${APP_BUNDLE}"
 DMG_TEMP_DIR="${SCRIPT_DIR}/dmg-temp"
 DMG_CONTENTS_DIR="${SCRIPT_DIR}/dmg-contents"
 
-# 清理之前的临时文件
+# 清理之前的临时文件 / 旧 DMG（默认只保留当前版本的 DMG，避免目录堆积）
 echo "🧹 清理临时文件..."
 rm -rf "$DMG_TEMP_DIR"
+
+# 旧 DMG 清理策略：
+# - 默认：删除当前版本以外的 MusicPlayer-v*.dmg（包含 intel/arm 等后缀）。
+# - 如需保留旧 DMG：运行时设置 KEEP_OLD_DMGS=1 跳过清理。
+if [[ "${KEEP_OLD_DMGS:-0}" != "1" ]]; then
+    echo "🧹 清理旧版本 DMG（保留 v${VERSION}）..."
+    for f in "${SCRIPT_DIR}"/MusicPlayer-v*.dmg; do
+        [[ -e "$f" ]] || continue
+        base="$(basename "$f")"
+        if [[ "$base" != "MusicPlayer-v${VERSION}"*".dmg" ]]; then
+            rm -f "$f"
+        fi
+    done
+fi
+
 rm -f "${DMG_NAME}.dmg"
 
 # 检查源应用是否存在
