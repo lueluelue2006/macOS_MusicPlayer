@@ -6,6 +6,9 @@ public enum IPCCommand: String, Codable {
     case benchmarkLoad
     case clearLyricsCache
     case clearArtworkCache
+    case setSearchSortOption
+    case resetSearchSortOption
+    case toggleSearchSortOption
     case togglePlayPause
     case pause
     case resume

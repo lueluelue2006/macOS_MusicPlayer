@@ -13,7 +13,8 @@ struct SearchSortButton: View {
 
     var body: some View {
         let option = sortState.option(for: target)
-        let isActive = option != .default
+        // "Enabled sort" means using any field other than the original order.
+        let isActive = option.field != .original
 
         Button {
             // Make popover feel snappy: avoid implicit animations on show/hide.

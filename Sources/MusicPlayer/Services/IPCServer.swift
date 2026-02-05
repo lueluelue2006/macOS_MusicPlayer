@@ -114,6 +114,86 @@ final class IPCServer {
             audioPlayer.clearArtworkCache()
             return IPCReply(id: request.id, ok: true)
 
+        case .setSearchSortOption:
+            guard let rawTarget = request.arguments?["target"] else {
+                return IPCReply(id: request.id, ok: false, message: "missing target")
+            }
+            guard let target = SearchFocusTarget(rawValue: rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                return IPCReply(id: request.id, ok: false, message: "invalid target: \(rawTarget)")
+            }
+            guard let rawField = request.arguments?["field"] else {
+                return IPCReply(id: request.id, ok: false, message: "missing field")
+            }
+            let fieldKey = rawField.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let field: SearchSortField? = {
+                switch fieldKey {
+                case "original", "default", "none":
+                    return .original
+                case "weight":
+                    return .weight
+                case "title", "name":
+                    return .title
+                case "artist":
+                    return .artist
+                case "duration", "time":
+                    return .duration
+                case "format", "ext", "extension":
+                    return .format
+                default:
+                    return nil
+                }
+            }()
+            guard let field else {
+                return IPCReply(id: request.id, ok: false, message: "invalid field: \(rawField)")
+            }
+
+            let directionKey = request.arguments?["direction"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let direction: SearchSortDirection = {
+                switch directionKey {
+                case "desc", "descending", "down":
+                    return .descending
+                case "asc", "ascending", "up", nil:
+                    return .ascending
+                default:
+                    return .ascending
+                }
+            }()
+
+            SearchSortState.shared.setOption(SearchSortOption(field: field, direction: direction), for: target)
+            return IPCReply(
+                id: request.id,
+                ok: true,
+                message: "sort=\(field.displayName) (\(direction.displayName)) target=\(target.rawValue)",
+                data: ["target": target.rawValue, "field": field.rawValue, "direction": direction.rawValue]
+            )
+
+        case .resetSearchSortOption:
+            guard let rawTarget = request.arguments?["target"] else {
+                return IPCReply(id: request.id, ok: false, message: "missing target")
+            }
+            guard let target = SearchFocusTarget(rawValue: rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                return IPCReply(id: request.id, ok: false, message: "invalid target: \(rawTarget)")
+            }
+            SearchSortState.shared.setOption(.default, for: target)
+            return IPCReply(id: request.id, ok: true, message: "sort reset target=\(target.rawValue)")
+
+        case .toggleSearchSortOption:
+            guard let rawTarget = request.arguments?["target"] else {
+                return IPCReply(id: request.id, ok: false, message: "missing target")
+            }
+            guard let target = SearchFocusTarget(rawValue: rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                return IPCReply(id: request.id, ok: false, message: "invalid target: \(rawTarget)")
+            }
+            let current = SearchSortState.shared.option(for: target)
+            if current.field == .original {
+                SearchSortState.shared.setOption(SearchSortOption(field: .title, direction: .ascending), for: target)
+                return IPCReply(id: request.id, ok: true, message: "sort enabled target=\(target.rawValue)")
+            }
+            SearchSortState.shared.setOption(.default, for: target)
+            return IPCReply(id: request.id, ok: true, message: "sort disabled target=\(target.rawValue)")
+
         case .togglePlayPause:
             audioPlayer.togglePlayPause()
             return IPCReply(id: request.id, ok: true)

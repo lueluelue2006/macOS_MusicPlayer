@@ -35,6 +35,7 @@ private func printUsage() {
           normalization <on|off|toggle>
           shuffle
           loop
+          sort [set|toggle|reset] [--target <queue|playlists|addFromQueue|volumeAnalysis>] [--field <original|weight|title|artist|duration|format>] [--direction <asc|desc>]
           add <path> [path...]
           remove [--index <n> | [--all] <query...>]
           screenshot [--out <path>] [--timeout <seconds>]
@@ -338,6 +339,72 @@ private func run() -> ExitCode {
         let reply = sendRequest(req, timeoutSeconds: 1.5)
         guard let reply else { eprint("no reply"); return .noReply }
         return reply.ok ? .ok : .failure
+    case "sort":
+        var mode = "set"
+        var i = 0
+
+        if i < args.count, !args[i].hasPrefix("--") {
+            let s = args[i].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if s == "toggle" || s == "reset" || s == "set" {
+                mode = s
+                i += 1
+            }
+        }
+
+        var target = "queue"
+        var field: String? = nil
+        var direction: String? = nil
+
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--target":
+                guard i + 1 < args.count else { eprint("sort: --target needs a value"); return .usage }
+                target = args[i + 1]
+                i += 2
+            case "--field":
+                guard i + 1 < args.count else { eprint("sort: --field needs a value"); return .usage }
+                field = args[i + 1]
+                i += 2
+            case "--direction":
+                guard i + 1 < args.count else { eprint("sort: --direction needs a value"); return .usage }
+                direction = args[i + 1]
+                i += 2
+            default:
+                if mode == "set", field == nil, !a.hasPrefix("--") {
+                    field = a
+                    i += 1
+                } else {
+                    eprint("sort: unknown option \(a)")
+                    return .usage
+                }
+            }
+        }
+
+        let targetTrimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !targetTrimmed.isEmpty else { eprint("sort: invalid --target"); return .usage }
+
+        let req: IPCRequest
+        switch mode {
+        case "toggle":
+            req = makeRequest(command: .toggleSearchSortOption, arguments: ["target": targetTrimmed])
+        case "reset":
+            req = makeRequest(command: .resetSearchSortOption, arguments: ["target": targetTrimmed])
+        default:
+            guard let field else { eprint("sort: missing --field"); return .usage }
+            var args: [String: String] = ["target": targetTrimmed, "field": field]
+            if let direction { args["direction"] = direction }
+            req = makeRequest(command: .setSearchSortOption, arguments: args)
+        }
+
+        let reply = sendRequest(req, timeoutSeconds: 1.5)
+        guard let reply else { eprint("no reply"); return .noReply }
+        if reply.ok {
+            if let msg = reply.message, !msg.isEmpty { print(msg) }
+            return .ok
+        }
+        eprint(reply.message ?? "failed")
+        return .failure
     case "add":
         guard !args.isEmpty else {
             eprint("add: missing path(s)")
