@@ -11,7 +11,7 @@ cd "$SCRIPT_DIR"
 
 # 配置参数（基于脚本目录）
 APP_NAME="MusicPlayer"
-VERSION="3.6.2"
+VERSION="3.6.3"
 APP_BUNDLE="${APP_BUNDLE:-MusicPlayer.app}"
 DMG_SUFFIX="${DMG_SUFFIX:-}"
 DMG_NAME="MusicPlayer-v${VERSION}${DMG_SUFFIX}"
@@ -37,7 +37,7 @@ mkdir -p "$DMG_TEMP_DIR"
 
 # 复制应用到临时目录
 echo "📱 复制应用文件..."
-cp -R "$SOURCE_APP" "$DMG_TEMP_DIR/"
+/usr/bin/ditto "$SOURCE_APP" "$DMG_TEMP_DIR/${APP_NAME}.app"
 
 # 创建Applications符号链接
 echo "🔗 创建 Applications 链接..."

@@ -8,10 +8,12 @@ struct SearchSortButton: View {
     @State private var isPresented: Bool = false
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
     var body: some View {
         let option = sortState.option(for: target)
+        let isActive = option != .default
 
         Button {
             // Make popover feel snappy: avoid implicit animations on show/hide.
@@ -22,11 +24,27 @@ struct SearchSortButton: View {
                 isPresented.toggle()
             }
         } label: {
-            Image(systemName: option.field == .original ? "arrow.up.arrow.down" : "arrow.up.arrow.down.circle.fill")
-                .foregroundColor(theme.mutedText)
-                .font(.headline)
-                .frame(width: 28, height: 28)
-                .contentShape(Rectangle())
+            ZStack {
+                if isActive {
+                    if reduceMotion {
+                        activeBackground(phase: 0.65)
+                    } else {
+                        TimelineView(.periodic(from: .now, by: 1.0 / 30.0)) { context in
+                            let t = context.date.timeIntervalSinceReferenceDate
+                            let period = 1.8
+                            let phase = (sin(t * (2.0 * .pi) / period) + 1.0) / 2.0 // 0..1
+                            activeBackground(phase: phase)
+                        }
+                    }
+                }
+
+                Image(systemName: option.field == .original ? "arrow.up.arrow.down" : "arrow.up.arrow.down.circle.fill")
+                    .foregroundStyle(isActive ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText))
+                    .font(.headline)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .frame(width: 28, height: 28)
         }
         .buttonStyle(.plain)
         .popover(isPresented: $isPresented, arrowEdge: .bottom) {
@@ -37,6 +55,26 @@ struct SearchSortButton: View {
                 }
         }
         .help("排序：\(option.field.displayName)（\(option.direction.displayName)）\n\(helpSuffix)")
+    }
+
+    @ViewBuilder
+    private func activeBackground(phase: Double) -> some View {
+        let clamped = max(0.0, min(1.0, phase))
+        let bgOpacity = 0.12 + 0.10 * clamped
+        let glowOpacity = 0.20 + 0.35 * clamped
+        let glowRadius = 6.0 + 7.0 * clamped
+        let scale = 0.98 + 0.04 * clamped
+
+        RoundedRectangle(cornerRadius: 9, style: .continuous)
+            .fill(theme.accent.opacity(bgOpacity))
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .stroke(theme.accentGradient, lineWidth: 1.2)
+                    .opacity(0.85)
+            )
+            .shadow(color: theme.accentShadow.opacity(glowOpacity), radius: glowRadius, x: 0, y: 0)
+            .scaleEffect(scale)
+            .allowsHitTesting(false)
     }
 }
 
