@@ -89,7 +89,7 @@ actor SelfUpdater {
     private static func makeInstallerScript() -> String {
         // Notes:
         // - Wait for current app to exit to avoid copying over a running bundle.
-        // - Back up the old app for safety.
+        // - Move the old app to Trash for safety (avoid cluttering /Applications).
         // - Remove quarantine + adhoc sign to reduce first-run friction.
         return """
         #!/bin/bash
@@ -114,6 +114,7 @@ actor SelfUpdater {
 
         TS=$(date +%Y%m%d_%H%M%S)
         MOUNT_DIR="$(mktemp -d "/tmp/macos_musicplayer_update_mount.XXXXXX")"
+        TRASH_DIR="${HOME}/.Trash"
 
         cleanup() {
           /usr/bin/hdiutil detach "$MOUNT_DIR" -quiet >/dev/null 2>&1 || true
@@ -129,10 +130,25 @@ actor SelfUpdater {
         fi
 
         if [[ -d "$TARGET_APP" ]]; then
-          mv "$TARGET_APP" "/Applications/$APP_NAME.bak-update-$TS" || true
+          mkdir -p "$TRASH_DIR" >/dev/null 2>&1 || true
+          DEST_IN_TRASH="$TRASH_DIR/MusicPlayer-old-$TS.app"
+          if [[ -e "$DEST_IN_TRASH" ]]; then
+            n=2
+            while [[ -e "$TRASH_DIR/MusicPlayer-old-$TS ($n).app" ]]; do
+              n=$((n+1))
+            done
+            DEST_IN_TRASH="$TRASH_DIR/MusicPlayer-old-$TS ($n).app"
+          fi
+
+          if ! mv "$TARGET_APP" "$DEST_IN_TRASH" >/dev/null 2>&1; then
+            # As a last resort, move to /tmp to avoid corrupting the install by copying into an existing bundle.
+            if ! mv "$TARGET_APP" "/tmp/MusicPlayer-old-$TS.app" >/dev/null 2>&1; then
+              exit 4
+            fi
+          fi
         fi
 
-        cp -R "$SRC_APP" "$TARGET_APP"
+        /usr/bin/ditto "$SRC_APP" "$TARGET_APP"
         /usr/bin/xattr -dr com.apple.quarantine "$TARGET_APP" >/dev/null 2>&1 || true
         /usr/bin/codesign --force --deep --sign - "$TARGET_APP" >/dev/null 2>&1 || true
 
@@ -140,4 +156,3 @@ actor SelfUpdater {
         """
     }
 }
-
