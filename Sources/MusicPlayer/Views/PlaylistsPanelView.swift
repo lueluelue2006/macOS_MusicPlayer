@@ -160,14 +160,23 @@ struct PlaylistsPanelView: View {
             VStack(alignment: .leading, spacing: 14) {
                 header(for: playlist)
 
-	                SearchBarView(searchText: $trackSearchText, onSearchChanged: { q in
-	                    trackSearchText = q
-	                }, focusTarget: .playlists)
+		                SearchBarView(searchText: $trackSearchText, onSearchChanged: { q in
+		                    trackSearchText = q
+		                }, focusTarget: .playlists)
 
-	                ScrollViewReader { proxy in
-	                    Group {
-	                        if isLoadingTracks {
-	                            VStack(spacing: 10) {
+		                if !trackSearchText.isEmpty {
+		                    HStack {
+		                        Text("找到 \(filteredTracks.count) / \(loadedTracks.count) 首歌曲")
+		                            .font(.caption)
+		                            .foregroundColor(.secondary)
+		                        Spacer()
+		                    }
+		                }
+
+		                ScrollViewReader { proxy in
+		                    Group {
+		                        if isLoadingTracks {
+		                            VStack(spacing: 10) {
 	                                ProgressView()
 	                                Text("加载歌单…")
 	                                    .font(.caption)
@@ -253,69 +262,75 @@ struct PlaylistsPanelView: View {
         }
     }
 
-	    private func header(for playlist: UserPlaylist) -> some View {
-	        HStack(spacing: 12) {
-	            VStack(alignment: .leading, spacing: 4) {
-	                Text(playlist.name)
-                    .font(.title3)
-                    .fontWeight(.bold)
-                    .foregroundColor(.primary)
+		    private func header(for playlist: UserPlaylist) -> some View {
+		        HStack(spacing: 12) {
+		            VStack(alignment: .leading, spacing: 4) {
+		                Text(playlist.name)
+	                    .font(.title3)
+	                    .fontWeight(.bold)
+	                    .foregroundColor(.primary)
                     .lineLimit(1)
                 Text("\(playlist.tracks.count) 首")
                     .font(.caption)
                     .foregroundColor(theme.mutedText)
             }
 
-            Spacer()
+	            Spacer()
 
-            Button("从队列添加") {
-                openAddFromQueueSheet(targetPlaylistID: playlist.id)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(playlistManager.audioFiles.isEmpty)
-            .help(playlistManager.audioFiles.isEmpty ? "队列为空：先在“队列”里导入一些歌曲" : "")
+	            VStack(alignment: .trailing, spacing: 10) {
+	                HStack(spacing: 10) {
+	                    Button("从队列添加") {
+	                        openAddFromQueueSheet(targetPlaylistID: playlist.id)
+	                    }
+	                    .buttonStyle(.borderedProminent)
+	                    .disabled(playlistManager.audioFiles.isEmpty)
+	                    .help(playlistManager.audioFiles.isEmpty ? "队列为空：先在“队列”里导入一些歌曲" : "")
 
-	            Button("添加正在播放") {
-	                if let url = audioPlayer.currentFile?.url {
-	                    playlistsStore.addTracks([url], to: playlist.id)
-	                    reloadSelectedPlaylist()
-                } else {
-                    postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
-                }
-            }
-	            .buttonStyle(.bordered)
-	            .disabled(audioPlayer.currentFile == nil)
-	            .help(audioPlayer.currentFile == nil ? "没有正在播放的歌曲" : "")
+	                    Button("添加正在播放") {
+	                        if let url = audioPlayer.currentFile?.url {
+	                            playlistsStore.addTracks([url], to: playlist.id)
+	                            reloadSelectedPlaylist()
+	                        } else {
+	                            postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
+	                        }
+	                    }
+	                    .buttonStyle(.bordered)
+	                    .disabled(audioPlayer.currentFile == nil)
+	                    .help(audioPlayer.currentFile == nil ? "没有正在播放的歌曲" : "")
+	                }
 
-	            let nowPlayingID = nowPlayingIDInPlaylist(playlist)
-	            Button {
-	                requestScrollToNowPlayingInPlaylist(playlist)
-	            } label: {
-	                Label("定位正在播放", systemImage: "scope")
+	                HStack(spacing: 10) {
+	                    let nowPlayingID = nowPlayingIDInPlaylist(playlist)
+	                    Button {
+	                        requestScrollToNowPlayingInPlaylist(playlist)
+	                    } label: {
+	                        Label("定位正在播放", systemImage: "scope")
+	                    }
+	                    .buttonStyle(.bordered)
+	                    .disabled(nowPlayingID == nil)
+	                    .help(nowPlayingID == nil ? "当前播放歌曲不在该歌单" : "定位到正在播放的歌曲（会自动清空搜索）")
+
+	                    Button {
+	                        let result = weights.syncPlaylistOverridesToQueue(from: playlist.id)
+	                        if result.total == 0 {
+	                            postToast(title: "歌单没有设置随机权重", subtitle: "先在歌单里点一下 5 个方块设置权重", kind: "info")
+	                            return
+	                        }
+	                        if result.changed == 0 {
+	                            postToast(title: "队列权重已是最新", subtitle: "无需同步（\(result.total) 条权重一致）", kind: "info")
+	                            return
+	                        }
+	                        postToast(title: "已同步权重到队列", subtitle: "应用了 \(result.changed)/\(result.total) 条权重", kind: "success")
+	                    } label: {
+	                        Label("同步权重", systemImage: "arrow.triangle.2.circlepath")
+	                    }
+	                    .buttonStyle(.bordered)
+	                    .help("将本歌单的随机权重同步到队列（只同步非默认权重，不会清空队列里其他歌曲的权重）")
+	                }
 	            }
-	            .buttonStyle(.bordered)
-	            .disabled(nowPlayingID == nil)
-	            .help(nowPlayingID == nil ? "当前播放歌曲不在该歌单" : "定位到正在播放的歌曲（会自动清空搜索）")
-
-	            Button {
-	                let result = weights.syncPlaylistOverridesToQueue(from: playlist.id)
-	                if result.total == 0 {
-	                    postToast(title: "歌单没有设置随机权重", subtitle: "先在歌单里点一下 5 个方块设置权重", kind: "info")
-                    return
-                }
-                if result.changed == 0 {
-                    postToast(title: "队列权重已是最新", subtitle: "无需同步（\(result.total) 条权重一致）", kind: "info")
-                    return
-                }
-                postToast(title: "已同步权重到队列", subtitle: "应用了 \(result.changed)/\(result.total) 条权重", kind: "success")
-            } label: {
-                Label("同步权重", systemImage: "arrow.triangle.2.circlepath")
-            }
-            .buttonStyle(.bordered)
-            .help("将本歌单的随机权重同步到队列（只同步非默认权重，不会清空队列里其他歌曲的权重）")
-	        }
-	        .padding(.top, 4)
-	    }
+		        }
+		        .padding(.top, 4)
+		    }
 
 	    private func nowPlayingIDInPlaylist(_ playlist: UserPlaylist) -> String? {
 	        guard let url = currentHighlightedURL else { return nil }
@@ -532,49 +547,65 @@ struct PlaylistsPanelView: View {
         return playlistManager.audioFiles.filter { keySet.contains(pathKey($0.url)) }
     }
 
-    @ViewBuilder
-    private var addFromQueueSheet: some View {
-        VStack(spacing: 14) {
-            HStack(spacing: 10) {
-                Text("从队列添加")
-                    .font(.headline)
-                Spacer()
-                Button("本页全选") {
-                    for f in addFromQueueCandidates {
-                        addFromQueueSelectedKeys.insert(pathKey(f.url))
-                    }
-                }
-                .disabled(addFromQueueCandidates.isEmpty)
-                Button("本页全不选") {
-                    for f in addFromQueueCandidates {
-                        addFromQueueSelectedKeys.remove(pathKey(f.url))
-                    }
-                }
-                .disabled(addFromQueueCandidates.isEmpty)
-                Button("清空") {
-                    addFromQueueSelectedKeys.removeAll(keepingCapacity: true)
-                }
-                .disabled(addFromQueueSelectedKeys.isEmpty)
+	    @ViewBuilder
+	    private var addFromQueueSheet: some View {
+	        VStack(spacing: 14) {
+	            VStack(spacing: 8) {
+	                HStack(spacing: 10) {
+	                    Text("从队列添加")
+	                        .font(.headline)
+	                    Spacer()
 
-                Button {
-                    showAddFromQueueSheet = false
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundColor(theme.mutedText)
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(.plain)
-                .help("关闭（Esc）")
-            }
+	                    Button("本页全选") {
+	                        for f in addFromQueueCandidates {
+	                            addFromQueueSelectedKeys.insert(pathKey(f.url))
+	                        }
+	                    }
+	                    .disabled(addFromQueueCandidates.isEmpty)
 
-            SearchBarView(searchText: $addFromQueueSearchText, onSearchChanged: { q in
-                addFromQueueSearchText = q
-            }, focusTarget: .addFromQueue, autoFocusOnAppear: true)
+	                    Button {
+	                        showAddFromQueueSheet = false
+	                    } label: {
+	                        Image(systemName: "xmark.circle.fill")
+	                            .font(.system(size: 18, weight: .semibold))
+	                            .foregroundColor(theme.mutedText)
+	                            .frame(width: 28, height: 28)
+	                    }
+	                    .buttonStyle(.plain)
+	                    .help("关闭（Esc）")
+	                }
 
-            List(addFromQueueCandidates) { file in
-                Button {
-                    let k = pathKey(file.url)
+	                HStack(spacing: 10) {
+	                    Spacer()
+	                    Button("本页全不选") {
+	                        for f in addFromQueueCandidates {
+	                            addFromQueueSelectedKeys.remove(pathKey(f.url))
+	                        }
+	                    }
+	                    .disabled(addFromQueueCandidates.isEmpty)
+	                    Button("清空") {
+	                        addFromQueueSelectedKeys.removeAll(keepingCapacity: true)
+	                    }
+	                    .disabled(addFromQueueSelectedKeys.isEmpty)
+	                }
+	            }
+
+	            SearchBarView(searchText: $addFromQueueSearchText, onSearchChanged: { q in
+	                addFromQueueSearchText = q
+	            }, focusTarget: .addFromQueue, autoFocusOnAppear: true)
+
+	            if !addFromQueueSearchText.isEmpty {
+	                HStack {
+	                    Text("找到 \(addFromQueueCandidates.count) / \(playlistManager.audioFiles.count) 首歌曲")
+	                        .font(.caption)
+	                        .foregroundColor(.secondary)
+	                    Spacer()
+	                }
+	            }
+
+	            List(addFromQueueCandidates) { file in
+	                Button {
+	                    let k = pathKey(file.url)
                     if addFromQueueSelectedKeys.contains(k) {
                         addFromQueueSelectedKeys.remove(k)
                     } else {
