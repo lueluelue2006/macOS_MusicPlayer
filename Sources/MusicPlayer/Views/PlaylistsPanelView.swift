@@ -30,6 +30,24 @@ struct PlaylistsPanelView: View {
         playlistsStore.playlist(for: playlistsStore.selectedPlaylistID)
     }
 
+    private var sidebarSelectedPlaylistID: Binding<UserPlaylist.ID?> {
+        Binding(
+            get: { playlistsStore.selectedPlaylistID },
+            set: { newValue in
+                // macOS SwiftUI: clicking List's empty area can clear selection (set nil).
+                // For playlists, that's a poor UX: it jumps to the "请选择一个歌单" placeholder.
+                // Treat empty-area clicks as no-op as long as we still have playlists.
+                guard let newValue else {
+                    if playlistsStore.playlists.isEmpty {
+                        playlistsStore.selectedPlaylistID = nil
+                    }
+                    return
+                }
+                playlistsStore.selectedPlaylistID = newValue
+            }
+        )
+    }
+
     private var currentHighlightedURL: URL? {
         if audioPlayer.persistPlaybackState,
            playlistManager.currentIndex >= 0,
@@ -112,7 +130,7 @@ struct PlaylistsPanelView: View {
                 )
                 Spacer()
             } else {
-                List(selection: $playlistsStore.selectedPlaylistID) {
+                List(selection: sidebarSelectedPlaylistID) {
                     ForEach(playlistsStore.playlists) { playlist in
                         HStack(spacing: 10) {
                             Image(systemName: "music.note.list")
@@ -286,33 +304,33 @@ struct PlaylistsPanelView: View {
 	                    .disabled(playlistManager.audioFiles.isEmpty)
 	                    .help(playlistManager.audioFiles.isEmpty ? "队列为空：先在“队列”里导入一些歌曲" : "")
 
-	                    Button("添加正在播放") {
-	                        if let url = audioPlayer.currentFile?.url {
-	                            playlistsStore.addTracks([url], to: playlist.id)
-	                            reloadSelectedPlaylist()
-	                        } else {
-	                            postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
-	                        }
-	                    }
-	                    .buttonStyle(.bordered)
-	                    .disabled(audioPlayer.currentFile == nil)
-	                    .help(audioPlayer.currentFile == nil ? "没有正在播放的歌曲" : "")
-	                }
+                    Button("添加正在播放") {
+                        if let url = audioPlayer.currentFile?.url {
+                            playlistsStore.addTracks([url], to: playlist.id)
+                            reloadSelectedPlaylist()
+                        } else {
+                            postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(audioPlayer.currentFile == nil)
+                    .help(audioPlayer.currentFile == nil ? "没有正在播放的歌曲" : "")
+                }
 
-	                HStack(spacing: 10) {
-	                    let nowPlayingID = nowPlayingIDInPlaylist(playlist)
-	                    if nowPlayingID != nil {
-	                        Button {
-	                            requestScrollToNowPlayingInPlaylist(playlist)
-	                        } label: {
-	                            Label("定位正在播放", systemImage: "scope")
-	                        }
-	                        .buttonStyle(.bordered)
-	                        .help("定位到正在播放的歌曲（会自动清空搜索）")
-	                    }
+                HStack(spacing: 10) {
+                    let nowPlayingID = nowPlayingIDInPlaylist(playlist)
+                    if nowPlayingID != nil {
+                        Button {
+                            requestScrollToNowPlayingInPlaylist(playlist)
+                        } label: {
+                            Label("定位正在播放", systemImage: "scope")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .help("定位到正在播放的歌曲（会自动清空搜索）")
+                    }
 
-	                    Button {
-	                        let result = weights.syncPlaylistOverridesToQueue(from: playlist.id)
+                    Button {
+                        let result = weights.syncPlaylistOverridesToQueue(from: playlist.id)
 	                        if result.total == 0 {
 	                            postToast(title: "歌单没有设置随机权重", subtitle: "先在歌单里点一下 5 个方块设置权重", kind: "info")
 	                            return
@@ -322,14 +340,14 @@ struct PlaylistsPanelView: View {
 	                            return
 	                        }
 	                        postToast(title: "已同步权重到队列", subtitle: "应用了 \(result.changed)/\(result.total) 条权重", kind: "success")
-	                    } label: {
-	                        Label("同步权重给队列", systemImage: "arrow.triangle.2.circlepath")
-	                    }
-	                    .buttonStyle(.bordered)
-	                    .help("将本歌单的随机权重同步到队列（只同步非默认权重，不会清空队列里其他歌曲的权重）")
-	                }
-	            }
-		        }
+                    } label: {
+                        Label("同步权重给队列", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .help("将本歌单的随机权重同步到队列（只同步非默认权重，不会清空队列里其他歌曲的权重）")
+                }
+            }
+        }
 		        .padding(.top, 4)
 		    }
 

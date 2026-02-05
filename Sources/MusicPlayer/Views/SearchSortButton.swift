@@ -13,8 +13,8 @@ struct SearchSortButton: View {
 
     var body: some View {
         let option = sortState.option(for: target)
-        // "Enabled sort" means using any field other than the original order.
-        let isActive = option.field != .original
+        // "Enabled sort" means using any order other than the default (original + ascending).
+        let isActive = option.field != .original || option.direction != .ascending
 
         Button {
             // Make popover feel snappy: avoid implicit animations on show/hide.
@@ -39,7 +39,7 @@ struct SearchSortButton: View {
                     }
                 }
 
-                Image(systemName: option.field == .original ? "arrow.up.arrow.down" : "arrow.up.arrow.down.circle.fill")
+                Image(systemName: isActive ? "arrow.up.arrow.down.circle.fill" : "arrow.up.arrow.down")
                     .foregroundStyle(isActive ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText))
                     .font(.headline)
                     .frame(width: 28, height: 28)

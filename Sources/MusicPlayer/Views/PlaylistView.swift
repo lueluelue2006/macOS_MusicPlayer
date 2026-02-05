@@ -54,6 +54,30 @@ struct PlaylistView: View {
         // For ephemeral playback (external open, not in queue), fall back to the loaded file.
         return audioPlayer.currentFile?.url
     }
+
+    private var activePlaybackScope: PlaybackScope? {
+        guard audioPlayer.currentFile != nil, audioPlayer.persistPlaybackState else { return nil }
+        return playlistManager.playbackScope
+    }
+
+    private var scopeIndicatorSystemName: String {
+        audioPlayer.isShuffling ? "shuffle.circle.fill" : "play.circle.fill"
+    }
+
+    @ViewBuilder
+    private func panelModeSegmentLabel(title: String, isActiveScope: Bool) -> some View {
+        ZStack {
+            Text(title)
+                .frame(maxWidth: .infinity, alignment: .center)
+
+            if isActiveScope {
+                ActivePlaybackScopeIndicator(systemName: scopeIndicatorSystemName, isPlaying: audioPlayer.isPlaying)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.trailing, 6)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
     
     // 确保窗口在视图销毁时被清理
     init(audioPlayer: AudioPlayer, playlistManager: PlaylistManager, playlistsStore: PlaylistsStore) {
@@ -77,8 +101,21 @@ struct PlaylistView: View {
                         .foregroundColor(.primary)
 
                     Picker("", selection: $panelModeRaw) {
-                        Text("队列").tag(PanelMode.queue.rawValue)
-                        Text("歌单").tag(PanelMode.playlists.rawValue)
+                        panelModeSegmentLabel(
+                            title: "队列",
+                            isActiveScope: activePlaybackScope == .queue
+                        )
+                        .tag(PanelMode.queue.rawValue)
+
+                        panelModeSegmentLabel(
+                            title: "歌单",
+                            isActiveScope: {
+                                guard let scope = activePlaybackScope else { return false }
+                                if case .playlist = scope { return true }
+                                return false
+                            }()
+                        )
+                        .tag(PanelMode.playlists.rawValue)
                     }
                     .pickerStyle(.segmented)
                     .frame(width: 150)

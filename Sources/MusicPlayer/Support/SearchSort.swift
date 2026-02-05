@@ -78,7 +78,10 @@ final class SearchSortState: ObservableObject {
 
 extension SearchSortOption {
     func applying(to files: [AudioFile], weightScope: PlaybackWeights.Scope?) -> [AudioFile] {
-        guard field != .original, files.count >= 2 else { return files }
+        guard files.count >= 2 else { return files }
+        if field == .original {
+            return direction == .ascending ? files : Array(files.reversed())
+        }
 
         let field = self.field
         let direction = self.direction
@@ -186,4 +189,3 @@ extension SearchSortOption {
         return sorted.map(\.element)
     }
 }
-
