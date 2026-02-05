@@ -322,7 +322,7 @@ struct PlaylistsPanelView: View {
 	                        }
 	                        postToast(title: "已同步权重到队列", subtitle: "应用了 \(result.changed)/\(result.total) 条权重", kind: "success")
 	                    } label: {
-	                        Label("同步权重", systemImage: "arrow.triangle.2.circlepath")
+	                        Label("同步权重给队列", systemImage: "arrow.triangle.2.circlepath")
 	                    }
 	                    .buttonStyle(.bordered)
 	                    .help("将本歌单的随机权重同步到队列（只同步非默认权重，不会清空队列里其他歌曲的权重）")
