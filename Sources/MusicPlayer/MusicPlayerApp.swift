@@ -22,6 +22,7 @@ struct MusicPlayerApp: App {
         // - avoids conflicting defaults when other apps use the old id
         // - preserves existing user settings on upgrade
         UserDefaultsMigrator.migrateFromLegacyBundleIdentifierIfNeeded(currentBundleIdentifier: Bundle.main.bundleIdentifier)
+        PathKeyDiskMigrator.migrateLegacyLowercasedKeysIfNeeded()
 
 	        let audioPlayer = AudioPlayer()
 	        let playlistManager = PlaylistManager()
