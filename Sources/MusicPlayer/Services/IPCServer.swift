@@ -45,6 +45,14 @@ final class IPCServer {
 
     @MainActor
     private func handleRequest(_ request: IPCRequest) async -> IPCReply {
+        guard isRequestAllowed(request) else {
+            return IPCReply(
+                id: request.id,
+                ok: false,
+                message: "CLI 调试模式未开启。请在菜单“设置 > 启用 CLI 调试模式”后重试。"
+            )
+        }
+
         switch request.command {
         case .ping:
             return IPCReply(id: request.id, ok: true, message: "pong")
@@ -448,6 +456,13 @@ final class IPCServer {
                 return IPCReply(id: request.id, ok: false, message: "write failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    private func isRequestAllowed(_ request: IPCRequest) -> Bool {
+        if request.command == .ping || request.command == .status {
+            return true
+        }
+        return IPCDebugSettings.isEnabled()
     }
 
     private func postReply(_ reply: IPCReply) {

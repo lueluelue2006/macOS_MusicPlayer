@@ -143,14 +143,37 @@ final class AudioPlayer: NSObject, ObservableObject {
     }
 
     private func volumeCacheKey(for url: URL) -> String {
-        // 统一键格式：避免同一路径因大小写/Unicode 组合形式差异导致缓存 miss / 重复分析。
-        url.standardizedFileURL.path
-            .precomposedStringWithCanonicalMapping
-            .lowercased()
+        PathKey.canonical(for: url)
     }
 
-    private func volumeCacheKey(forPath path: String) -> String {
-        volumeCacheKey(for: URL(fileURLWithPath: path))
+    private func volumeCacheLookupKeys(for url: URL) -> [String] {
+        PathKey.lookupKeys(for: url)
+    }
+
+    private func cachedLoudnessAndMigrate(for url: URL) -> Float? {
+        let keys = volumeCacheLookupKeys(for: url)
+        guard let canonical = keys.first else { return nil }
+        var migrated = false
+
+        let value: Float? = withVolumeCacheLock {
+            if let exact = fileLoudnessCache[canonical] {
+                return exact
+            }
+            for key in keys where key != canonical {
+                if let legacy = fileLoudnessCache[key] {
+                    fileLoudnessCache[canonical] = legacy
+                    fileLoudnessCache.removeValue(forKey: key)
+                    migrated = true
+                    return legacy
+                }
+            }
+            return nil
+        }
+
+        if migrated {
+            saveVolumeCache()
+        }
+        return value
     }
 
     private func debugLog(_ message: @autoclosure () -> String) {
@@ -1184,8 +1207,7 @@ extension AudioPlayer {
 
     private func desiredPlayerVolume(for url: URL) -> Float {
         if !isNormalizationEnabled { return volume }
-        let fileKey = volumeCacheKey(for: url)
-        if let levelDb = withVolumeCacheLock({ fileLoudnessCache[fileKey] }) {
+        if let levelDb = cachedLoudnessAndMigrate(for: url) {
             return min(volume * normalizationGain(forMeasuredLevelDb: levelDb), 1.0)
         }
         return volume
@@ -1248,7 +1270,7 @@ extension AudioPlayer {
             // 若均衡已关闭，不再后台分析
             guard isNormalizationEnabled else { return }
 
-            let hasCache = withVolumeCacheLock { fileLoudnessCache[fileKey] != nil }
+            let hasCache = cachedLoudnessAndMigrate(for: url) != nil
             // 若已有缓存，无需再排队分析
             guard !hasCache else { return }
             guard allowBackgroundAnalysis else { return }
@@ -1262,9 +1284,14 @@ extension AudioPlayer {
             normalizationQueue.async { [weak self] in
                 guard let self else { return }
                 // 避免同一路径重复排队分析
-                if self.normalizationInFlight.contains(fileKey) { return }
+                let inFlightKeys = self.volumeCacheLookupKeys(for: url)
+                if inFlightKeys.contains(where: { self.normalizationInFlight.contains($0) }) { return }
                 self.normalizationInFlight.insert(fileKey)
-                defer { self.normalizationInFlight.remove(fileKey) }
+                defer {
+                    for key in inFlightKeys {
+                        self.normalizationInFlight.remove(key)
+                    }
+                }
 
                 _ = self.calculateNormalizedVolume(for: url)
 
@@ -1290,12 +1317,12 @@ extension AudioPlayer {
 	    
 		    /// 计算归一化音量
 		    func calculateNormalizedVolume(for url: URL, persist: Bool = true, cancellationCheck: (() -> Bool)? = nil) -> Float {
-		        let fileKey = volumeCacheKey(for: url)
-		        
-		        // 检查缓存
-		        if let cachedLevelDb = withVolumeCacheLock({ fileLoudnessCache[fileKey] }) {
-		            return normalizationGain(forMeasuredLevelDb: cachedLevelDb)
-		        }
+            let fileKey = volumeCacheKey(for: url)
+            
+            // 检查缓存
+            if let cachedLevelDb = cachedLoudnessAndMigrate(for: url) {
+                return normalizationGain(forMeasuredLevelDb: cachedLevelDb)
+            }
 
 			        // 分析音频文件响度（RMS, dB）
 			        guard let measuredLevelDb = analyzeAudioLevel(for: url, cancellationCheck: cancellationCheck) else {
@@ -1539,7 +1566,7 @@ extension AudioPlayer {
         normalized.reserveCapacity(raw.count)
         for (path, value) in raw {
             guard value.isFinite else { continue }
-            normalized[volumeCacheKey(forPath: path)] = value
+            normalized[PathKey.canonical(path: path)] = value
         }
         return normalized
     }
@@ -1562,8 +1589,7 @@ extension AudioPlayer {
     }
 
     func hasVolumeNormalizationCache(for url: URL) -> Bool {
-        let key = volumeCacheKey(for: url)
-        return withVolumeCacheLock { fileLoudnessCache[key] != nil }
+        cachedLoudnessAndMigrate(for: url) != nil
     }
 
     func volumeNormalizationCacheKeysSnapshot() -> Set<String> {

@@ -322,16 +322,19 @@ class MetadataEditor: ObservableObject {
             // 成功导出，替换原文件
             do {
                 // 备份原文件权限
-                let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-                
-                // 删除原文件
-                try FileManager.default.removeItem(at: url)
-                
-                // 移动新文件到原位置
-                try FileManager.default.moveItem(at: tempURL, to: url)
-                
-                // 恢复文件权限
-                try FileManager.default.setAttributes(attributes, ofItemAtPath: url.path)
+                let fileManager = FileManager.default
+                let attributes = try fileManager.attributesOfItem(atPath: url.path)
+
+                // 原子替换原文件，避免“先删后移”窗口导致异常时文件丢失
+                _ = try fileManager.replaceItemAt(url, withItemAt: tempURL)
+
+                var attrsToRestore: [FileAttributeKey: Any] = [:]
+                if let p = attributes[.posixPermissions] { attrsToRestore[.posixPermissions] = p }
+                if let o = attributes[.ownerAccountID] { attrsToRestore[.ownerAccountID] = o }
+                if let g = attributes[.groupOwnerAccountID] { attrsToRestore[.groupOwnerAccountID] = g }
+                if !attrsToRestore.isEmpty {
+                    try? fileManager.setAttributes(attrsToRestore, ofItemAtPath: url.path)
+                }
                 
             } catch {
                 // 清理临时文件

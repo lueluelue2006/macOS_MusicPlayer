@@ -289,13 +289,23 @@ struct ContentView: View {
             switch outcome {
             case .updateAvailable(let info):
                 if info.assetURL != nil {
-                    showToastMessage(
-                        "发现新版本 \(info.latestVersion)",
-                        subtitle: "点击自动更新（下载并安装后自动重启）",
-                        kind: .update,
-                        duration: 10.0,
-                        tapUpdate: info
-                    )
+                    if info.checksumAssetURL != nil {
+                        showToastMessage(
+                            "发现新版本 \(info.latestVersion)",
+                            subtitle: "点击自动更新（下载并校验后安装）",
+                            kind: .update,
+                            duration: 10.0,
+                            tapUpdate: info
+                        )
+                    } else {
+                        showToastMessage(
+                            "发现新版本 \(info.latestVersion)",
+                            subtitle: "未找到 SHA256 校验文件，点击打开 Releases 手动下载",
+                            kind: .warning,
+                            duration: 10.0,
+                            tapURL: info.releaseURL
+                        )
+                    }
                 } else {
                     showToastMessage(
                         "发现新版本 \(info.latestVersion)",

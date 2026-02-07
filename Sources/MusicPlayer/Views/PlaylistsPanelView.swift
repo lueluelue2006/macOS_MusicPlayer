@@ -356,12 +356,15 @@ struct PlaylistsPanelView: View {
 		        .padding(.top, 4)
 		    }
 
-	    private func nowPlayingIDInPlaylist(_ playlist: UserPlaylist) -> String? {
-	        guard let url = currentHighlightedURL else { return nil }
-	        let id = pathKey(url)
-	        guard playlist.tracks.contains(where: { pathKey(URL(fileURLWithPath: $0.path)) == id }) else { return nil }
-	        return id
-	    }
+    private func nowPlayingIDInPlaylist(_ playlist: UserPlaylist) -> String? {
+        guard let url = currentHighlightedURL else { return nil }
+        let id = pathKey(url)
+        let idLookup = Set(pathLookupKeys(url))
+        guard playlist.tracks.contains(where: {
+            !idLookup.isDisjoint(with: Set(pathLookupKeys(URL(fileURLWithPath: $0.path))))
+        }) else { return nil }
+        return id
+    }
 
 	    @MainActor
 	    private func requestScrollToNowPlayingInPlaylist(_ playlist: UserPlaylist) {
@@ -543,9 +546,11 @@ struct PlaylistsPanelView: View {
     }
 
     private func pathKey(_ url: URL) -> String {
-        url.standardizedFileURL.path
-            .precomposedStringWithCanonicalMapping
-            .lowercased()
+        PathKey.canonical(for: url)
+    }
+
+    private func pathLookupKeys(_ url: URL) -> [String] {
+        PathKey.lookupKeys(for: url)
     }
 
     // MARK: - Add from queue sheet
@@ -568,7 +573,9 @@ struct PlaylistsPanelView: View {
     private var addFromQueueSelectedFiles: [AudioFile] {
         let keySet = addFromQueueSelectedKeys
         guard !keySet.isEmpty else { return [] }
-        return playlistManager.audioFiles.filter { keySet.contains(pathKey($0.url)) }
+        return playlistManager.audioFiles.filter {
+            !Set(pathLookupKeys($0.url)).isDisjoint(with: keySet)
+        }
     }
 
 	    @ViewBuilder
@@ -628,15 +635,24 @@ struct PlaylistsPanelView: View {
 	            }
 
 	            List(addFromQueueCandidates) { file in
-	                Button {
-	                    let k = pathKey(file.url)
-                    if addFromQueueSelectedKeys.contains(k) {
+                Button {
+                    let k = pathKey(file.url)
+                    let selected = !Set(pathLookupKeys(file.url)).isDisjoint(with: addFromQueueSelectedKeys)
+                    if selected {
                         addFromQueueSelectedKeys.remove(k)
+                        let legacy = PathKey.legacy(for: file.url)
+                        if legacy != k {
+                            addFromQueueSelectedKeys.remove(legacy)
+                        }
                     } else {
                         addFromQueueSelectedKeys.insert(k)
+                        let legacy = PathKey.legacy(for: file.url)
+                        if legacy != k {
+                            addFromQueueSelectedKeys.insert(legacy)
+                        }
                     }
                 } label: {
-                    let selected = addFromQueueSelectedKeys.contains(pathKey(file.url))
+                    let selected = !Set(pathLookupKeys(file.url)).isDisjoint(with: addFromQueueSelectedKeys)
                     HStack(spacing: 10) {
                         Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                             .foregroundStyle(selected ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText))

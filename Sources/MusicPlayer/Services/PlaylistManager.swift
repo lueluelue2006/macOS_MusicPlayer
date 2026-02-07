@@ -181,7 +181,7 @@ final class PlaylistManager: ObservableObject {
             // - Prefer disk caches (duration/metadata)
             // - Fall back to filename-only placeholder (no AVAsset scan on startup)
             let existingQueueKeys: Set<String> = await MainActor.run {
-                Set(self.audioFiles.map { self.pathKey($0.url) })
+                Set(self.audioFiles.flatMap { self.pathLookupKeys($0.url) })
             }
 
             var toAppend: [AudioFile] = []
@@ -248,7 +248,8 @@ final class PlaylistManager: ObservableObject {
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     for (url, metadata) in results {
-                        if let index = self.audioFiles.firstIndex(where: { self.pathKey($0.url) == self.pathKey(url) }) {
+                        let lookupSet = Set(self.pathLookupKeys(url))
+                        if let index = self.audioFiles.firstIndex(where: { !lookupSet.isDisjoint(with: Set(self.pathLookupKeys($0.url))) }) {
                             let existing = self.audioFiles[index]
                             self.audioFiles[index] = AudioFile(url: existing.url, metadata: metadata, lyricsTimeline: existing.lyricsTimeline, duration: existing.duration)
                         }
@@ -332,12 +333,10 @@ final class PlaylistManager: ObservableObject {
         guard !didPerformInitialRestore else { return }
         didPerformInitialRestore = true
 
-        // Ensure user playlists are available for restoring playback scope.
-        playlistsStore.loadIfNeeded()
-
         initialRestoreTask?.cancel()
         initialRestoreTask = Task.detached(priority: .userInitiated) { [weak self, weak audioPlayer] in
             guard let self, let audioPlayer else { return }
+            await playlistsStore.ensureLoaded()
             await self.loadSavedPlaylist(audioPlayer: audioPlayer)
             let skipRestore = await MainActor.run {
                 // 若本次启动是通过 Finder/Dock 外部文件打开，则不恢复上次播放/播放范围
@@ -521,13 +520,15 @@ final class PlaylistManager: ObservableObject {
         // 去重（路径粒度）：仅保留首次出现的路径
         let newFilesDedupWithinBatch: [AudioFile] = {
             var seen = Set<String>()
+            var seenLegacy = Set<String>()
             var result: [AudioFile] = []
             for f in built {
                 let key = self.pathKey(f.url)
-                if !seen.contains(key) {
-                    seen.insert(key)
-                    result.append(f)
-                }
+                let legacy = PathKey.legacy(for: f.url)
+                if seen.contains(key) || seenLegacy.contains(legacy) { continue }
+                seen.insert(key)
+                seenLegacy.insert(legacy)
+                result.append(f)
             }
             return result
         }()
@@ -536,13 +537,15 @@ final class PlaylistManager: ObservableObject {
             let wasEmpty = self.audioFiles.isEmpty
             // 与现有列表去重：若重复路径已存在，保留已有（更早）的条目，丢弃新增重复
             var existing = Set(self.audioFiles.map { self.pathKey($0.url) })
+            var existingLegacy = Set(self.audioFiles.map { PathKey.legacy(for: $0.url) })
             var toAppend: [AudioFile] = []
             for f in newFilesDedupWithinBatch {
                 let key = self.pathKey(f.url)
-                if !existing.contains(key) {
-                    existing.insert(key)
-                    toAppend.append(f)
-                }
+                let legacy = PathKey.legacy(for: f.url)
+                if existing.contains(key) || existingLegacy.contains(legacy) { continue }
+                existing.insert(key)
+                existingLegacy.insert(legacy)
+                toAppend.append(f)
             }
             let oldCount = self.audioFiles.count
             self.audioFiles.append(contentsOf: toAppend)
@@ -592,7 +595,7 @@ final class PlaylistManager: ObservableObject {
                 let isSymlink = (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) ?? false
                 if isSymlink { continue }
 
-                let canonical = url.resolvingSymlinksInPath().standardizedFileURL.path.lowercased()
+                let canonical = PathKey.canonical(path: url.resolvingSymlinksInPath().standardizedFileURL.path)
                 if visitedDirectories.contains(canonical) { continue }
                 visitedDirectories.insert(canonical)
 
@@ -678,22 +681,22 @@ final class PlaylistManager: ObservableObject {
     
     // 刷新单个文件的元数据（从文件重新读取）
     func refreshFileMetadata(_ file: AudioFile) async {
-        if let index = audioFiles.firstIndex(where: { $0.id == file.id }) {
-            // 强制清除所有缓存，重新创建 AVAsset
-            let newMetadata = await loadFreshMetadata(from: file.url)
-            await MetadataCache.shared.storeBasicMetadata(newMetadata, for: file.url)
+        // 强制清除所有缓存，重新创建 AVAsset
+        let newMetadata = await loadFreshMetadata(from: file.url)
+        await MetadataCache.shared.storeBasicMetadata(newMetadata, for: file.url)
 
-            // 创建新的 AudioFile
-            let newFile = AudioFile(url: file.url, metadata: newMetadata, duration: file.duration)
-
-            await MainActor.run {
-                audioFiles[index] = newFile
-                updateFilteredFiles()
+        await MainActor.run {
+            guard let refreshedIndex = self.audioFiles.firstIndex(where: { $0.id == file.id }) else {
+                return
             }
-
-            // 清除该文件的歌词缓存，确保后续重新解析（包括侧载 LRC 或嵌入变更）
-            await LyricsService.shared.invalidate(for: file.url)
+            let existing = self.audioFiles[refreshedIndex]
+            let newFile = AudioFile(url: existing.url, metadata: newMetadata, duration: existing.duration)
+            self.audioFiles[refreshedIndex] = newFile
+            self.updateFilteredFiles()
         }
+
+        // 清除该文件的歌词缓存，确保后续重新解析（包括侧载 LRC 或嵌入变更）
+        await LyricsService.shared.invalidate(for: file.url)
     }
     
     // 刷新所有文件的元数据
@@ -1172,7 +1175,7 @@ final class PlaylistManager: ObservableObject {
 
     private func currentPathKeyInQueue() -> String? {
         guard currentIndex >= 0, currentIndex < audioFiles.count else { return nil }
-        return pathKey(audioFiles[currentIndex].url)
+        return pathLookupKeys(audioFiles[currentIndex].url).first
     }
 
     private func currentPlaylistPosition() -> Int? {
@@ -1181,8 +1184,9 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func indexInQueue(forPathKey key: String) -> Int? {
+        let lookupSet = Set(PathKey.lookupKeys(forPath: key))
         for (idx, file) in audioFiles.enumerated() {
-            if pathKey(file.url) == key {
+            if !lookupSet.isDisjoint(with: Set(pathLookupKeys(file.url))) {
                 return idx
             }
         }
@@ -1412,11 +1416,13 @@ final class PlaylistManager: ObservableObject {
 	        return audioExtensions.contains(url.pathExtension.lowercased())
 	    }
 
-    // 统一的路径键（大小写不敏感，标准化 URL）
+    // 统一的路径键（Unicode 规范化 + 标准路径，不再强制 lowercased）
     private func pathKey(_ url: URL) -> String {
-        return url.standardizedFileURL.path
-            .precomposedStringWithCanonicalMapping
-            .lowercased()
+        return PathKey.canonical(for: url)
+    }
+
+    private func pathLookupKeys(_ url: URL) -> [String] {
+        PathKey.lookupKeys(for: url)
     }
     
     // 当选择了新曲目时，尝试预取歌词（供未来调用）
@@ -1513,14 +1519,14 @@ final class PlaylistManager: ObservableObject {
 
     @MainActor
     private func applyDuration(_ seconds: TimeInterval, for url: URL) {
-        let key = pathKey(url)
-        if let idx = audioFiles.firstIndex(where: { pathKey($0.url) == key }) {
+        let keys = Set(pathLookupKeys(url))
+        if let idx = audioFiles.firstIndex(where: { !Set(pathLookupKeys($0.url)).isDisjoint(with: keys) }) {
             let f = audioFiles[idx]
             if f.duration == nil {
                 audioFiles[idx] = AudioFile(url: f.url, metadata: f.metadata, lyricsTimeline: f.lyricsTimeline, duration: seconds)
             }
         }
-        if let idx = filteredFiles.firstIndex(where: { pathKey($0.url) == key }) {
+        if let idx = filteredFiles.firstIndex(where: { !Set(pathLookupKeys($0.url)).isDisjoint(with: keys) }) {
             let f = filteredFiles[idx]
             if f.duration == nil {
                 filteredFiles[idx] = AudioFile(url: f.url, metadata: f.metadata, lyricsTimeline: f.lyricsTimeline, duration: seconds)
@@ -1543,8 +1549,8 @@ final class PlaylistManager: ObservableObject {
 
             // Skip if no longer in the playlist, or already has a duration.
             let needsWork = await MainActor.run { () -> Bool in
-                let k = self.pathKey(url)
-                guard let idx = self.audioFiles.firstIndex(where: { self.pathKey($0.url) == k }) else { return false }
+                let lookupSet = Set(self.pathLookupKeys(url))
+                guard let idx = self.audioFiles.firstIndex(where: { !lookupSet.isDisjoint(with: Set(self.pathLookupKeys($0.url))) }) else { return false }
                 return self.audioFiles[idx].duration == nil
             }
             if !needsWork { continue }
@@ -1574,12 +1580,22 @@ final class PlaylistManager: ObservableObject {
     func savePlaylist() {
         let snapshot = SavedPlaylist(paths: audioFiles.map { $0.url.path }, currentIndex: currentIndex)
         debugLog("保存播放列表: \(snapshot.paths.count) 个文件, 当前索引: \(snapshot.currentIndex)")
-        guard let url = playlistFileURL() else { return }
+        guard let url = playlistFileURL() else {
+            PersistenceLogger.log("保存播放列表失败: 无法创建应用支持目录")
+            DispatchQueue.main.async {
+                PersistenceLogger.notifyUser(title: "播放列表保存失败", subtitle: "无法创建应用支持目录")
+            }
+            return
+        }
         playlistIOQueue.async {
             do {
                 try self.writePlaylistSnapshot(snapshot, to: url)
             } catch {
                 self.debugLog("保存播放列表到磁盘失败: \(error)")
+                PersistenceLogger.log("保存播放列表失败: \(error)")
+                DispatchQueue.main.async {
+                    PersistenceLogger.notifyUser(title: "播放列表保存失败", subtitle: "请检查磁盘权限或空间")
+                }
             }
         }
     }
@@ -1692,7 +1708,8 @@ final class PlaylistManager: ObservableObject {
             await MainActor.run { [weak self, weak audioPlayer] in
                 guard let self else { return }
                 for (url, metadata) in results {
-                    guard let index = self.audioFiles.firstIndex(where: { self.pathKey($0.url) == self.pathKey(url) }) else {
+                    let lookupSet = Set(self.pathLookupKeys(url))
+                    guard let index = self.audioFiles.firstIndex(where: { !lookupSet.isDisjoint(with: Set(self.pathLookupKeys($0.url))) }) else {
                         continue
                     }
                     let existing = self.audioFiles[index]
@@ -1749,6 +1766,10 @@ final class PlaylistManager: ObservableObject {
                 return true
             } catch {
                 self.debugLog("保存播放列表到磁盘失败: \(error)")
+                PersistenceLogger.log("保存播放列表失败: \(error)")
+                DispatchQueue.main.async {
+                    PersistenceLogger.notifyUser(title: "播放列表保存失败", subtitle: "请检查磁盘权限或空间")
+                }
                 return false
             }
         }

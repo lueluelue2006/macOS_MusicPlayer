@@ -2,10 +2,10 @@ import Foundation
 
 /// Persistent, lightweight per-track playback weight settings.
 ///
-/// Design:
-/// - Scoped: queue weights and per-playlist weights are isolated.
-/// - Keyed by normalized file path (no bookmarks).
-/// - Best-effort disk persistence (JSON, debounced).
+    /// Design:
+    /// - Scoped: queue weights and per-playlist weights are isolated.
+    /// - Keyed by canonical file path (no bookmarks), with legacy lowercased key compatibility.
+    /// - Best-effort disk persistence (JSON, debounced).
 final class PlaybackWeights: ObservableObject {
     static let shared = PlaybackWeights()
 
@@ -59,20 +59,31 @@ final class PlaybackWeights: ObservableObject {
     }
 
     func level(for url: URL, scope: Scope) -> Level {
-        let key = Self.key(for: url)
-        return level(forKey: key, scope: scope)
+        let keys = Self.lookupKeys(for: url)
+        if let first = keys.first {
+            return level(forLookupKeys: keys, canonicalKey: first, scope: scope)
+        }
+        return .green
     }
 
     func level(forKey key: String, scope: Scope) -> Level {
+        level(forLookupKeys: [PathKey.canonical(path: key), PathKey.legacy(path: key)], canonicalKey: PathKey.canonical(path: key), scope: scope)
+    }
+
+    private func level(forLookupKeys lookupKeys: [String], canonicalKey: String, scope: Scope) -> Level {
         loadIfNeeded()
         lock.lock()
         defer { lock.unlock() }
         let raw: Int? = {
             switch scope {
             case .queue:
-                return queueLevels[key]
+                return valueWithMigration(in: &queueLevels, lookupKeys: lookupKeys, canonicalKey: canonicalKey)
             case .playlist(let id):
-                return playlistLevels[id.uuidString]?[key]
+                let pid = id.uuidString
+                if playlistLevels[pid] == nil {
+                    playlistLevels[pid] = [:]
+                }
+                return valueWithMigration(in: &playlistLevels[pid]!, lookupKeys: lookupKeys, canonicalKey: canonicalKey)
             }
         }()
         return Level(rawValue: raw ?? 0) ?? .green
@@ -99,9 +110,10 @@ final class PlaybackWeights: ObservableObject {
         switch scope {
         case .queue:
             if clamped == 0 {
-                if queueLevels.removeValue(forKey: key) != nil { changed = true }
+                if removeKeyVariants(key, from: &queueLevels) { changed = true }
             } else if queueLevels[key] != clamped {
                 queueLevels[key] = clamped
+                removeLegacyVariant(key, from: &queueLevels)
                 changed = true
             }
 
@@ -109,10 +121,11 @@ final class PlaybackWeights: ObservableObject {
             let pid = id.uuidString
             if playlistLevels[pid] == nil { playlistLevels[pid] = [:] }
             if clamped == 0 {
-                if playlistLevels[pid]?.removeValue(forKey: key) != nil { changed = true }
+                if removeKeyVariants(key, from: &playlistLevels[pid]!) { changed = true }
                 if playlistLevels[pid]?.isEmpty == true { playlistLevels.removeValue(forKey: pid) }
             } else if playlistLevels[pid]?[key] != clamped {
                 playlistLevels[pid]?[key] = clamped
+                removeLegacyVariant(key, from: &playlistLevels[pid]!)
                 changed = true
             }
         }
@@ -169,7 +182,7 @@ final class PlaybackWeights: ObservableObject {
         let pid = id.uuidString
         var removed = false
         lock.lock()
-        if playlistLevels[pid]?.removeValue(forKey: key) != nil {
+        if playlistLevels[pid] != nil, removeKeyVariants(key, from: &playlistLevels[pid]!) {
             removed = true
             if playlistLevels[pid]?.isEmpty == true { playlistLevels.removeValue(forKey: pid) }
         }
@@ -265,7 +278,10 @@ final class PlaybackWeights: ObservableObject {
             let data = try JSONEncoder().encode(payload)
             try data.write(to: url, options: .atomic)
         } catch {
-            // Best-effort only.
+            PersistenceLogger.log("保存随机权重失败: \(error)")
+            DispatchQueue.main.async {
+                PersistenceLogger.notifyUser(title: "随机权重保存失败", subtitle: "请检查磁盘权限或空间")
+            }
         }
     }
 
@@ -288,10 +304,7 @@ final class PlaybackWeights: ObservableObject {
         var normalized: [String: Int] = [:]
         normalized.reserveCapacity(raw.count)
         for (path, level) in raw {
-            let key = URL(fileURLWithPath: path)
-                .standardizedFileURL.path
-                .precomposedStringWithCanonicalMapping
-                .lowercased()
+            let key = PathKey.canonical(path: path)
             let clamped = max(0, min(4, level))
             if clamped != 0 {
                 normalized[key] = clamped
@@ -301,8 +314,43 @@ final class PlaybackWeights: ObservableObject {
     }
 
     nonisolated static func key(for url: URL) -> String {
-        url.standardizedFileURL.path
-            .precomposedStringWithCanonicalMapping
-            .lowercased()
+        PathKey.canonical(for: url)
+    }
+
+    nonisolated static func lookupKeys(for url: URL) -> [String] {
+        PathKey.lookupKeys(for: url)
+    }
+
+    private func removeKeyVariants(_ key: String, from map: inout [String: Int]) -> Bool {
+        let variants = [PathKey.canonical(path: key), PathKey.legacy(path: key)]
+        var removed = false
+        for variant in variants {
+            if map.removeValue(forKey: variant) != nil {
+                removed = true
+            }
+        }
+        return removed
+    }
+
+    private func removeLegacyVariant(_ key: String, from map: inout [String: Int]) {
+        let canonical = PathKey.canonical(path: key)
+        let legacy = PathKey.legacy(path: key)
+        guard canonical != legacy else { return }
+        map.removeValue(forKey: legacy)
+    }
+
+    private func valueWithMigration(in map: inout [String: Int], lookupKeys: [String], canonicalKey: String) -> Int? {
+        if let value = map[canonicalKey] {
+            return value
+        }
+        for key in lookupKeys where key != canonicalKey {
+            if let value = map[key] {
+                map[canonicalKey] = value
+                map.removeValue(forKey: key)
+                scheduleSave()
+                return value
+            }
+        }
+        return nil
     }
 }

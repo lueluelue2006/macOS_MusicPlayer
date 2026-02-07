@@ -37,19 +37,35 @@ actor DurationCache {
     private var pendingSaveTask: Task<Void, Never>?
 
     nonisolated static func key(for url: URL) -> String {
-        url.standardizedFileURL.path
-            .precomposedStringWithCanonicalMapping
-            .lowercased()
+        PathKey.canonical(for: url)
+    }
+
+    nonisolated static func legacyKey(for url: URL) -> String {
+        PathKey.legacy(for: url)
     }
 
     func cachedDurationIfValid(for url: URL) -> TimeInterval? {
         loadIfNeeded()
 
         let key = Self.key(for: url)
-        guard let entry = entries[key] else { return nil }
+        let legacyKey = Self.legacyKey(for: url)
+        var matchedKey = key
+        guard let entry: Entry = {
+            if let exact = entries[key] {
+                return exact
+            }
+            guard legacyKey != key, let legacy = entries[legacyKey] else {
+                return nil
+            }
+            entries[key] = legacy
+            entries.removeValue(forKey: legacyKey)
+            scheduleSave()
+            matchedKey = key
+            return legacy
+        }() else { return nil }
         guard let current = fileSignature(for: url) else {
             // File missing/unreadable -> drop cache entry.
-            entries.removeValue(forKey: key)
+            entries.removeValue(forKey: matchedKey)
             scheduleSave()
             return nil
         }
@@ -57,7 +73,7 @@ actor DurationCache {
         let expected = FileSignature(fileSize: entry.fileSize, mtimeNs: entry.mtimeNs, inode: entry.inode)
         guard current == expected else {
             // File changed -> invalidate.
-            entries.removeValue(forKey: key)
+            entries.removeValue(forKey: matchedKey)
             scheduleSave()
             return nil
         }
@@ -82,14 +98,24 @@ actor DurationCache {
 
         if entries[key] != entry {
             entries[key] = entry
+            let legacyKey = Self.legacyKey(for: url)
+            if legacyKey != key {
+                entries.removeValue(forKey: legacyKey)
+            }
             scheduleSave()
         }
     }
 
     func remove(for url: URL) {
         loadIfNeeded()
-        let key = Self.key(for: url)
-        if entries.removeValue(forKey: key) != nil {
+        let keys = [Self.key(for: url), Self.legacyKey(for: url)]
+        var removed = false
+        for key in keys {
+            if entries.removeValue(forKey: key) != nil {
+                removed = true
+            }
+        }
+        if removed {
             scheduleSave()
         }
     }
@@ -185,10 +211,7 @@ actor DurationCache {
         var normalized: [String: Entry] = [:]
         normalized.reserveCapacity(raw.count)
         for (path, entry) in raw {
-            let key = URL(fileURLWithPath: path)
-                .standardizedFileURL.path
-                .precomposedStringWithCanonicalMapping
-                .lowercased()
+            let key = PathKey.canonical(path: path)
             normalized[key] = entry
         }
         return normalized

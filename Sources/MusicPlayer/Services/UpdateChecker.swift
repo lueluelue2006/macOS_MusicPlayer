@@ -10,6 +10,7 @@ actor UpdateChecker {
         let releaseURL: URL
         let assetName: String?
         let assetURL: URL?
+        let checksumAssetURL: URL?
     }
 
     enum CheckOutcome: Sendable {
@@ -55,12 +56,14 @@ actor UpdateChecker {
 
             if latest > current {
                 let asset = selectBestAsset(from: latestRelease.assets)
+                let checksum = selectChecksumAsset(from: latestRelease.assets)
                 return .updateAvailable(UpdateInfo(
                     currentVersion: currentVersion,
                     latestVersion: latestVersionString,
                     releaseURL: releasesURL,
                     assetName: asset?.name,
-                    assetURL: asset?.url
+                    assetURL: asset?.url,
+                    checksumAssetURL: checksum?.url
                 ))
             }
 
@@ -114,6 +117,19 @@ actor UpdateChecker {
 #endif
 
         return dmgAssets.first
+    }
+
+    private func selectChecksumAsset(from assets: [GitHubAsset]) -> SelectedAsset? {
+        let checksumAssets: [SelectedAsset] = assets.compactMap { asset in
+            let lowered = asset.name.lowercased()
+            guard lowered == "sha256sums.txt" || lowered == "checksums.txt" else { return nil }
+            guard let url = URL(string: asset.browserDownloadURL) else { return nil }
+            return SelectedAsset(name: asset.name, url: url)
+        }
+        if let preferred = checksumAssets.first(where: { $0.name.lowercased() == "sha256sums.txt" }) {
+            return preferred
+        }
+        return checksumAssets.first
     }
 }
 

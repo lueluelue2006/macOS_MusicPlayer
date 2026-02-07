@@ -78,6 +78,19 @@ public actor LyricsService {
     public static let shared = LyricsService()
     private init() {}
 
+    private nonisolated static let timestampGroupRegex = try? NSRegularExpression(
+        pattern: #"(\[(\d{1,2}):(\d{1,2})(?:[.:](\d+))?\])+"#,
+        options: []
+    )
+    private nonisolated static let timeOnlyRegex = try? NSRegularExpression(
+        pattern: #"^\s*(\[(\d{1,2}):(\d{1,2})(?:[.:](\d+))?\])+\s*$"#,
+        options: []
+    )
+    private nonisolated static let bracketTimestampRegex = try? NSRegularExpression(
+        pattern: #"\[(\d{1,2}):(\d{1,2})(?:[.:](\d+))?\]"#,
+        options: []
+    )
+
     // Cache per file URL, with modification-date fingerprints to detect staleness
     private struct CacheEntry {
         let timeline: LyricsTimeline
@@ -307,8 +320,7 @@ public actor LyricsService {
         
         // 3) 拆分行并过滤：去除纯空白行、去除只有时间戳而正文为空的行（以避免空行渲染）
         // 支持 [mm:ss] 或 [mm:ss.xxx] 等多种时间格式
-        let timeOnlyPattern = #"^\s*(\[(\d{1,2}):(\d{1,2})(?:[.:](\d+))?\])+\s*$"#
-        let timeOnlyRegex = try? NSRegularExpression(pattern: timeOnlyPattern, options: [])
+        let timeOnlyRegex = Self.timeOnlyRegex
         
         let texts = normalized
             .components(separatedBy: "\n")
@@ -344,15 +356,15 @@ public actor LyricsService {
         // Example tag: [mm:ss.xx] lyric
         // Also supports multiple timestamps per line: [mm:ss.xx][mm:ss.xx] lyric
         // 支持任意位小数：[mm:ss]、[mm:ss.c]、[mm:ss.cc]、[mm:ss.ccc]…（小数位数不限）
-        let pattern = #"(\[(\d{1,2}):(\d{1,2})(?:[.:](\d+))?\])+"#
-        let regex = try? NSRegularExpression(pattern: pattern, options: [])
+        let regex = Self.timestampGroupRegex
+        let timeOnlyRegex = Self.timeOnlyRegex
+        let bracketRegex = Self.bracketTimestampRegex
 
         for rawLine in normalized.components(separatedBy: "\n") {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             guard !line.isEmpty else { continue }
             // 过滤掉只有时间戳、没有正文的行，避免渲染空行
-            let timeOnlyPattern = #"^\s*(\[(\d{1,2}):(\d{1,2})(?:[.:](\d+))?\])+\s*$"#
-            if let re = try? NSRegularExpression(pattern: timeOnlyPattern, options: []) {
+            if let re = timeOnlyRegex {
                 let ns = line as NSString
                 if re.firstMatch(in: line, options: [], range: NSRange(location: 0, length: ns.length)) != nil {
                     continue
@@ -376,7 +388,6 @@ public actor LyricsService {
             // For each timestamp in the line, add one LyricsLine with same text
             // Scan all [mm:ss.xx] occurrences
             // 与主匹配保持一致：任意位小数
-            let bracketRegex = try? NSRegularExpression(pattern: #"\[(\d{1,2}):(\d{1,2})(?:[.:](\d+))?\]"#, options: [])
             let timeMatches = bracketRegex?.matches(in: line, options: [], range: NSRange(location: 0, length: nsLine.length)) ?? []
             for m in timeMatches {
                 if m.numberOfRanges >= 3 {

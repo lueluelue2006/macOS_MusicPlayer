@@ -31,4 +31,7 @@ extension Notification.Name {
 
     /// 手动检查更新（菜单触发）
     static let manualCheckForUpdates = Notification.Name("manualCheckForUpdates")
+
+    /// 调试模式（控制 IPC 接口是否可用）
+    static let ipcDebugModeDidChange = Notification.Name("ipcDebugModeDidChange")
 }

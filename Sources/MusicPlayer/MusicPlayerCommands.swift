@@ -9,6 +9,7 @@ struct MusicPlayerCommands: Commands {
     @AppStorage("userNotifyOnDeviceSwitch") private var notifyOnDeviceSwitch: Bool = true
     @AppStorage("userNotifyDeviceSwitchSilent") private var notifyDeviceSwitchSilent: Bool = true
     @AppStorage("userColorSchemeOverride") private var userColorSchemeOverride: Int = 0
+    @AppStorage(IPCDebugSettings.userDefaultsKey) private var ipcDebugEnabled: Bool = false
 
     var body: some Commands {
         // 保证 Command+Q 在任何弹窗/子窗口/Sheet 打开时都能正常退出（不被焦点/第一响应者影响）
@@ -351,6 +352,24 @@ struct MusicPlayerCommands: Commands {
                 )) {
                     Text("设备切换通知静音（默认）")
                 }
+            }
+
+            Divider()
+
+            Toggle(isOn: Binding(
+                get: { ipcDebugEnabled },
+                set: { newValue in
+                    ipcDebugEnabled = newValue
+                    IPCDebugSettings.setEnabled(newValue)
+                    NotificationSettingsHelper.postToast(
+                        title: newValue ? "已开启 CLI 调试模式" : "已关闭 CLI 调试模式",
+                        subtitle: newValue ? "musicplayerctl 命令现已可用" : "IPC 命令调用将被拒绝",
+                        kind: newValue ? "success" : "info",
+                        duration: 2.8
+                    )
+                }
+            )) {
+                Text("启用 CLI 调试模式")
             }
 
             Divider()

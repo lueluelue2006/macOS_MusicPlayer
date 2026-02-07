@@ -149,8 +149,6 @@ struct AudioFile: Identifiable, Equatable {
     }
 
     private static func makeStableID(for url: URL) -> String {
-        url.standardizedFileURL.path
-            .precomposedStringWithCanonicalMapping
-            .lowercased()
+        PathKey.canonical(for: url)
     }
 }

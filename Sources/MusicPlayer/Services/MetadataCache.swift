@@ -37,19 +37,37 @@ actor MetadataCache {
     private var pendingSaveTask: Task<Void, Never>?
 
     nonisolated static func key(for url: URL) -> String {
-        url.standardizedFileURL.path
-            .precomposedStringWithCanonicalMapping
-            .lowercased()
+        PathKey.canonical(for: url)
+    }
+
+    nonisolated static func legacyKey(for url: URL) -> String {
+        PathKey.legacy(for: url)
     }
 
     func cachedMetadataIfValid(for url: URL) -> AudioMetadata? {
         loadIfNeeded()
 
         let key = Self.key(for: url)
-        guard let entry = entries[key] else { return nil }
+        let legacyKey = Self.legacyKey(for: url)
+        var matchedKey = key
+
+        guard let entry: Entry = {
+            if let exact = entries[key] {
+                return exact
+            }
+            guard legacyKey != key, let legacy = entries[legacyKey] else {
+                return nil
+            }
+            // 兼容旧版 lowercased 键：命中后迁移到新键。
+            entries[key] = legacy
+            entries.removeValue(forKey: legacyKey)
+            scheduleSave()
+            matchedKey = key
+            return legacy
+        }() else { return nil }
         guard let current = fileSignature(for: url) else {
             // File missing/unreadable -> drop cache entry.
-            entries.removeValue(forKey: key)
+            entries.removeValue(forKey: matchedKey)
             scheduleSave()
             return nil
         }
@@ -57,7 +75,7 @@ actor MetadataCache {
         let expected = FileSignature(fileSize: entry.fileSize, mtimeNs: entry.mtimeNs)
         guard current == expected else {
             // File changed -> invalidate.
-            entries.removeValue(forKey: key)
+            entries.removeValue(forKey: matchedKey)
             scheduleSave()
             return nil
         }
@@ -65,7 +83,7 @@ actor MetadataCache {
         // Self-heal: cached metadata might have been produced by lossy decoding (e.g. "?????")
         // even though the file actually contains valid Unicode tags.
         if looksCorrupted(entry.title) || looksCorrupted(entry.artist) || looksCorrupted(entry.album) {
-            entries.removeValue(forKey: key)
+            entries.removeValue(forKey: matchedKey)
             scheduleSave()
             return nil
         }
@@ -85,6 +103,7 @@ actor MetadataCache {
 
         guard let sig = fileSignature(for: url) else { return }
         let key = Self.key(for: url)
+        let legacyKey = Self.legacyKey(for: url)
 
         let entry = Entry(
             title: metadata.title,
@@ -96,14 +115,23 @@ actor MetadataCache {
 
         if entries[key] != entry {
             entries[key] = entry
+            if legacyKey != key {
+                entries.removeValue(forKey: legacyKey)
+            }
             scheduleSave()
         }
     }
 
     func remove(for url: URL) {
         loadIfNeeded()
-        let key = Self.key(for: url)
-        if entries.removeValue(forKey: key) != nil {
+        let keys = [Self.key(for: url), Self.legacyKey(for: url)]
+        var removed = false
+        for key in keys {
+            if entries.removeValue(forKey: key) != nil {
+                removed = true
+            }
+        }
+        if removed {
             scheduleSave()
         }
     }
@@ -187,10 +215,7 @@ actor MetadataCache {
         var normalized: [String: Entry] = [:]
         normalized.reserveCapacity(raw.count)
         for (path, entry) in raw {
-            let key = URL(fileURLWithPath: path)
-                .standardizedFileURL.path
-                .precomposedStringWithCanonicalMapping
-                .lowercased()
+            let key = PathKey.canonical(path: path)
             normalized[key] = entry
         }
         return normalized

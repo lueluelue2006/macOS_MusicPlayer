@@ -15,6 +15,7 @@ final class PlaylistsStore: ObservableObject {
     }
 
     private var isLoaded = false
+    private var loadTask: Task<Void, Never>?
     private let ioQueue = DispatchQueue(label: "playlists.persistence", qos: .utility)
     private let ioQueueKey = DispatchSpecificKey<Void>()
 
@@ -25,21 +26,44 @@ final class PlaylistsStore: ObservableObject {
     func loadIfNeeded() {
         guard !isLoaded else { return }
         isLoaded = true
+        loadTask = Task { [weak self] in
+            await self?.loadFromDisk()
+        }
+    }
 
-        guard let url = playlistsFileURL() else { return }
-        ioQueue.async { [weak self] in
-            guard let self else { return }
-            guard let data = try? Data(contentsOf: url) else { return }
-            guard let decoded = try? JSONDecoder().decode(StoreFile.self, from: data), decoded.version == self.formatVersion else { return }
+    func ensureLoaded() async {
+        loadIfNeeded()
+        await loadTask?.value
+    }
 
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.playlists = decoded.playlists
-                if self.selectedPlaylistID == nil {
-                    self.selectedPlaylistID = self.playlists.first?.id
+    private func loadFromDisk() async {
+        guard let url = playlistsFileURL() else {
+            loadTask = nil
+            return
+        }
+
+        let decoded: StoreFile? = await withCheckedContinuation { continuation in
+            ioQueue.async {
+                guard let data = try? Data(contentsOf: url) else {
+                    continuation.resume(returning: nil)
+                    return
                 }
+                guard let store = try? JSONDecoder().decode(StoreFile.self, from: data), store.version == self.formatVersion else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: store)
             }
         }
+
+        if let decoded {
+            playlists = decoded.playlists
+            if selectedPlaylistID == nil {
+                selectedPlaylistID = playlists.first?.id
+            }
+        }
+
+        loadTask = nil
     }
 
     func createPlaylist(name: String, trackURLs: [URL] = []) {
@@ -80,12 +104,15 @@ final class PlaylistsStore: ObservableObject {
         guard !newTracks.isEmpty else { return }
 
         var existingKeys = Set(playlists[idx].tracks.map { pathKey($0.path) })
+        var existingLegacyKeys = Set(playlists[idx].tracks.map { PathKey.legacy(path: $0.path) })
         var appended: [UserPlaylist.Track] = []
         appended.reserveCapacity(newTracks.count)
         for t in newTracks {
             let k = pathKey(t.path)
-            if existingKeys.contains(k) { continue }
+            let legacy = PathKey.legacy(path: t.path)
+            if existingKeys.contains(k) || existingLegacyKeys.contains(legacy) { continue }
             existingKeys.insert(k)
+            existingLegacyKeys.insert(legacy)
             appended.append(t)
         }
         guard !appended.isEmpty else { return }
@@ -98,9 +125,12 @@ final class PlaylistsStore: ObservableObject {
     func removeTrack(path: String, from playlistID: UserPlaylist.ID) {
         loadIfNeeded()
         guard let idx = playlists.firstIndex(where: { $0.id == playlistID }) else { return }
-        let targetKey = pathKey(path)
+        let targetKeys = Set(pathLookupKeys(path))
         let before = playlists[idx].tracks.count
-        playlists[idx].tracks.removeAll { pathKey($0.path) == targetKey }
+        playlists[idx].tracks.removeAll {
+            let keys = pathLookupKeys($0.path)
+            return keys.contains(where: targetKeys.contains)
+        }
         if playlists[idx].tracks.count != before {
             playlists[idx].updatedAt = Date()
             PlaybackWeights.shared.removeTrack(URL(fileURLWithPath: path), fromPlaylist: playlistID)
@@ -123,7 +153,10 @@ final class PlaylistsStore: ObservableObject {
                 let data = try JSONEncoder().encode(payload)
                 try data.write(to: url, options: .atomic)
             } catch {
-                // Best-effort only.
+                PersistenceLogger.log("保存歌单失败: \(error)")
+                DispatchQueue.main.async {
+                    PersistenceLogger.notifyUser(title: "歌单保存失败", subtitle: "请检查磁盘权限或空间")
+                }
             }
         }
     }
@@ -160,6 +193,10 @@ final class PlaylistsStore: ObservableObject {
     }
 
     private func pathKey(_ path: String) -> String {
-        path.precomposedStringWithCanonicalMapping.lowercased()
+        PathKey.canonical(path: path)
+    }
+
+    private func pathLookupKeys(_ path: String) -> [String] {
+        PathKey.lookupKeys(forPath: path)
     }
 }
