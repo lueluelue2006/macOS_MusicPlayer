@@ -456,3 +456,36 @@ extension PathKeyDiskMigrator {
         case failed(fileName: String)
     }
 }
+
+extension PathKeyDiskMigrator {
+    struct DebugIncrementalRunResult {
+        let didRun: Bool
+        let migrationResult: MigrationResult
+        let savedStateData: Data?
+    }
+
+    static func debugRunIncrementalMigrationForTesting(
+        baseDirectory: URL,
+        previousStateData: Data?
+    ) -> DebugIncrementalRunResult {
+        let beforeState = computeMigrationState(baseDirectory: baseDirectory)
+        let previousState = previousStateData.flatMap { try? JSONDecoder().decode(MigrationState.self, from: $0) }
+
+        if let previousState, previousState == beforeState {
+            return DebugIncrementalRunResult(
+                didRun: false,
+                migrationResult: MigrationResult(changedFiles: 0, changedEntries: 0, failedFiles: []),
+                savedStateData: previousStateData
+            )
+        }
+
+        let result = migrateLegacyLowercasedKeys(baseDirectory: baseDirectory)
+        guard result.failedFiles.isEmpty else {
+            return DebugIncrementalRunResult(didRun: true, migrationResult: result, savedStateData: previousStateData)
+        }
+
+        let afterState = computeMigrationState(baseDirectory: baseDirectory)
+        let stateData = try? JSONEncoder().encode(afterState)
+        return DebugIncrementalRunResult(didRun: true, migrationResult: result, savedStateData: stateData)
+    }
+}

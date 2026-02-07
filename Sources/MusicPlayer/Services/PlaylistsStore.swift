@@ -200,3 +200,12 @@ final class PlaylistsStore: ObservableObject {
         PathKey.lookupKeys(forPath: path)
     }
 }
+
+extension PlaylistsStore {
+    func debugSetPlaylistsForTesting(_ items: [UserPlaylist], selectedID: UserPlaylist.ID? = nil) {
+        playlists = items
+        selectedPlaylistID = selectedID ?? items.first?.id
+        isLoaded = true
+        loadTask = nil
+    }
+}

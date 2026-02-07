@@ -115,6 +115,10 @@ struct MusicPlayerApp: App {
         }
         #endif
 
+        Task.detached(priority: .background) {
+            await RegressionTests.runIfEnabled()
+        }
+
         // System notifications: only available when running as a bundled .app.
         if Bundle.main.bundleURL.pathExtension.lowercased() == "app" {
             let center = UNUserNotificationCenter.current()
