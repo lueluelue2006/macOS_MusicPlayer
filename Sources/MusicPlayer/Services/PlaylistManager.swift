@@ -16,6 +16,10 @@ final class PlaylistManager: ObservableObject {
     private var shuffleQueue: [Int] = []
     private var shuffleIndex = 0
 
+    // Queue path-key -> index cache (accelerates playlist-scope lookup in large libraries).
+    private var queueIndexByPathKey: [String: Int] = [:]
+    private var isQueueIndexCacheDirty: Bool = true
+
     // Playlist-scope playback (order defined by user playlist, not by queue order).
     private var playbackPlaylistTrackKeys: [String] = []
     private var playbackPlaylistPositionByKey: [String: Int] = [:]
@@ -549,6 +553,7 @@ final class PlaylistManager: ObservableObject {
             }
             let oldCount = self.audioFiles.count
             self.audioFiles.append(contentsOf: toAppend)
+            self.invalidateQueueIndexCache()
             self.updateFilteredFiles()
             self.enqueueDurationPrefetch(for: toAppend.map { $0.url })
             self.integrateNewQueueIndicesIntoShuffleQueue(oldCount: oldCount)
@@ -821,6 +826,7 @@ final class PlaylistManager: ObservableObject {
         guard index < audioFiles.count else { return }
         let removedURL = audioFiles[index].url
         audioFiles.remove(at: index)
+        invalidateQueueIndexCache()
         unplayableReasons.removeValue(forKey: pathKey(removedURL))
 
         if audioFiles.isEmpty {
@@ -840,6 +846,7 @@ final class PlaylistManager: ObservableObject {
     func clearAllFiles() {
         cancelDurationPrefetch()
         audioFiles.removeAll()
+        invalidateQueueIndexCache()
         filteredFiles.removeAll()
         currentIndex = 0
         searchText = ""
@@ -905,6 +912,7 @@ final class PlaylistManager: ObservableObject {
 
         let oldCount = audioFiles.count
         audioFiles.append(contentsOf: toAppend)
+        invalidateQueueIndexCache()
         updateFilteredFiles()
         enqueueDurationPrefetch(for: toAppend.map(\.url))
         integrateNewQueueIndicesIntoShuffleQueue(oldCount: oldCount)
@@ -1184,13 +1192,36 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func indexInQueue(forPathKey key: String) -> Int? {
-        let lookupSet = Set(PathKey.lookupKeys(forPath: key))
-        for (idx, file) in audioFiles.enumerated() {
-            if !lookupSet.isDisjoint(with: Set(pathLookupKeys(file.url))) {
+        rebuildQueueIndexCacheIfNeeded()
+        for lookup in PathKey.lookupKeys(forPath: key) {
+            if let idx = queueIndexByPathKey[lookup] {
                 return idx
             }
         }
         return nil
+    }
+
+    private func invalidateQueueIndexCache() {
+        isQueueIndexCacheDirty = true
+    }
+
+    private func rebuildQueueIndexCacheIfNeeded() {
+        guard isQueueIndexCacheDirty else { return }
+        isQueueIndexCacheDirty = false
+
+        var indexMap: [String: Int] = [:]
+        indexMap.reserveCapacity(max(16, audioFiles.count * 2))
+
+        for (idx, file) in audioFiles.enumerated() {
+            let keys = pathLookupKeys(file.url)
+            guard let canonical = keys.first else { continue }
+            indexMap[canonical] = idx
+            for variant in keys.dropFirst() where indexMap[variant] == nil {
+                indexMap[variant] = idx
+            }
+        }
+
+        queueIndexByPathKey = indexMap
     }
 
     private func integrateNewQueueIndicesIntoShuffleQueue(oldCount: Int) {
@@ -1658,6 +1689,7 @@ final class PlaylistManager: ObservableObject {
         let restoredFilesSnapshot = restoredFiles
         await MainActor.run {
             self.audioFiles = restoredFilesSnapshot
+            self.invalidateQueueIndexCache()
             self.currentIndex = 0
             self.updateFilteredFiles()
             self.resetShuffleQueue()
