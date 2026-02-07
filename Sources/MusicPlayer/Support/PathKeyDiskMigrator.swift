@@ -1,11 +1,33 @@
 import Foundation
 
 enum PathKeyDiskMigrator {
+    private static let migrationStateDefaultsKey = "pathKeyMigrationState"
+    private static let migrationVersion = 2
+    private static let trackedFiles: [String] = [
+        "metadata-cache.json",
+        "duration-cache.json",
+        "volume-cache.json",
+        "playback-weights.json",
+        "playlist.json",
+        "user-playlists.json"
+    ]
+
     static func migrateLegacyLowercasedKeysIfNeeded() {
-        let result = migrateLegacyLowercasedKeys()
+        guard let appSupport = appSupportDirectory() else { return }
+
+        let beforeState = computeMigrationState(baseDirectory: appSupport)
+        if let saved = loadMigrationState(), saved == beforeState {
+            return
+        }
+
+        let result = migrateLegacyLowercasedKeys(baseDirectory: appSupport)
         if !result.failedFiles.isEmpty {
             PersistenceLogger.log("路径键迁移未完成，失败文件: \(result.failedFiles.joined(separator: ", "))")
+            return
         }
+
+        let afterState = computeMigrationState(baseDirectory: appSupport)
+        saveMigrationState(afterState)
     }
 
     @discardableResult
@@ -14,12 +36,20 @@ enum PathKeyDiskMigrator {
             return MigrationResult(changedFiles: 0, changedEntries: 0, failedFiles: [])
         }
 
+        let result = migrateLegacyLowercasedKeys(baseDirectory: appSupport)
+        if result.failedFiles.isEmpty {
+            saveMigrationState(computeMigrationState(baseDirectory: appSupport))
+        }
+        return result
+    }
+
+    private static func migrateLegacyLowercasedKeys(baseDirectory: URL) -> MigrationResult {
         var resolverCache: [String: [String]] = [:]
         var changedFiles = 0
         var changedEntries = 0
         var failedFiles: [String] = []
 
-        for task in migrationTasks(baseDirectory: appSupport) {
+        for task in migrationTasks(baseDirectory: baseDirectory) {
             switch task.run(&resolverCache) {
             case .unchanged:
                 break
@@ -42,6 +72,47 @@ enum PathKeyDiskMigrator {
         let fm = FileManager.default
         guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
         return base.appendingPathComponent("MusicPlayer", isDirectory: true)
+    }
+
+    private static func computeMigrationState(baseDirectory: URL) -> MigrationState {
+        var signatures: [String: FileSignature] = [:]
+        signatures.reserveCapacity(trackedFiles.count)
+
+        for fileName in trackedFiles {
+            let fileURL = baseDirectory.appendingPathComponent(fileName, isDirectory: false)
+            signatures[fileName] = fileSignature(of: fileURL)
+        }
+
+        return MigrationState(version: migrationVersion, fileSignatures: signatures)
+    }
+
+    private static func fileSignature(of fileURL: URL) -> FileSignature {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: fileURL.path) else {
+            return .missing
+        }
+
+        do {
+            let values = try fileURL.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            let size = Int64(values.fileSize ?? -1)
+            let mtime = values.contentModificationDate?.timeIntervalSince1970 ?? 0
+            let mtimeNs = Int64((mtime * 1_000_000_000.0).rounded())
+            return .present(size: size, mtimeNs: mtimeNs)
+        } catch {
+            return .missing
+        }
+    }
+
+    private static func loadMigrationState() -> MigrationState? {
+        let defaults = UserDefaults.standard
+        guard let data = defaults.data(forKey: migrationStateDefaultsKey) else { return nil }
+        return try? JSONDecoder().decode(MigrationState.self, from: data)
+    }
+
+    private static func saveMigrationState(_ state: MigrationState) {
+        let defaults = UserDefaults.standard
+        guard let data = try? JSONEncoder().encode(state) else { return }
+        defaults.set(data, forKey: migrationStateDefaultsKey)
     }
 
     private static func migrationTasks(baseDirectory: URL) -> [MigrationTask] {
@@ -358,6 +429,16 @@ extension PathKeyDiskMigrator {
         let changedFiles: Int
         let changedEntries: Int
         let failedFiles: [String]
+    }
+
+    private struct MigrationState: Codable, Equatable {
+        let version: Int
+        let fileSignatures: [String: FileSignature]
+    }
+
+    private enum FileSignature: Codable, Equatable {
+        case missing
+        case present(size: Int64, mtimeNs: Int64)
     }
 
     private struct MigrationTask {
