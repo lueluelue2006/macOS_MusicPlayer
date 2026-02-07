@@ -438,7 +438,6 @@ final class AudioPlayer: NSObject, ObservableObject {
         }
         // 取消尚未完成的加载任务，避免相互打断
         pendingLoadTask?.cancel()
-        self.persistPlaybackState = persist
 
         let isLoop = self.isLooping
         let url = file.url
@@ -464,7 +463,7 @@ final class AudioPlayer: NSObject, ObservableObject {
             prepared.numberOfLoops = isLoop ? -1 : 0
             prepared.enableRate = true
             prepared.rate = self.clampPlaybackRate(self.playbackRate)
-
+            self.persistPlaybackState = persist
             self.currentFile = file
             self.playbackClock.duration = prepared.duration
             self.lastSavedTime = 0
@@ -581,7 +580,7 @@ final class AudioPlayer: NSObject, ObservableObject {
                     newPlayer.delegate = self
                     newPlayer.enableRate = true
                     newPlayer.rate = self.clampPlaybackRate(self.playbackRate)
-
+                    self.persistPlaybackState = persist
 	                    self.currentFile = file
 	                    self.playbackClock.duration = newPlayer.duration
 	                    self.lastSavedTime = 0

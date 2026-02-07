@@ -12,6 +12,7 @@ struct PlaybackControlsView: View {
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
     private var onAccentPillForeground: Color { colorScheme == .dark ? Color.black.opacity(0.86) : Color.white }
+    private var isEphemeralPlayback: Bool { audioPlayer.persistPlaybackState == false }
 
     var body: some View {
         VStack(spacing: 24) {
@@ -47,7 +48,7 @@ struct PlaybackControlsView: View {
                     .animation(AppTheme.quickSpring, value: previousButtonPressed)
                     .animation(AppTheme.quickSpring, value: previousHovered)
                 }
-                .disabled(playlistManager.playbackScopePlayableCount() == 0)
+                .disabled(playlistManager.playbackScopePlayableCount() == 0 || isEphemeralPlayback)
                 .buttonStyle(PlainButtonStyle())
                 .onHover { hovering in previousHovered = hovering }
                 .onLongPressGesture(minimumDuration: 0, maximumDistance: .infinity, pressing: { pressing in
@@ -146,7 +147,7 @@ struct PlaybackControlsView: View {
                     .animation(AppTheme.quickSpring, value: nextButtonPressed)
                     .animation(AppTheme.quickSpring, value: nextHovered)
                 }
-                .disabled(playlistManager.playbackScopePlayableCount() == 0)
+                .disabled(playlistManager.playbackScopePlayableCount() == 0 || isEphemeralPlayback)
                 .buttonStyle(PlainButtonStyle())
                 .onHover { hovering in nextHovered = hovering }
                 .onLongPressGesture(minimumDuration: 0, maximumDistance: .infinity, pressing: { pressing in
@@ -240,9 +241,9 @@ struct PlaybackControlsView: View {
                                     .shadow(color: Color.orange.opacity(0.3), radius: 4, x: 0, y: 2)
                             )
                     }
-                    .disabled(playlistManager.playbackScopePlayableCount() < 2)
+                    .disabled(playlistManager.playbackScopePlayableCount() < 2 || isEphemeralPlayback)
                     .buttonStyle(PlainButtonStyle())
-                    .help("随机播放一首新歌")
+                    .help(isEphemeralPlayback ? "临时播放模式下不可切歌" : "随机播放一首新歌")
                 }
             }
         }
@@ -258,18 +259,21 @@ struct PlaybackControlsView: View {
     }
     
     private func nextTrack() {
+        guard !isEphemeralPlayback else { return }
         if let nextFile = playlistManager.nextFile(isShuffling: audioPlayer.isShuffling) {
             audioPlayer.play(nextFile)
         }
     }
     
     private func previousTrack() {
+        guard !isEphemeralPlayback else { return }
         if let previousFile = playlistManager.previousFile(isShuffling: audioPlayer.isShuffling) {
             audioPlayer.play(previousFile)
         }
     }
     
     private func playRandomTrack() {
+        guard !isEphemeralPlayback else { return }
         if let randomFile = playlistManager.getRandomFileExcludingCurrent() {
             audioPlayer.play(randomFile)
         }

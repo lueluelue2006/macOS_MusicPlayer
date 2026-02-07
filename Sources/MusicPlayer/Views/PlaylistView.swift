@@ -43,6 +43,38 @@ struct PlaylistView: View {
         nonmutating set { panelModeRaw = newValue.rawValue }
     }
 
+    private struct PlaybackScopeBadge {
+        let title: String
+        let targetPanel: PanelMode
+        let help: String
+    }
+
+    private var scopeIndicatorSystemName: String {
+        if audioPlayer.isLooping { return "repeat" }
+        if audioPlayer.isShuffling { return "shuffle" }
+        return "play.fill"
+    }
+
+    private var activePlaybackScopeBadge: PlaybackScopeBadge? {
+        guard audioPlayer.currentFile != nil, audioPlayer.persistPlaybackState else { return nil }
+
+        switch playlistManager.playbackScope {
+        case .queue:
+            return PlaybackScopeBadge(
+                title: "播放中：队列",
+                targetPanel: .queue,
+                help: "当前播放范围为队列，下一首/随机将作用于队列"
+            )
+        case .playlist(let id):
+            let name = playlistsStore.playlist(for: id)?.name ?? "歌单"
+            return PlaybackScopeBadge(
+                title: "播放中：\(name)",
+                targetPanel: .playlists,
+                help: "当前播放范围为歌单，下一首/随机将作用于该歌单"
+            )
+        }
+    }
+
     private var currentHighlightedURL: URL? {
         // For normal playback (queue-based), rely on PlaylistManager selection to avoid any
         // transient `AudioPlayer.currentFile` toggling during async loads.
@@ -55,29 +87,6 @@ struct PlaylistView: View {
         return audioPlayer.currentFile?.url
     }
 
-    private var activePlaybackScope: PlaybackScope? {
-        guard audioPlayer.currentFile != nil, audioPlayer.persistPlaybackState else { return nil }
-        return playlistManager.playbackScope
-    }
-
-    private var scopeIndicatorSystemName: String {
-        audioPlayer.isShuffling ? "shuffle.circle.fill" : "play.circle.fill"
-    }
-
-    @ViewBuilder
-    private func panelModeSegmentLabel(title: String, isActiveScope: Bool) -> some View {
-        ZStack {
-            Text(title)
-                .frame(maxWidth: .infinity, alignment: .center)
-
-            if isActiveScope {
-                ActivePlaybackScopeIndicator(systemName: scopeIndicatorSystemName, isPlaying: audioPlayer.isPlaying)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                    .padding(.trailing, 6)
-            }
-        }
-        .frame(maxWidth: .infinity)
-    }
     
     // 确保窗口在视图销毁时被清理
     init(audioPlayer: AudioPlayer, playlistManager: PlaylistManager, playlistsStore: PlaylistsStore) {
@@ -101,25 +110,41 @@ struct PlaylistView: View {
                         .foregroundColor(.primary)
 
                     Picker("", selection: $panelModeRaw) {
-                        panelModeSegmentLabel(
-                            title: "队列",
-                            isActiveScope: activePlaybackScope == .queue
-                        )
-                        .tag(PanelMode.queue.rawValue)
-
-                        panelModeSegmentLabel(
-                            title: "歌单",
-                            isActiveScope: {
-                                guard let scope = activePlaybackScope else { return false }
-                                if case .playlist = scope { return true }
-                                return false
-                            }()
-                        )
-                        .tag(PanelMode.playlists.rawValue)
+                        Text("队列").tag(PanelMode.queue.rawValue)
+                        Text("歌单").tag(PanelMode.playlists.rawValue)
                     }
                     .pickerStyle(.segmented)
                     .frame(width: 150)
                     .labelsHidden()
+
+                    if let scopeBadge = activePlaybackScopeBadge {
+                        Button(action: {
+                            panelMode = scopeBadge.targetPanel
+                            NotificationCenter.default.post(name: .blurSearchField, object: nil)
+                        }) {
+                            HStack(spacing: 6) {
+                                ActivePlaybackScopeIndicator(systemName: scopeIndicatorSystemName, isPlaying: audioPlayer.isPlaying)
+                                Text(scopeBadge.title)
+                                    .font(.caption)
+                                    .fontWeight(.semibold)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .fill(theme.mutedSurface)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 10)
+                                            .stroke(theme.stroke, lineWidth: 1)
+                                    )
+                            )
+                            .foregroundStyle(theme.accentGradient)
+                        }
+                        .buttonStyle(.plain)
+                        .help(scopeBadge.help)
+                    }
                 }
                 
                 Spacer()

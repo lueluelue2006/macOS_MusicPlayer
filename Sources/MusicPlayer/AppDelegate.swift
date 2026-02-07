@@ -144,32 +144,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if filtered.isEmpty { return }
 
         // 标记本次启动（或本次外部打开）应跳过“恢复上次播放”
-        DispatchQueue.main.async {
-            audioPlayer.markSkipRestoreThisLaunch()
-        }
+        audioPlayer.markSkipRestoreThisLaunch()
 
         // 构建 AudioFile（使用现有的元数据读取逻辑，避免首次打开信息不全）
         Task { [weak self] in
             guard let self = self else { return }
-            let files: [AudioFile] = await withTaskGroup(of: AudioFile?.self) { group in
-                for url in filtered {
+            let files: [AudioFile] = await withTaskGroup(of: (Int, AudioFile?).self) { group in
+                for (index, url) in filtered.enumerated() {
                     group.addTask { [weak self] in
-                        guard let self = self else { return nil }
+                        guard let self = self else { return (index, nil) }
                         if let pm = self.playlistManager {
                             let md = await pm.loadFreshMetadata(from: url)
-                            return AudioFile(url: url, metadata: md)
+                            return (index, AudioFile(url: url, metadata: md))
                         } else {
                             let asset = AVURLAsset(url: url)
                             let md = await AudioMetadata.load(from: asset, includeArtwork: false)
-                            return AudioFile(url: url, metadata: md)
+                            return (index, AudioFile(url: url, metadata: md))
                         }
                     }
                 }
-                var built: [AudioFile] = []
-                for await item in group {
-                    if let f = item { built.append(f) }
+                var built: [AudioFile?] = Array(repeating: nil, count: filtered.count)
+                for await (index, item) in group {
+                    built[index] = item
                 }
-                return built
+                return built.compactMap { $0 }
             }
 
             // 仅播放，不加入/不保存到播放列表
