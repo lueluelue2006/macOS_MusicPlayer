@@ -71,3 +71,13 @@ gh release delete vOLD -R lueluelue2006/macOS_MusicPlayer --yes
 - DMG、`SHA256SUMS.txt` 等发布产物默认不提交到源码仓库（除非用户明确要求）。
 - 发现仅用于发布流程的临时产物，应及时清理或加入忽略策略，避免污染工作区。
 
+
+## 本地验收部署流程（默认强制）
+
+- 每次完成代码修改后，必须执行构建并给用户可测版本：
+  1) `./build.sh`
+  2) 直接覆盖 `/Applications/MusicPlayer.app`
+  3) `open /Applications/MusicPlayer.app` 启动供用户测试
+- 覆盖安装时**不做任何备份**（不创建 `.bak`、`bak-update` 等目录）。
+- 禁止在 `/Applications` 保留旧备份副本，保持应用目录整洁。
+- 由于仓库已用 Git 管理版本，回退依赖 Git/Release，不依赖本机 app 备份。
