@@ -55,3 +55,19 @@ gh release view vX.Y.Z -R lueluelue2006/macOS_MusicPlayer --json assets,url
 # 删除旧 patch release（保留 tag）
 gh release delete vOLD -R lueluelue2006/macOS_MusicPlayer --yes
 ```
+
+### 5) 发布细节规范（必须）
+
+- Release 文案必须使用 `--notes-file`（或 `--notes-file` + 本地 markdown 文件），避免 `\n` 字面量导致页面格式错乱。
+- 上传资产前必须校验架构：
+  - Apple Silicon 包内可执行文件应为 `arm64`
+  - Intel 包内可执行文件应为 `x86_64`
+  - 建议命令：`file MusicPlayer.app/Contents/MacOS/MusicPlayer`、`file MusicPlayer-intel.app/Contents/MacOS/MusicPlayer`
+- `SHA256SUMS.txt` 必须覆盖当次发布的两个 DMG（M 芯片 + Intel）。
+- 发布后必须复查 Release 页面展示（文案格式、资产数量、文件名）。
+
+### 6) 发布产物与仓库卫生
+
+- DMG、`SHA256SUMS.txt` 等发布产物默认不提交到源码仓库（除非用户明确要求）。
+- 发现仅用于发布流程的临时产物，应及时清理或加入忽略策略，避免污染工作区。
+
