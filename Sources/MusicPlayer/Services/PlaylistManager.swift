@@ -49,6 +49,7 @@ final class PlaylistManager: ObservableObject {
         let currentIndex: Int
     }
     private let playlistFileName = "playlist.json"
+    private let isRunningRegressionTests = ProcessInfo.processInfo.environment["MUSICPLAYER_RUN_REGRESSION_TESTS"] == "1"
     private let playlistIOQueue = DispatchQueue(label: "playlist.persistence", qos: .utility)
     private let playlistIOQueueKey = DispatchSpecificKey<Void>()
     private let metadataGate = ConcurrencyGate(maxConcurrent: 4) // 限制元数据加载并发
@@ -1609,6 +1610,10 @@ final class PlaylistManager: ObservableObject {
     
     // MARK: - 保存和加载播放列表
     func savePlaylist() {
+        if isRunningRegressionTests {
+            debugLog("回归测试模式：跳过播放列表持久化写盘")
+            return
+        }
         let snapshot = SavedPlaylist(paths: audioFiles.map { $0.url.path }, currentIndex: currentIndex)
         debugLog("保存播放列表: \(snapshot.paths.count) 个文件, 当前索引: \(snapshot.currentIndex)")
         guard let url = playlistFileURL() else {
@@ -1790,6 +1795,9 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func savePlaylistToDisk(_ snapshot: SavedPlaylist) -> Bool {
+        if isRunningRegressionTests {
+            return true
+        }
         guard let url = playlistFileURL() else { return false }
         let isOnIOQueue = DispatchQueue.getSpecific(key: playlistIOQueueKey) != nil
         let write = {
