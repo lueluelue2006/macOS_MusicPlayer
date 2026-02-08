@@ -1239,23 +1239,33 @@ extension AudioPlayer {
         }
     }
 
-    private func setPlayerVolume(_ targetVolume: Float, mode: VolumeApplyMode) {
-        let clamped = max(0, min(1, targetVolume))
-        DispatchQueue.main.async { [weak self] in
-            guard let self, let player = self.player else { return }
-            switch mode {
-            case .immediate:
+    private func applyPlayerVolumeOnMain(_ clamped: Float, mode: VolumeApplyMode) {
+        guard let player = self.player else { return }
+        switch mode {
+        case .immediate:
+            self.volumeRampTask?.cancel()
+            player.volume = clamped
+        case .smooth:
+            let duration = self.normalizationFadeDuration
+            guard duration > 0, self.isPlaying else {
                 self.volumeRampTask?.cancel()
                 player.volume = clamped
-            case .smooth:
-                let duration = self.normalizationFadeDuration
-                guard duration > 0, self.isPlaying else {
-                    self.volumeRampTask?.cancel()
-                    player.volume = clamped
-                    return
-                }
-                self.startVolumeRamp(on: player, to: clamped, duration: duration)
+                return
             }
+            self.startVolumeRamp(on: player, to: clamped, duration: duration)
+        }
+    }
+
+    private func setPlayerVolume(_ targetVolume: Float, mode: VolumeApplyMode) {
+        let clamped = max(0, min(1, targetVolume))
+        let apply: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.applyPlayerVolumeOnMain(clamped, mode: mode)
+        }
+        if Thread.isMainThread {
+            apply()
+        } else {
+            DispatchQueue.main.async(execute: apply)
         }
     }
 	    
