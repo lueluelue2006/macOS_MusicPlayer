@@ -253,7 +253,7 @@ struct ContentView: View {
         // 已经排队等待执行，则不重复创建任务
         guard updateCheckTask == nil else { return }
 
-        let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "3.8"
+        let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "3.8.2"
         updateCheckTask = Task(priority: .background) {
             // 延迟一点：让加载/恢复后的 UI 与磁盘/元数据任务先跑一会儿
             do {
@@ -270,7 +270,7 @@ struct ContentView: View {
         updateCheckTask?.cancel()
         updateCheckTask = nil
 
-        let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "3.8"
+        let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "3.8.2"
         showToastMessage("正在检查更新…", kind: .update, duration: 2.0)
         updateCheckTask = Task(priority: .userInitiated) {
             await runUpdateCheck(currentVersion: currentVersion, markLaunchChecked: true)

@@ -27,6 +27,7 @@ struct PlaylistView: View {
     @State private var metadataEditWindow: NSWindow?
     @State private var windowDelegate: MetadataWindowDelegate?
     @State private var queueScrollTargetID: String?
+    @State private var queueVisibleFiles: [AudioFile] = []
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
@@ -317,12 +318,11 @@ struct PlaylistView: View {
                     }
                     
                     // 播放列表
-                    let visibleFiles = sortState.option(for: .queue).applying(to: playlistManager.filteredFiles, weightScope: .queue)
-                    if visibleFiles.isEmpty {
+                    if queueVisibleFiles.isEmpty {
                         EmptyPlaylistView()
                     } else {
                         ScrollViewReader { proxy in
-		                    List(visibleFiles) { file in
+			                    List(queueVisibleFiles) { file in
 		                        PlaylistItemView(
 		                            file: file,
 		                            isCurrentTrack: currentHighlightedURL == file.url,
@@ -412,11 +412,24 @@ struct PlaylistView: View {
         .background(theme.surface)
         .onAppear {
             AppFocusState.shared.activeSearchTarget = (panelMode == .queue) ? .queue : .playlists
+            refreshQueueVisibleFiles()
+        }
+        .onReceive(playlistManager.$filteredFiles) { _ in
+            refreshQueueVisibleFiles()
+        }
+        .onReceive(sortState.objectWillChange) { _ in
+            refreshQueueVisibleFiles()
+        }
+        .onChange(of: weights.revision) { _ in
+            refreshQueueVisibleFiles()
         }
         .onChange(of: panelModeRaw) { _ in
             AppFocusState.shared.activeSearchTarget = (panelMode == .queue) ? .queue : .playlists
             // 切换面板时清掉旧的搜索框焦点，避免 Cmd+F 来回跳
             NotificationCenter.default.post(name: .blurSearchField, object: nil)
+            if panelMode == .queue {
+                refreshQueueVisibleFiles()
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .switchPlaylistPanelToQueue)) { _ in
             panelMode = .queue
@@ -457,6 +470,11 @@ struct PlaylistView: View {
         // Ensure the current track is visible.
         playlistManager.searchFiles("")
         queueScrollTargetID = id
+    }
+
+    @MainActor
+    private func refreshQueueVisibleFiles() {
+        queueVisibleFiles = sortState.option(for: .queue).applying(to: playlistManager.filteredFiles, weightScope: .queue)
     }
 
     @MainActor

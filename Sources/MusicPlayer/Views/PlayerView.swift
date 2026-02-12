@@ -194,28 +194,19 @@ struct FlowingBorder: View {
     // One full cycle duration. Larger = slower flow.
     var period: TimeInterval = 10.4
     var phaseOffset: Double = 0
+    @State private var rotation: Double = 0
 
     var body: some View {
-        if enabled {
-            TimelineView(.animation) { timeline in
-                let angle = rotationAngle(for: timeline.date)
-                RoundedRectangle(cornerRadius: cornerRadius)
-                    .strokeBorder(gradient(angle: angle), lineWidth: lineWidth)
-            }
-        } else {
-            RoundedRectangle(cornerRadius: cornerRadius)
-                .strokeBorder(gradient(angle: 0), lineWidth: lineWidth)
-        }
+        RoundedRectangle(cornerRadius: cornerRadius)
+            .strokeBorder(borderGradient, lineWidth: lineWidth)
+            // Rasterize the gradient border once, then rotate the texture.
+            .drawingGroup()
+            .rotationEffect(.degrees(rotation))
+            .onAppear { updateAnimation(enabled: enabled) }
+            .onChange(of: enabled) { updateAnimation(enabled: $0) }
     }
 
-    private func rotationAngle(for date: Date) -> Double {
-        guard period > 0 else { return 0 }
-        let t = date.timeIntervalSinceReferenceDate
-        let phase = (t / period + phaseOffset).truncatingRemainder(dividingBy: 1)
-        return phase * 360
-    }
-
-    private func gradient(angle: Double) -> AngularGradient {
+    private var borderGradient: AngularGradient {
         let glowA = base.opacity(0.95)
         let glowB = secondary.opacity(0.95)
 
@@ -230,9 +221,31 @@ struct FlowingBorder: View {
                 .init(color: .clear, location: 1.00),
             ]),
             center: .center,
-            startAngle: .degrees(angle),
-            endAngle: .degrees(angle + 360)
+            startAngle: .degrees(0),
+            endAngle: .degrees(360)
         )
+    }
+
+    private func updateAnimation(enabled: Bool) {
+        let baseAngle = phaseOffset * 360
+        if enabled && period > 0 {
+            var transaction = Transaction()
+            transaction.animation = nil
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                rotation = baseAngle
+            }
+            withAnimation(.linear(duration: period).repeatForever(autoreverses: false)) {
+                rotation = baseAngle + 360
+            }
+        } else {
+            var transaction = Transaction()
+            transaction.animation = nil
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                rotation = 0
+            }
+        }
     }
 }
 
@@ -256,7 +269,7 @@ struct CurrentTrackView: View {
                 // 专辑封面
                 ZStack {
                     // 动态光晕背景（播放时旋转）
-                    if audioPlayer.isPlaying {
+                    if audioPlayer.isPlaying && !reduceMotion {
                         // 外层彩色光晕
                         Circle()
                             .fill(
@@ -273,9 +286,11 @@ struct CurrentTrackView: View {
                                 )
                             )
                             .frame(width: coverContainerSize - 40, height: coverContainerSize - 40)
-                            .blur(radius: 40)
+                            .blur(radius: 24)
+                            // Rasterize expensive gradient+blur, rotate as a texture.
+                            .drawingGroup()
                             .rotationEffect(.degrees(glowRotation))
-                            .opacity(0.6)
+                            .opacity(0.55)
                     }
 
                     // 主封面

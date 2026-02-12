@@ -155,37 +155,65 @@ extension SearchSortOption {
             return weights.level(for: f.url, scope: scope).rawValue
         }
 
-        let sorted = files.enumerated().sorted { lhs, rhs in
-            let a = lhs.element
-            let b = rhs.element
+        struct SortRow {
+            let file: AudioFile
+            let offset: Int
+            let title: String
+            let artist: String?
+            let duration: TimeInterval?
+            let format: String?
+            let name: String
+            let weight: Int
+        }
 
+        let rows: [SortRow] = files.enumerated().map { entry in
+            let file = entry.element
+            let weightValue: Int
+            if field == .weight {
+                weightValue = weightLevel(file)
+            } else {
+                weightValue = 0
+            }
+            return SortRow(
+                file: file,
+                offset: entry.offset,
+                title: titleKey(file),
+                artist: artistKey(file),
+                duration: file.duration,
+                format: formatKey(file),
+                name: file.url.lastPathComponent,
+                weight: weightValue
+            )
+        }
+
+        let sorted = rows.sorted { lhs, rhs in
             let primary: Int = {
                 switch field {
                 case .original:
                     return 0
                 case .weight:
-                    return compareIntDirected(weightLevel(a), weightLevel(b))
+                    return compareIntDirected(lhs.weight, rhs.weight)
                 case .title:
-                    return compareStringDirected(titleKey(a), titleKey(b))
+                    return compareStringDirected(lhs.title, rhs.title)
                 case .artist:
-                    return compareOptionalStringDirected(artistKey(a), artistKey(b))
+                    return compareOptionalStringDirected(lhs.artist, rhs.artist)
                 case .duration:
-                    return compareDurationDirected(a.duration, b.duration)
+                    return compareDurationDirected(lhs.duration, rhs.duration)
                 case .format:
-                    return compareOptionalStringDirected(formatKey(a), formatKey(b))
+                    return compareOptionalStringDirected(lhs.format, rhs.format)
                 }
             }()
 
             if primary != 0 { return primary < 0 }
 
             // Tie-breakers: keep stable and predictable regardless of sort direction.
-            let t = compareStringAscending(titleKey(a), titleKey(b))
+            let t = compareStringAscending(lhs.title, rhs.title)
             if t != 0 { return t < 0 }
-            let n = compareStringAscending(a.url.lastPathComponent, b.url.lastPathComponent)
+            let n = compareStringAscending(lhs.name, rhs.name)
             if n != 0 { return n < 0 }
             return lhs.offset < rhs.offset
         }
 
-        return sorted.map(\.element)
+        return sorted.map(\.file)
     }
 }

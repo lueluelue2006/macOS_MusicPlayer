@@ -27,16 +27,9 @@ struct SearchSortButton: View {
         } label: {
             ZStack {
                 if isActive {
-                    if reduceMotion {
-                        activeBackground(phase: 0.65)
-                    } else {
-                        TimelineView(.periodic(from: .now, by: 1.0 / 30.0)) { context in
-                            let t = context.date.timeIntervalSinceReferenceDate
-                            let period = 1.8
-                            let phase = (sin(t * (2.0 * .pi) / period) + 1.0) / 2.0 // 0..1
-                            activeBackground(phase: phase)
-                        }
-                    }
+                    // Avoid periodic TimelineView refresh: it can trigger expensive re-render work in large lists.
+                    activeBackground(phase: 0.72)
+                        .transition(.opacity)
                 }
 
                 Image(systemName: isActive ? "arrow.up.arrow.down.circle.fill" : "arrow.up.arrow.down")
