@@ -383,12 +383,11 @@ struct PlaylistView: View {
 	                        .scrollContentBackground(.hidden)
                             .onChange(of: queueScrollTargetID) { target in
                                 guard let target else { return }
-                                withAnimation(.easeInOut(duration: 0.2)) {
-                                    proxy.scrollTo(target, anchor: .center)
-                                }
-                                DispatchQueue.main.async {
-                                    queueScrollTargetID = nil
-                                }
+                                scrollToQueueTrackIfPossible(targetID: target, proxy: proxy)
+                            }
+                            .onChange(of: queueVisibleFiles.map(\.id)) { _ in
+                                guard let target = queueScrollTargetID else { return }
+                                scrollToQueueTrackIfPossible(targetID: target, proxy: proxy)
                             }
                         }
                     }
@@ -456,12 +455,10 @@ struct PlaylistView: View {
 
     private func nowPlayingIDInQueue() -> String? {
         guard let url = currentHighlightedURL else { return nil }
-        let key =
-            url.standardizedFileURL.path
-                .precomposedStringWithCanonicalMapping
-                .lowercased()
-        guard playlistManager.audioFiles.contains(where: { $0.id == key }) else { return nil }
-        return key
+        let id = PathKey.canonical(for: url)
+        let idLookup = Set(PathKey.lookupKeys(for: url))
+        guard playlistManager.audioFiles.contains(where: { !idLookup.isDisjoint(with: Set(PathKey.lookupKeys(for: $0.url))) }) else { return nil }
+        return id
     }
 
     @MainActor
@@ -470,6 +467,17 @@ struct PlaylistView: View {
         // Ensure the current track is visible.
         playlistManager.searchFiles("")
         queueScrollTargetID = id
+    }
+
+    @MainActor
+    private func scrollToQueueTrackIfPossible(targetID: String, proxy: ScrollViewProxy) {
+        guard queueVisibleFiles.contains(where: { $0.id == targetID }) else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            proxy.scrollTo(targetID, anchor: .center)
+        }
+        DispatchQueue.main.async {
+            queueScrollTargetID = nil
+        }
     }
 
     @MainActor
