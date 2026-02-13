@@ -27,6 +27,16 @@ This file is intended for AI coding assistants (Codex/Cursor/Claude/etc.). It is
 
 Common commands:
 
+- `musicplayerctl debug on|off|status|snapshot --json`
+- `musicplayerctl queue ls --json --limit 50`
+- `musicplayerctl playlist ls --json`
+- `musicplayerctl playlist tracks selected --json`
+- `musicplayerctl weight get --current`
+- `musicplayerctl analysis status --json`
+- `musicplayerctl analysis options --json`
+- `musicplayerctl cache clear lyrics|artwork|all`
+- `musicplayerctl ipc commands`
+- `musicplayerctl ipc raw <IPCCommand> --arg key=value --path /path --json`
 - `musicplayerctl ping`
 - `musicplayerctl status --json`
 - `musicplayerctl play <keyword...>` / `musicplayerctl play --index <n>`

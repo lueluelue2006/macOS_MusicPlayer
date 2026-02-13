@@ -28,7 +28,7 @@ struct MusicPlayerApp: App {
 	        let playlistManager = PlaylistManager()
 	        let playlistsStore = PlaylistsStore()
 	        let playbackCoordinator = PlaybackCoordinator(audioPlayer: audioPlayer, playlistManager: playlistManager)
-	        let ipcServer = IPCServer(audioPlayer: audioPlayer, playlistManager: playlistManager)
+	        let ipcServer = IPCServer(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
 
         let audioRouteMonitor = AudioRouteMonitor(
             onHeadphonesDisconnected: { [weak audioPlayer] in

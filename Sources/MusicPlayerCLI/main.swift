@@ -19,6 +19,14 @@ private func printUsage() {
           musicplayerctl <command> [options]
 
         commands:
+          debug <on|off|toggle|status|snapshot> [options]
+          queue <ls|clear|search|locate|scan-subfolders|refresh> [options]
+          playlist <ls|tracks|create|rename|delete|select|add|remove|play|scope|locate> [options]
+          weight <get|set|clear|sync> [options]
+          lyrics <show|hide|toggle|status>
+          analysis <status|start|cancel|options> [options]
+          cache clear <lyrics|artwork|all>
+          ipc <commands|raw> [options]
           ping
           status [--json] [--timeout <seconds>]
           bench <folder> [--limit <n> | --all] [--timeout <seconds>]
@@ -178,6 +186,823 @@ private func parseTimeValueSeconds(_ raw: String) -> Double? {
     return max(0, v)
 }
 
+private func parseBoolWord(_ raw: String) -> Bool? {
+    switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "1", "true", "yes", "on", "enabled":
+        return true
+    case "0", "false", "no", "off", "disabled":
+        return false
+    default:
+        return nil
+    }
+}
+
+private func printReplyAsJSON(_ reply: IPCReply) {
+    if let raw = reply.data?["json"], !raw.isEmpty {
+        print(raw)
+        return
+    }
+
+    let payload: [String: Any] = [
+        "ok": reply.ok,
+        "message": reply.message as Any,
+        "data": reply.data as Any
+    ]
+
+    if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]),
+       let text = String(data: data, encoding: .utf8) {
+        print(text)
+    } else {
+        print(payload)
+    }
+}
+
+private func printReplyAsPlain(_ reply: IPCReply) {
+    if let msg = reply.message, !msg.isEmpty {
+        print(msg)
+    }
+
+    guard let data = reply.data, !data.isEmpty else { return }
+
+    let sortedKeys = data.keys.filter { $0 != "json" }.sorted()
+    if sortedKeys.isEmpty {
+        if let raw = data["json"], !raw.isEmpty {
+            print(raw)
+        }
+        return
+    }
+
+    for key in sortedKeys {
+        print("\(key): \(data[key] ?? "")")
+    }
+}
+
+private func finalizeReply(_ reply: IPCReply, json: Bool = false, silentOnSuccess: Bool = false) -> ExitCode {
+    if reply.ok {
+        if !silentOnSuccess {
+            if json {
+                printReplyAsJSON(reply)
+            } else {
+                printReplyAsPlain(reply)
+            }
+        }
+        return .ok
+    }
+
+    if json {
+        printReplyAsJSON(reply)
+    } else {
+        eprint(reply.message ?? "failed")
+    }
+    return .failure
+}
+
+private func sendAndFinalize(
+    command: IPCCommand,
+    arguments: [String: String]? = nil,
+    paths: [String]? = nil,
+    timeout: TimeInterval = 1.5,
+    json: Bool = false,
+    silentOnSuccess: Bool = false
+) -> ExitCode {
+    let request = makeRequest(command: command, arguments: arguments, paths: paths)
+    guard let reply = sendRequest(request, timeoutSeconds: timeout) else {
+        eprint("no reply")
+        return .noReply
+    }
+    return finalizeReply(reply, json: json, silentOnSuccess: silentOnSuccess)
+}
+
+private func parseKeyValue(_ raw: String) -> (String, String)? {
+    guard let index = raw.firstIndex(of: "=") else { return nil }
+    let key = String(raw[..<index]).trimmingCharacters(in: .whitespacesAndNewlines)
+    let value = String(raw[raw.index(after: index)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !key.isEmpty else { return nil }
+    return (key, value)
+}
+
+private let allIPCCommandNames: [String] = [
+    "ping", "status", "benchmarkLoad", "clearLyricsCache", "clearArtworkCache",
+    "setIPCDebugEnabled", "debugSnapshot", "queueSnapshot", "clearQueue", "searchQueue",
+    "setSearchSortOption", "resetSearchSortOption", "toggleSearchSortOption",
+    "playlistsSnapshot", "playlistTracksSnapshot", "createPlaylist", "renamePlaylist", "deletePlaylist",
+    "selectPlaylist", "addTracksToPlaylist", "removeTracksFromPlaylist", "playPlaylistTrack",
+    "setPlaybackScope", "locateNowPlaying", "setWeight", "getWeight", "clearWeights",
+    "syncPlaylistWeightsToQueue", "setLyricsVisible", "toggleLyricsVisible", "volumePreanalysis",
+    "setAnalysisOptions", "setScanSubfolders", "refreshMetadata",
+    "togglePlayPause", "pause", "resume", "next", "previous", "random",
+    "playIndex", "playQuery", "seek", "setVolume", "setRate", "toggleNormalization",
+    "setNormalizationEnabled", "toggleShuffle", "toggleLoop", "add", "remove", "screenshot"
+]
+
+private func handleDebugCommand(_ args: [String]) -> ExitCode {
+    guard let sub = args.first?.lowercased() else {
+        eprint("debug: missing subcommand")
+        return .usage
+    }
+
+    switch sub {
+    case "on":
+        return sendAndFinalize(command: .setIPCDebugEnabled, arguments: ["enabled": "true"])
+    case "off":
+        return sendAndFinalize(command: .setIPCDebugEnabled, arguments: ["enabled": "false"])
+    case "toggle":
+        return sendAndFinalize(command: .setIPCDebugEnabled, arguments: ["enabled": "toggle"])
+    case "status":
+        var json = false
+        var timeoutSeconds: TimeInterval = 1.5
+        var i = 1
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--json":
+                json = true
+                i += 1
+            case "--timeout":
+                guard i + 1 < args.count else { eprint("debug status: --timeout needs a value"); return .usage }
+                guard let t = parseTimeout(args[i + 1]) else { eprint("debug status: invalid timeout"); return .usage }
+                timeoutSeconds = t
+                i += 2
+            default:
+                eprint("debug status: unknown option \(a)")
+                return .usage
+            }
+        }
+
+        let req = makeRequest(command: .status)
+        guard let reply = sendRequest(req, timeoutSeconds: timeoutSeconds) else {
+            eprint("no reply")
+            return .noReply
+        }
+        if json {
+            return finalizeReply(reply, json: true)
+        }
+        if !reply.ok {
+            eprint(reply.message ?? "failed")
+            return .failure
+        }
+        print("enabled: \(reply.data?["ipcDebugEnabled"] ?? "unknown")")
+        return .ok
+
+    case "snapshot":
+        var json = false
+        var timeoutSeconds: TimeInterval = 2.0
+        var queueLimit = "40"
+
+        var i = 1
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--json":
+                json = true
+                i += 1
+            case "--queue-limit":
+                guard i + 1 < args.count else { eprint("debug snapshot: --queue-limit needs a value"); return .usage }
+                queueLimit = args[i + 1]
+                i += 2
+            case "--timeout":
+                guard i + 1 < args.count else { eprint("debug snapshot: --timeout needs a value"); return .usage }
+                guard let t = parseTimeout(args[i + 1]) else { eprint("debug snapshot: invalid timeout"); return .usage }
+                timeoutSeconds = t
+                i += 2
+            default:
+                eprint("debug snapshot: unknown option \(a)")
+                return .usage
+            }
+        }
+
+        return sendAndFinalize(command: .debugSnapshot, arguments: ["queueLimit": queueLimit], timeout: timeoutSeconds, json: json)
+    default:
+        eprint("debug: unknown subcommand \(sub)")
+        return .usage
+    }
+}
+
+private func handleQueueCommand(_ args: [String]) -> ExitCode {
+    guard let sub = args.first?.lowercased() else {
+        eprint("queue: missing subcommand")
+        return .usage
+    }
+
+    switch sub {
+    case "ls", "list":
+        var json = false
+        var timeoutSeconds: TimeInterval = 2.0
+        var limit = "200"
+        var offset = "0"
+
+        var i = 1
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--json":
+                json = true
+                i += 1
+            case "--limit":
+                guard i + 1 < args.count else { eprint("queue ls: --limit needs a value"); return .usage }
+                limit = args[i + 1]
+                i += 2
+            case "--offset":
+                guard i + 1 < args.count else { eprint("queue ls: --offset needs a value"); return .usage }
+                offset = args[i + 1]
+                i += 2
+            case "--timeout":
+                guard i + 1 < args.count else { eprint("queue ls: --timeout needs a value"); return .usage }
+                guard let t = parseTimeout(args[i + 1]) else { eprint("queue ls: invalid timeout"); return .usage }
+                timeoutSeconds = t
+                i += 2
+            default:
+                eprint("queue ls: unknown option \(a)")
+                return .usage
+            }
+        }
+
+        return sendAndFinalize(
+            command: .queueSnapshot,
+            arguments: ["limit": limit, "offset": offset],
+            timeout: timeoutSeconds,
+            json: json
+        )
+    case "clear":
+        return sendAndFinalize(command: .clearQueue)
+    case "search":
+        let query = Array(args.dropFirst()).joined(separator: " ")
+        return sendAndFinalize(command: .searchQueue, arguments: ["query": query])
+    case "locate":
+        return sendAndFinalize(command: .locateNowPlaying, arguments: ["target": "queue"])
+    case "scan-subfolders":
+        guard args.count >= 2 else { eprint("queue scan-subfolders: missing on/off"); return .usage }
+        guard let enabled = parseBoolWord(args[1]) else { eprint("queue scan-subfolders: invalid value"); return .usage }
+        return sendAndFinalize(command: .setScanSubfolders, arguments: ["enabled": enabled ? "true" : "false"])
+    case "refresh":
+        let mode = (args.count >= 2) ? args[1] : "all"
+        return sendAndFinalize(command: .refreshMetadata, arguments: ["mode": mode], timeout: 30.0)
+    default:
+        eprint("queue: unknown subcommand \(sub)")
+        return .usage
+    }
+}
+
+private func handlePlaylistCommand(_ args: [String]) -> ExitCode {
+    guard let sub = args.first?.lowercased() else {
+        eprint("playlist: missing subcommand")
+        return .usage
+    }
+
+    switch sub {
+    case "ls", "list":
+        var json = false
+        var timeoutSeconds: TimeInterval = 2.0
+        var i = 1
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--json":
+                json = true
+                i += 1
+            case "--timeout":
+                guard i + 1 < args.count else { eprint("playlist ls: --timeout needs a value"); return .usage }
+                guard let t = parseTimeout(args[i + 1]) else { eprint("playlist ls: invalid timeout"); return .usage }
+                timeoutSeconds = t
+                i += 2
+            default:
+                eprint("playlist ls: unknown option \(a)")
+                return .usage
+            }
+        }
+        return sendAndFinalize(command: .playlistsSnapshot, timeout: timeoutSeconds, json: json)
+
+    case "tracks":
+        var json = false
+        var timeoutSeconds: TimeInterval = 2.0
+        var limit = "200"
+        var offset = "0"
+        var playlistID: String?
+
+        var i = 1
+        if i < args.count, !args[i].hasPrefix("--") {
+            if args[i].lowercased() != "selected" {
+                playlistID = args[i]
+            }
+            i += 1
+        }
+
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--json":
+                json = true
+                i += 1
+            case "--limit":
+                guard i + 1 < args.count else { eprint("playlist tracks: --limit needs a value"); return .usage }
+                limit = args[i + 1]
+                i += 2
+            case "--offset":
+                guard i + 1 < args.count else { eprint("playlist tracks: --offset needs a value"); return .usage }
+                offset = args[i + 1]
+                i += 2
+            case "--timeout":
+                guard i + 1 < args.count else { eprint("playlist tracks: --timeout needs a value"); return .usage }
+                guard let t = parseTimeout(args[i + 1]) else { eprint("playlist tracks: invalid timeout"); return .usage }
+                timeoutSeconds = t
+                i += 2
+            default:
+                eprint("playlist tracks: unknown option \(a)")
+                return .usage
+            }
+        }
+
+        var reqArgs: [String: String] = ["limit": limit, "offset": offset]
+        if let playlistID { reqArgs["playlistID"] = playlistID }
+        return sendAndFinalize(command: .playlistTracksSnapshot, arguments: reqArgs, timeout: timeoutSeconds, json: json)
+
+    case "create":
+        let name = Array(args.dropFirst()).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { eprint("playlist create: missing name"); return .usage }
+        return sendAndFinalize(command: .createPlaylist, arguments: ["name": name])
+
+    case "rename":
+        guard args.count >= 3 else { eprint("playlist rename: usage playlist rename <playlistID> <name>"); return .usage }
+        let playlistID = args[1]
+        let name = Array(args.dropFirst(2)).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { eprint("playlist rename: missing name"); return .usage }
+        return sendAndFinalize(command: .renamePlaylist, arguments: ["playlistID": playlistID, "name": name])
+
+    case "delete":
+        guard args.count >= 2 else { eprint("playlist delete: missing playlistID"); return .usage }
+        return sendAndFinalize(command: .deletePlaylist, arguments: ["playlistID": args[1]])
+
+    case "select":
+        guard args.count >= 2 else { eprint("playlist select: missing playlistID"); return .usage }
+        return sendAndFinalize(command: .selectPlaylist, arguments: ["playlistID": args[1]])
+
+    case "add":
+        guard args.count >= 3 else { eprint("playlist add: usage playlist add <playlistID> <path...>"); return .usage }
+        let playlistID = args[1]
+        let paths = Array(args.dropFirst(2))
+        return sendAndFinalize(command: .addTracksToPlaylist, arguments: ["playlistID": playlistID], paths: paths, timeout: 3.0)
+
+    case "remove":
+        guard args.count >= 3 else {
+            eprint("playlist remove: usage playlist remove <playlistID> [--index n | --path path | [--all] query]")
+            return .usage
+        }
+
+        let playlistID = args[1]
+        var reqArgs: [String: String] = ["playlistID": playlistID]
+        var queryParts: [String] = []
+        var i = 2
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--index":
+                guard i + 1 < args.count else { eprint("playlist remove: --index needs a value"); return .usage }
+                reqArgs["index"] = args[i + 1]
+                i += 2
+            case "--path":
+                guard i + 1 < args.count else { eprint("playlist remove: --path needs a value"); return .usage }
+                reqArgs["path"] = args[i + 1]
+                i += 2
+            case "--all":
+                reqArgs["mode"] = "all"
+                i += 1
+            default:
+                queryParts.append(a)
+                i += 1
+            }
+        }
+
+        if reqArgs["index"] == nil, reqArgs["path"] == nil {
+            let query = queryParts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !query.isEmpty else {
+                eprint("playlist remove: missing index/path/query")
+                return .usage
+            }
+            reqArgs["query"] = query
+        }
+
+        return sendAndFinalize(command: .removeTracksFromPlaylist, arguments: reqArgs, timeout: 3.0)
+
+    case "play":
+        guard args.count >= 2 else {
+            eprint("playlist play: usage playlist play <playlistID> [--index n | query]")
+            return .usage
+        }
+
+        let playlistID = args[1]
+        var reqArgs: [String: String] = ["playlistID": playlistID]
+        var queryParts: [String] = []
+        var i = 2
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--index":
+                guard i + 1 < args.count else { eprint("playlist play: --index needs a value"); return .usage }
+                reqArgs["index"] = args[i + 1]
+                i += 2
+            default:
+                queryParts.append(a)
+                i += 1
+            }
+        }
+        if reqArgs["index"] == nil {
+            let query = queryParts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !query.isEmpty {
+                reqArgs["query"] = query
+            }
+        }
+        return sendAndFinalize(command: .playPlaylistTrack, arguments: reqArgs, timeout: 3.0)
+
+    case "scope":
+        guard args.count >= 2 else { eprint("playlist scope: missing playlistID"); return .usage }
+        return sendAndFinalize(command: .setPlaybackScope, arguments: ["scope": "playlist", "playlistID": args[1]])
+
+    case "locate":
+        return sendAndFinalize(command: .locateNowPlaying, arguments: ["target": "playlist"])
+
+    default:
+        eprint("playlist: unknown subcommand \(sub)")
+        return .usage
+    }
+}
+
+private func handleWeightCommand(_ args: [String]) -> ExitCode {
+    guard let sub = args.first?.lowercased() else {
+        eprint("weight: missing subcommand")
+        return .usage
+    }
+
+    var reqArgs: [String: String] = [:]
+    var json = false
+    var timeoutSeconds: TimeInterval = 2.0
+
+    func parseOptions(startIndex: Int, allowLevel: Bool) -> Bool {
+        var i = startIndex
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--scope":
+                guard i + 1 < args.count else { eprint("weight: --scope needs a value"); return false }
+                reqArgs["scope"] = args[i + 1]
+                i += 2
+            case "--playlist":
+                guard i + 1 < args.count else { eprint("weight: --playlist needs a value"); return false }
+                reqArgs["playlistID"] = args[i + 1]
+                i += 2
+            case "--path":
+                guard i + 1 < args.count else { eprint("weight: --path needs a value"); return false }
+                reqArgs["path"] = args[i + 1]
+                i += 2
+            case "--index":
+                guard i + 1 < args.count else { eprint("weight: --index needs a value"); return false }
+                reqArgs["index"] = args[i + 1]
+                i += 2
+            case "--query":
+                guard i + 1 < args.count else { eprint("weight: --query needs a value"); return false }
+                reqArgs["query"] = args[i + 1]
+                i += 2
+            case "--current":
+                reqArgs["current"] = "true"
+                i += 1
+            case "--level":
+                guard allowLevel else { eprint("weight: --level not allowed here"); return false }
+                guard i + 1 < args.count else { eprint("weight: --level needs a value"); return false }
+                reqArgs["level"] = args[i + 1]
+                i += 2
+            case "--all":
+                reqArgs["all"] = "true"
+                i += 1
+            case "--json":
+                json = true
+                i += 1
+            case "--timeout":
+                guard i + 1 < args.count else { eprint("weight: --timeout needs a value"); return false }
+                guard let t = parseTimeout(args[i + 1]) else { eprint("weight: invalid timeout"); return false }
+                timeoutSeconds = t
+                i += 2
+            default:
+                eprint("weight: unknown option \(a)")
+                return false
+            }
+        }
+        return true
+    }
+
+    switch sub {
+    case "set":
+        guard parseOptions(startIndex: 1, allowLevel: true) else { return .usage }
+        guard reqArgs["level"] != nil else {
+            eprint("weight set: missing --level")
+            return .usage
+        }
+        if reqArgs["scope"]?.lowercased() == "playlist", reqArgs["playlistID"] == nil {
+            eprint("weight set: --scope playlist requires --playlist <id>")
+            return .usage
+        }
+        if reqArgs["path"] == nil, reqArgs["index"] == nil, reqArgs["query"] == nil, reqArgs["current"] == nil {
+            reqArgs["current"] = "true"
+        }
+        return sendAndFinalize(command: .setWeight, arguments: reqArgs, timeout: timeoutSeconds, json: json)
+
+    case "get":
+        guard parseOptions(startIndex: 1, allowLevel: false) else { return .usage }
+        if reqArgs["scope"]?.lowercased() == "playlist", reqArgs["playlistID"] == nil {
+            eprint("weight get: --scope playlist requires --playlist <id>")
+            return .usage
+        }
+        if reqArgs["path"] == nil, reqArgs["index"] == nil, reqArgs["query"] == nil, reqArgs["current"] == nil {
+            reqArgs["current"] = "true"
+        }
+        return sendAndFinalize(command: .getWeight, arguments: reqArgs, timeout: timeoutSeconds, json: json)
+
+    case "clear":
+        guard parseOptions(startIndex: 1, allowLevel: false) else { return .usage }
+        if reqArgs["scope"]?.lowercased() == "playlist", reqArgs["playlistID"] == nil {
+            eprint("weight clear: --scope playlist requires --playlist <id>")
+            return .usage
+        }
+        return sendAndFinalize(command: .clearWeights, arguments: reqArgs, timeout: timeoutSeconds, json: json)
+
+    case "sync":
+        var i = 1
+        var playlistID: String? = nil
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--playlist":
+                guard i + 1 < args.count else { eprint("weight sync: --playlist needs a value"); return .usage }
+                playlistID = args[i + 1]
+                i += 2
+            case "--json":
+                json = true
+                i += 1
+            case "--timeout":
+                guard i + 1 < args.count else { eprint("weight sync: --timeout needs a value"); return .usage }
+                guard let t = parseTimeout(args[i + 1]) else { eprint("weight sync: invalid timeout"); return .usage }
+                timeoutSeconds = t
+                i += 2
+            default:
+                if !a.hasPrefix("--") && playlistID == nil {
+                    playlistID = a
+                    i += 1
+                } else {
+                    eprint("weight sync: unknown option \(a)")
+                    return .usage
+                }
+            }
+        }
+        guard let playlistID, !playlistID.isEmpty else {
+            eprint("weight sync: missing playlistID")
+            return .usage
+        }
+        return sendAndFinalize(command: .syncPlaylistWeightsToQueue, arguments: ["playlistID": playlistID], timeout: timeoutSeconds, json: json)
+
+    default:
+        eprint("weight: unknown subcommand \(sub)")
+        return .usage
+    }
+}
+
+private func handleLyricsCommand(_ args: [String]) -> ExitCode {
+    guard let sub = args.first?.lowercased() else {
+        eprint("lyrics: missing subcommand")
+        return .usage
+    }
+
+    switch sub {
+    case "show":
+        return sendAndFinalize(command: .setLyricsVisible, arguments: ["enabled": "true"])
+    case "hide":
+        return sendAndFinalize(command: .setLyricsVisible, arguments: ["enabled": "false"])
+    case "toggle":
+        return sendAndFinalize(command: .toggleLyricsVisible)
+    case "status":
+        return sendAndFinalize(command: .status)
+    default:
+        eprint("lyrics: unknown subcommand \(sub)")
+        return .usage
+    }
+}
+
+private func handleAnalysisCommand(_ args: [String]) -> ExitCode {
+    guard let sub = args.first?.lowercased() else {
+        eprint("analysis: missing subcommand")
+        return .usage
+    }
+
+    switch sub {
+    case "status":
+        var json = false
+        var timeoutSeconds: TimeInterval = 2.0
+        var i = 1
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--json":
+                json = true
+                i += 1
+            case "--timeout":
+                guard i + 1 < args.count else { eprint("analysis status: --timeout needs a value"); return .usage }
+                guard let t = parseTimeout(args[i + 1]) else { eprint("analysis status: invalid timeout"); return .usage }
+                timeoutSeconds = t
+                i += 2
+            default:
+                eprint("analysis status: unknown option \(a)")
+                return .usage
+            }
+        }
+        return sendAndFinalize(command: .volumePreanalysis, arguments: ["action": "status"], timeout: timeoutSeconds, json: json)
+
+    case "start":
+        var reqArgs: [String: String] = ["action": "start"]
+        var json = false
+        var timeoutSeconds: TimeInterval = 2.0
+        var i = 1
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--scope":
+                guard i + 1 < args.count else { eprint("analysis start: --scope needs a value"); return .usage }
+                reqArgs["scope"] = args[i + 1]
+                i += 2
+            case "--playlist":
+                guard i + 1 < args.count else { eprint("analysis start: --playlist needs a value"); return .usage }
+                reqArgs["playlistID"] = args[i + 1]
+                i += 2
+            case "--json":
+                json = true
+                i += 1
+            case "--timeout":
+                guard i + 1 < args.count else { eprint("analysis start: --timeout needs a value"); return .usage }
+                guard let t = parseTimeout(args[i + 1]) else { eprint("analysis start: invalid timeout"); return .usage }
+                timeoutSeconds = t
+                i += 2
+            default:
+                eprint("analysis start: unknown option \(a)")
+                return .usage
+            }
+        }
+        if reqArgs["scope"]?.lowercased() == "playlist", reqArgs["playlistID"] == nil {
+            eprint("analysis start: --scope playlist requires --playlist <id>")
+            return .usage
+        }
+        return sendAndFinalize(command: .volumePreanalysis, arguments: reqArgs, timeout: timeoutSeconds, json: json)
+
+    case "cancel", "stop":
+        return sendAndFinalize(command: .volumePreanalysis, arguments: ["action": "cancel"])
+
+    case "options":
+        var reqArgs: [String: String] = [:]
+        var json = false
+        var timeoutSeconds: TimeInterval = 2.0
+        var i = 1
+
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--analyze-during-playback":
+                guard i + 1 < args.count else { eprint("analysis options: --analyze-during-playback needs a value"); return .usage }
+                guard let value = parseBoolWord(args[i + 1]) else { eprint("analysis options: invalid analyze-during-playback"); return .usage }
+                reqArgs["analyzeDuringPlayback"] = value ? "true" : "false"
+                i += 2
+            case "--auto-preanalyze-when-idle":
+                guard i + 1 < args.count else { eprint("analysis options: --auto-preanalyze-when-idle needs a value"); return .usage }
+                guard let value = parseBoolWord(args[i + 1]) else { eprint("analysis options: invalid auto-preanalyze-when-idle"); return .usage }
+                reqArgs["autoPreanalyzeWhenIdle"] = value ? "true" : "false"
+                i += 2
+            case "--require-before-playback":
+                guard i + 1 < args.count else { eprint("analysis options: --require-before-playback needs a value"); return .usage }
+                guard let value = parseBoolWord(args[i + 1]) else { eprint("analysis options: invalid require-before-playback"); return .usage }
+                reqArgs["requireAnalysisBeforePlayback"] = value ? "true" : "false"
+                i += 2
+            case "--target-level-db":
+                guard i + 1 < args.count else { eprint("analysis options: --target-level-db needs a value"); return .usage }
+                reqArgs["targetLevelDb"] = args[i + 1]
+                i += 2
+            case "--fade-duration":
+                guard i + 1 < args.count else { eprint("analysis options: --fade-duration needs a value"); return .usage }
+                reqArgs["fadeDuration"] = args[i + 1]
+                i += 2
+            case "--json":
+                json = true
+                i += 1
+            case "--timeout":
+                guard i + 1 < args.count else { eprint("analysis options: --timeout needs a value"); return .usage }
+                guard let t = parseTimeout(args[i + 1]) else { eprint("analysis options: invalid timeout"); return .usage }
+                timeoutSeconds = t
+                i += 2
+            default:
+                eprint("analysis options: unknown option \(a)")
+                return .usage
+            }
+        }
+
+        return sendAndFinalize(command: .setAnalysisOptions, arguments: reqArgs, timeout: timeoutSeconds, json: json)
+
+    default:
+        eprint("analysis: unknown subcommand \(sub)")
+        return .usage
+    }
+}
+
+private func handleCacheCommand(_ args: [String]) -> ExitCode {
+    guard args.count >= 2 else {
+        eprint("cache: usage cache clear <lyrics|artwork|all>")
+        return .usage
+    }
+
+    let sub = args[0].lowercased()
+    guard sub == "clear" else {
+        eprint("cache: unknown subcommand \(sub)")
+        return .usage
+    }
+
+    let target = args[1].lowercased()
+    switch target {
+    case "lyrics":
+        return sendAndFinalize(command: .clearLyricsCache)
+    case "artwork":
+        return sendAndFinalize(command: .clearArtworkCache)
+    case "all":
+        let first = sendAndFinalize(command: .clearLyricsCache, silentOnSuccess: true)
+        if first != .ok { return first }
+        return sendAndFinalize(command: .clearArtworkCache)
+    default:
+        eprint("cache clear: invalid target \(target)")
+        return .usage
+    }
+}
+
+private func handleIPCCommand(_ args: [String]) -> ExitCode {
+    guard let sub = args.first?.lowercased() else {
+        eprint("ipc: missing subcommand")
+        return .usage
+    }
+
+    switch sub {
+    case "commands":
+        for name in allIPCCommandNames.sorted() {
+            print(name)
+        }
+        return .ok
+
+    case "raw":
+        guard args.count >= 2 else {
+            eprint("ipc raw: missing command")
+            return .usage
+        }
+
+        let rawCommand = args[1]
+        guard let command = IPCCommand(rawValue: rawCommand) else {
+            eprint("ipc raw: unknown IPC command \(rawCommand)")
+            return .usage
+        }
+
+        var reqArgs: [String: String] = [:]
+        var reqPaths: [String] = []
+        var json = false
+        var timeoutSeconds: TimeInterval = 2.0
+
+        var i = 2
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--arg":
+                guard i + 1 < args.count else { eprint("ipc raw: --arg needs key=value"); return .usage }
+                guard let (key, value) = parseKeyValue(args[i + 1]) else { eprint("ipc raw: invalid --arg format (expected key=value)"); return .usage }
+                reqArgs[key] = value
+                i += 2
+            case "--path":
+                guard i + 1 < args.count else { eprint("ipc raw: --path needs a value"); return .usage }
+                reqPaths.append(args[i + 1])
+                i += 2
+            case "--json":
+                json = true
+                i += 1
+            case "--timeout":
+                guard i + 1 < args.count else { eprint("ipc raw: --timeout needs a value"); return .usage }
+                guard let t = parseTimeout(args[i + 1]) else { eprint("ipc raw: invalid timeout"); return .usage }
+                timeoutSeconds = t
+                i += 2
+            default:
+                eprint("ipc raw: unknown option \(a)")
+                return .usage
+            }
+        }
+
+        let request = makeRequest(command: command, arguments: reqArgs.isEmpty ? nil : reqArgs, paths: reqPaths.isEmpty ? nil : reqPaths)
+        guard let reply = sendRequest(request, timeoutSeconds: timeoutSeconds) else {
+            eprint("no reply")
+            return .noReply
+        }
+        return finalizeReply(reply, json: json)
+
+    default:
+        eprint("ipc: unknown subcommand \(sub)")
+        return .usage
+    }
+}
+
 private func run() -> ExitCode {
     var args = CommandLine.arguments
     _ = args.removeFirst()
@@ -192,6 +1017,22 @@ private func run() -> ExitCode {
     case "help", "-h", "--help":
         printUsage()
         return .ok
+    case "debug":
+        return handleDebugCommand(args)
+    case "queue":
+        return handleQueueCommand(args)
+    case "playlist":
+        return handlePlaylistCommand(args)
+    case "weight":
+        return handleWeightCommand(args)
+    case "lyrics":
+        return handleLyricsCommand(args)
+    case "analysis":
+        return handleAnalysisCommand(args)
+    case "cache":
+        return handleCacheCommand(args)
+    case "ipc":
+        return handleIPCCommand(args)
     case "ping":
         let req = makeRequest(command: .ping)
         let reply = sendRequest(req, timeoutSeconds: 1.5)

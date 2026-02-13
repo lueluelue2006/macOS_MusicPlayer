@@ -98,6 +98,10 @@ struct PlaylistsPanelView: View {
         .onReceive(NotificationCenter.default.publisher(for: .requestDismissAllSheets)) { _ in
             showAddFromQueueSheet = false
         }
+        .onReceive(NotificationCenter.default.publisher(for: .requestLocateNowPlayingInPlaylist)) { _ in
+            guard let playlist = selectedPlaylist else { return }
+            requestScrollToNowPlayingInPlaylist(playlist)
+        }
     }
 
     private var playlistsSidebar: some View {

@@ -6,9 +6,35 @@ public enum IPCCommand: String, Codable {
     case benchmarkLoad
     case clearLyricsCache
     case clearArtworkCache
+    case setIPCDebugEnabled
+    case debugSnapshot
+    case queueSnapshot
+    case clearQueue
+    case searchQueue
     case setSearchSortOption
     case resetSearchSortOption
     case toggleSearchSortOption
+    case playlistsSnapshot
+    case playlistTracksSnapshot
+    case createPlaylist
+    case renamePlaylist
+    case deletePlaylist
+    case selectPlaylist
+    case addTracksToPlaylist
+    case removeTracksFromPlaylist
+    case playPlaylistTrack
+    case setPlaybackScope
+    case locateNowPlaying
+    case setWeight
+    case getWeight
+    case clearWeights
+    case syncPlaylistWeightsToQueue
+    case setLyricsVisible
+    case toggleLyricsVisible
+    case volumePreanalysis
+    case setAnalysisOptions
+    case setScanSubfolders
+    case refreshMetadata
     case togglePlayPause
     case pause
     case resume

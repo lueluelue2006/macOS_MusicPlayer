@@ -436,6 +436,10 @@ struct PlaylistView: View {
         .onReceive(NotificationCenter.default.publisher(for: .switchPlaylistPanelToPlaylists)) { _ in
             panelMode = .playlists
         }
+        .onReceive(NotificationCenter.default.publisher(for: .requestLocateNowPlayingInQueue)) { _ in
+            panelMode = .queue
+            requestScrollToNowPlayingInQueue()
+        }
         .onChange(of: showingMetadataEdit) { isShowing in
             if isShowing, let file = selectedFileForEdit {
                 showMetadataEditWindow(for: file)
