@@ -168,12 +168,54 @@ struct FileSelectionView: View {
     }
 }
 
+struct FlowingEdgeBorder: View {
+    let cornerRadius: CGFloat
+    let lineWidth: CGFloat
+    let base: Color
+    let secondary: Color
+    let enabled: Bool
+    var duration: TimeInterval = 3.4
+
+    @State private var progress: Double = 0
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: cornerRadius)
+            .trim(from: 0.03, to: 0.21)
+            .stroke(
+                LinearGradient(
+                    colors: [base.opacity(0.95), .white.opacity(0.95), secondary.opacity(0.95)],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                ),
+                style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
+            )
+            .rotationEffect(.degrees(progress * 360))
+            .onAppear { updateAnimation(enabled: enabled) }
+            .onChange(of: enabled) { updateAnimation(enabled: $0) }
+    }
+
+    private func updateAnimation(enabled: Bool) {
+        var transaction = Transaction()
+        transaction.animation = nil
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            progress = 0
+        }
+
+        guard enabled, duration > 0 else { return }
+        withAnimation(.linear(duration: duration).repeatForever(autoreverses: false)) {
+            progress = 1
+        }
+    }
+}
+
 struct CurrentTrackView: View {
     @ObservedObject var audioPlayer: AudioPlayer
     @ObservedObject var playlistManager: PlaylistManager
     @ObservedObject private var weights = PlaybackWeights.shared
     @State private var showEphemeralTip: Bool = false
     @State private var showRatePicker: Bool = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
@@ -213,8 +255,20 @@ struct CurrentTrackView: View {
                 .frame(width: coverContainerSize, height: coverContainerSize)
                 .clipShape(RoundedRectangle(cornerRadius: 24))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 24)
-                        .stroke(audioPlayer.isPlaying ? theme.glowStroke : theme.stroke, lineWidth: audioPlayer.isPlaying ? 1.4 : 1.0)
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 24)
+                            .stroke(audioPlayer.isPlaying ? theme.glowStroke : theme.stroke, lineWidth: audioPlayer.isPlaying ? 1.2 : 1.0)
+
+                        FlowingEdgeBorder(
+                            cornerRadius: 24,
+                            lineWidth: 2.0,
+                            base: theme.accent,
+                            secondary: theme.accentSecondary,
+                            enabled: audioPlayer.isPlaying && !reduceMotion
+                        )
+                        .opacity(audioPlayer.isPlaying && !reduceMotion ? 1 : 0)
+                        .animation(.easeInOut(duration: 0.2), value: audioPlayer.isPlaying)
+                    }
                 )
 
                 // 临时播放标注：提示关闭或再次临时打开会丢失当前进度

@@ -369,7 +369,9 @@ struct PlaylistView: View {
                                 NotificationCenter.default.post(name: .blurSearchField, object: nil)
                                 selectedFileForEdit = fileToEdit
                                 showingMetadataEdit = true
-                            }
+                            },
+                            weightScope: .queue,
+                            showsWeightControl: true
                         )
 		                        .id(file.id)
 		                        .listRowBackground(Color.clear)
@@ -687,9 +689,12 @@ struct PlaylistItemView: View {
     let playAction: (AudioFile) -> Void
     let deleteAction: (AudioFile) -> Void
     let editAction: (AudioFile) -> Void
+    let weightScope: PlaybackWeights.Scope?
+    let showsWeightControl: Bool
     @State private var isHovered = false
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+    @ObservedObject private var weights = PlaybackWeights.shared
     private var iconStyle: AnyShapeStyle {
         if isCurrentTrack { return AnyShapeStyle(theme.accentGradient) }
         if unplayableReason != nil { return AnyShapeStyle(Color.orange) }
@@ -750,6 +755,21 @@ struct PlaylistItemView: View {
                         Spacer(minLength: 8)
 
                         HStack(alignment: .center, spacing: 8) {
+                            if showsWeightControl, let scope = weightScope {
+                                let level = weights.level(for: file.url, scope: scope)
+                                WeightDotsView(level: level) { newLevel in
+                                    weights.setLevel(newLevel, for: file.url, scope: scope)
+                                }
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 4)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .fill(Color.clear)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture { }
+                                )
+                            }
+
                             Text(durationLabel)
                                 .font(.system(size: 11, weight: .medium))
                                 .monospacedDigit()

@@ -235,7 +235,9 @@ struct PlaylistsPanelView: View {
                                             return
                                         }
                                         onRequestEditMetadata(fileToEdit)
-                                    }
+                                    },
+                                    weightScope: .playlist(playlist.id),
+                                    showsWeightControl: true
                                 )
 	                                .id(file.id)
 	                                .listRowBackground(Color.clear)

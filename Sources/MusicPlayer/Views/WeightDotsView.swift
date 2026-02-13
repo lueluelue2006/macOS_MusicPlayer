@@ -16,14 +16,13 @@ struct WeightDotsView: View {
                 } label: {
                     let isSelected = (l == level)
                     RoundedRectangle(cornerRadius: 2, style: .continuous)
-                        .fill(isSelected ? color(for: l) : theme.mutedText.opacity(0.12))
+                        .fill(isSelected ? color(for: l).opacity(0.92) : theme.mutedText.opacity(0.16))
                         .frame(width: 10, height: 10)
                         .overlay(
                             RoundedRectangle(cornerRadius: 2, style: .continuous)
-                                .stroke(theme.stroke.opacity(isSelected ? 0.9 : 0.55), lineWidth: 1.0)
+                                .stroke(theme.stroke.opacity(isSelected ? 0.78 : 0.55), lineWidth: 1.0)
                         )
-                        .shadow(color: isSelected ? color(for: l).opacity(0.75) : .clear, radius: 6, x: 0, y: 0)
-                        .shadow(color: isSelected ? color(for: l).opacity(0.35) : .clear, radius: 14, x: 0, y: 0)
+                        .shadow(color: isSelected ? color(for: l).opacity(0.28) : .clear, radius: 4, x: 0, y: 0)
                         // Bigger hitbox, but keep layout tight.
                         .frame(width: 14, height: 14)
                         // Remove dead zone between controls:
