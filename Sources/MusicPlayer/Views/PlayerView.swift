@@ -120,7 +120,6 @@ struct FileSelectionView: View {
     let showFlowingBorder: Bool
     let onFilesSelected: ([URL]) -> Void
     @State private var hovering = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
     
@@ -145,23 +144,7 @@ struct FileSelectionView: View {
             .clipShape(RoundedRectangle(cornerRadius: 16))
             .overlay(
                 RoundedRectangle(cornerRadius: 16)
-                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
-            )
-            .overlay(
-                Group {
-                    if showFlowingBorder {
-                        FlowingBorder(
-                            cornerRadius: 16,
-                            lineWidth: hovering ? 2.4 : 2.0,
-                            base: theme.accent,
-                            secondary: theme.accentSecondary,
-                            enabled: !reduceMotion
-                        )
-                        .opacity(hovering ? 1.0 : 0.92)
-                        .blendMode(.plusLighter)
-                        .allowsHitTesting(false)
-                    }
-                }
+                    .stroke(Color.white.opacity(showFlowingBorder ? 0.24 : 0.14), lineWidth: showFlowingBorder ? 1.8 : 1.0)
             )
             .shadow(color: theme.subtleShadow, radius: 10, x: 0, y: 5)
             .scaleEffect(hovering ? 1.02 : 1.0)
@@ -185,79 +168,13 @@ struct FileSelectionView: View {
     }
 }
 
-struct FlowingBorder: View {
-    let cornerRadius: CGFloat
-    let lineWidth: CGFloat
-    let base: Color
-    let secondary: Color
-    let enabled: Bool
-    // One full cycle duration. Larger = slower flow.
-    var period: TimeInterval = 10.4
-    var phaseOffset: Double = 0
-    @State private var rotation: Double = 0
-
-    var body: some View {
-        RoundedRectangle(cornerRadius: cornerRadius)
-            .strokeBorder(borderGradient, lineWidth: lineWidth)
-            // Rasterize the gradient border once, then rotate the texture.
-            .drawingGroup()
-            .rotationEffect(.degrees(rotation))
-            .onAppear { updateAnimation(enabled: enabled) }
-            .onChange(of: enabled) { updateAnimation(enabled: $0) }
-    }
-
-    private var borderGradient: AngularGradient {
-        let glowA = base.opacity(0.95)
-        let glowB = secondary.opacity(0.95)
-
-        return AngularGradient(
-            gradient: Gradient(stops: [
-                .init(color: .clear, location: 0.00),
-                .init(color: .clear, location: 0.40),
-                .init(color: glowA, location: 0.47),
-                .init(color: .white.opacity(0.95), location: 0.50),
-                .init(color: glowB, location: 0.53),
-                .init(color: .clear, location: 0.60),
-                .init(color: .clear, location: 1.00),
-            ]),
-            center: .center,
-            startAngle: .degrees(0),
-            endAngle: .degrees(360)
-        )
-    }
-
-    private func updateAnimation(enabled: Bool) {
-        let baseAngle = phaseOffset * 360
-        if enabled && period > 0 {
-            var transaction = Transaction()
-            transaction.animation = nil
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                rotation = baseAngle
-            }
-            withAnimation(.linear(duration: period).repeatForever(autoreverses: false)) {
-                rotation = baseAngle + 360
-            }
-        } else {
-            var transaction = Transaction()
-            transaction.animation = nil
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                rotation = 0
-            }
-        }
-    }
-}
-
 struct CurrentTrackView: View {
     @ObservedObject var audioPlayer: AudioPlayer
     @ObservedObject var playlistManager: PlaylistManager
     @ObservedObject private var weights = PlaybackWeights.shared
     @State private var showEphemeralTip: Bool = false
     @State private var showRatePicker: Bool = false
-    @State private var glowRotation: Double = 0
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
     var body: some View {
@@ -268,29 +185,24 @@ struct CurrentTrackView: View {
 
                 // 专辑封面
                 ZStack {
-                    // 动态光晕背景（播放时旋转）
-                    if audioPlayer.isPlaying && !reduceMotion {
-                        // 外层彩色光晕
+                    // 播放中的静态光晕（去除旋转动画）
+                    if audioPlayer.isPlaying {
                         Circle()
                             .fill(
-                                AngularGradient(
+                                RadialGradient(
                                     colors: [
-                                        theme.accent.opacity(0.5),
-                                        theme.accentSecondary.opacity(0.4),
-                                        theme.accentTertiary.opacity(0.3),
-                                        theme.accent.opacity(0.5)
+                                        theme.accent.opacity(0.28),
+                                        theme.accentSecondary.opacity(0.12),
+                                        Color.clear
                                     ],
                                     center: .center,
-                                    startAngle: .degrees(0),
-                                    endAngle: .degrees(360)
+                                    startRadius: 50,
+                                    endRadius: 145
                                 )
                             )
-                            .frame(width: coverContainerSize - 40, height: coverContainerSize - 40)
+                            .frame(width: coverContainerSize - 24, height: coverContainerSize - 24)
                             .blur(radius: 24)
-                            // Rasterize expensive gradient+blur, rotate as a texture.
-                            .drawingGroup()
-                            .rotationEffect(.degrees(glowRotation))
-                            .opacity(0.55)
+                            .opacity(0.8)
                     }
 
                     // 主封面
@@ -301,28 +213,9 @@ struct CurrentTrackView: View {
                 .frame(width: coverContainerSize, height: coverContainerSize)
                 .clipShape(RoundedRectangle(cornerRadius: 24))
                 .overlay(
-                    FlowingBorder(
-                        cornerRadius: 24,
-                        lineWidth: 2.0,
-                        base: theme.accent,
-                        secondary: theme.accentSecondary,
-                        enabled: audioPlayer.isPlaying && !reduceMotion
-                    )
-                    .opacity(audioPlayer.isPlaying ? 0.9 : 0)
-                    .blendMode(.plusLighter)
-                    .allowsHitTesting(false)
-                    .animation(.easeInOut(duration: 0.3), value: audioPlayer.isPlaying)
+                    RoundedRectangle(cornerRadius: 24)
+                        .stroke(audioPlayer.isPlaying ? theme.glowStroke : theme.stroke, lineWidth: audioPlayer.isPlaying ? 1.4 : 1.0)
                 )
-                .onAppear {
-                    if audioPlayer.isPlaying {
-                        startGlowAnimation()
-                    }
-                }
-                .onChange(of: audioPlayer.isPlaying) { playing in
-                    if playing {
-                        startGlowAnimation()
-                    }
-                }
 
                 // 临时播放标注：提示关闭或再次临时打开会丢失当前进度
                 if audioPlayer.persistPlaybackState == false {
@@ -563,12 +456,6 @@ struct CurrentTrackView: View {
         }
     }
 
-    private func startGlowAnimation() {
-        glowRotation = 0
-        withAnimation(.linear(duration: 16).repeatForever(autoreverses: false)) {
-            glowRotation = 360
-        }
-    }
 }
 
 // MARK: - Lyrics Views

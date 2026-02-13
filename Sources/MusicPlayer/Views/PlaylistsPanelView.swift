@@ -228,17 +228,15 @@ struct PlaylistsPanelView: View {
 	                                        playlistsStore.removeTrack(path: fileToDelete.url.path, from: playlist.id)
 	                                        reloadSelectedPlaylist()
 	                                    },
-	                                    editAction: { fileToEdit in
-	                                        NotificationCenter.default.post(name: .blurSearchField, object: nil)
-	                                        if trackUnplayableReasons[pathKey(fileToEdit.url)] != nil {
-	                                            postToast(title: "文件不存在，无法编辑", subtitle: fileToEdit.url.lastPathComponent, kind: "warning")
-	                                            return
-	                                        }
-	                                        onRequestEditMetadata(fileToEdit)
-	                                    },
-	                                    weightScope: .playlist(playlist.id),
-	                                    showsWeightControl: true
-	                                )
+                                    editAction: { fileToEdit in
+                                        NotificationCenter.default.post(name: .blurSearchField, object: nil)
+                                        if trackUnplayableReasons[pathKey(fileToEdit.url)] != nil {
+                                            postToast(title: "文件不存在，无法编辑", subtitle: fileToEdit.url.lastPathComponent, kind: "warning")
+                                            return
+                                        }
+                                        onRequestEditMetadata(fileToEdit)
+                                    }
+                                )
 	                                .id(file.id)
 	                                .listRowBackground(Color.clear)
 	                                .listRowSeparator(.hidden)
