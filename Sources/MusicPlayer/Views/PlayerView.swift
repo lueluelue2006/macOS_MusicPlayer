@@ -175,54 +175,51 @@ struct FlowingEdgeBorder: View {
     let secondary: Color
     let enabled: Bool
     var duration: TimeInterval = 3.4
-    var segmentLength: Double = 0.18
-
-    @State private var progress: Double = 0
+    var segmentRatio: CGFloat = 0.18
 
     var body: some View {
-        ZStack {
-            if progress + segmentLength <= 1 {
-                flowingSegment(from: progress, to: progress + segmentLength)
-            } else {
-                flowingSegment(from: progress, to: 1)
-                flowingSegment(from: 0, to: (progress + segmentLength) - 1)
+        GeometryReader { proxy in
+            let width = max(1, proxy.size.width)
+            let height = max(1, proxy.size.height)
+            let radius = min(cornerRadius, min(width, height) / 2)
+            let perimeter = roundedRectanglePerimeter(width: width, height: height, radius: radius)
+            let dashOn = max(8, perimeter * segmentRatio)
+            let dashOff = max(1, perimeter - dashOn)
+
+            TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { timeline in
+                let phase: CGFloat = {
+                    guard enabled, duration > 0 else { return 0 }
+                    let value = (timeline.date.timeIntervalSinceReferenceDate / duration).truncatingRemainder(dividingBy: 1)
+                    return CGFloat(value)
+                }()
+
+                RoundedRectangle(cornerRadius: radius)
+                    .stroke(
+                        style: StrokeStyle(
+                            lineWidth: lineWidth,
+                            lineCap: .round,
+                            lineJoin: .round,
+                            dash: [dashOn, dashOff],
+                            dashPhase: -phase * perimeter
+                        )
+                    )
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [base.opacity(0.95), .white.opacity(0.95), secondary.opacity(0.95)],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .opacity(enabled ? 1 : 0)
             }
         }
-        .onAppear { updateAnimation(enabled: enabled) }
-        .onChange(of: enabled) { updateAnimation(enabled: $0) }
+        .allowsHitTesting(false)
     }
 
-    @ViewBuilder
-    private func flowingSegment(from rawFrom: Double, to rawTo: Double) -> some View {
-        let from = max(0, min(1, rawFrom))
-        let to = max(0, min(1, rawTo))
-
-        if to > from {
-            RoundedRectangle(cornerRadius: cornerRadius)
-                .trim(from: from, to: to)
-                .stroke(
-                    LinearGradient(
-                        colors: [base.opacity(0.95), .white.opacity(0.95), secondary.opacity(0.95)],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    ),
-                    style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
-                )
-        }
-    }
-
-    private func updateAnimation(enabled: Bool) {
-        var transaction = Transaction()
-        transaction.animation = nil
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            progress = 0
-        }
-
-        guard enabled, duration > 0 else { return }
-        withAnimation(.linear(duration: duration).repeatForever(autoreverses: false)) {
-            progress = 1 - segmentLength
-        }
+    private func roundedRectanglePerimeter(width: CGFloat, height: CGFloat, radius: CGFloat) -> CGFloat {
+        let straight = 2 * (width + height - 4 * radius)
+        let arc = 2 * .pi * radius
+        return max(1, straight + arc)
     }
 }
 
