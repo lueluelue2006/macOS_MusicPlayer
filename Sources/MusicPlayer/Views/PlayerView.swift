@@ -175,23 +175,40 @@ struct FlowingEdgeBorder: View {
     let secondary: Color
     let enabled: Bool
     var duration: TimeInterval = 3.4
+    var segmentLength: Double = 0.18
 
     @State private var progress: Double = 0
 
     var body: some View {
-        RoundedRectangle(cornerRadius: cornerRadius)
-            .trim(from: 0.03, to: 0.21)
-            .stroke(
-                LinearGradient(
-                    colors: [base.opacity(0.95), .white.opacity(0.95), secondary.opacity(0.95)],
-                    startPoint: .leading,
-                    endPoint: .trailing
-                ),
-                style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
-            )
-            .rotationEffect(.degrees(progress * 360))
-            .onAppear { updateAnimation(enabled: enabled) }
-            .onChange(of: enabled) { updateAnimation(enabled: $0) }
+        ZStack {
+            if progress + segmentLength <= 1 {
+                flowingSegment(from: progress, to: progress + segmentLength)
+            } else {
+                flowingSegment(from: progress, to: 1)
+                flowingSegment(from: 0, to: (progress + segmentLength) - 1)
+            }
+        }
+        .onAppear { updateAnimation(enabled: enabled) }
+        .onChange(of: enabled) { updateAnimation(enabled: $0) }
+    }
+
+    @ViewBuilder
+    private func flowingSegment(from rawFrom: Double, to rawTo: Double) -> some View {
+        let from = max(0, min(1, rawFrom))
+        let to = max(0, min(1, rawTo))
+
+        if to > from {
+            RoundedRectangle(cornerRadius: cornerRadius)
+                .trim(from: from, to: to)
+                .stroke(
+                    LinearGradient(
+                        colors: [base.opacity(0.95), .white.opacity(0.95), secondary.opacity(0.95)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    ),
+                    style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
+                )
+        }
     }
 
     private func updateAnimation(enabled: Bool) {
@@ -204,7 +221,7 @@ struct FlowingEdgeBorder: View {
 
         guard enabled, duration > 0 else { return }
         withAnimation(.linear(duration: duration).repeatForever(autoreverses: false)) {
-            progress = 1
+            progress = 1 - segmentLength
         }
     }
 }
