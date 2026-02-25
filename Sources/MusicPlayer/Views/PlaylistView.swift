@@ -1,21 +1,6 @@
 import SwiftUI
 import AppKit
 
-// 窗口代理类，处理窗口关闭事件，避免强引用循环
-class MetadataWindowDelegate: NSObject, NSWindowDelegate {
-    weak var parentView: NSObject?
-    
-    init(parentView: NSObject?) {
-        self.parentView = parentView
-        super.init()
-    }
-    
-    func windowWillClose(_ notification: Notification) {
-        // 窗口即将关闭时的清理工作
-        // 由于使用了弱引用，不会造成循环引用问题
-    }
-}
-
 struct PlaylistView: View {
     @ObservedObject var audioPlayer: AudioPlayer
     @ObservedObject var playlistManager: PlaylistManager
@@ -25,7 +10,6 @@ struct PlaylistView: View {
     @State private var showingMetadataEdit = false
     @State private var selectedFileForEdit: AudioFile?
     @State private var metadataEditWindow: NSWindow?
-    @State private var windowDelegate: MetadataWindowDelegate?
     @State private var queueScrollTargetID: String?
     @State private var queueVisibleFiles: [AudioFile] = []
     @Environment(\.colorScheme) private var colorScheme
@@ -97,7 +81,6 @@ struct PlaylistView: View {
     }
     
     var body: some View {
-        let _ = weights.revision // drive refresh for weight-based sorting
         VStack(alignment: .leading, spacing: 20) {
             // 标题和操作按钮
             HStack {
@@ -178,34 +161,6 @@ struct PlaylistView: View {
                         }
                         .buttonStyle(PlainButtonStyle())
                         .disabled(playlistManager.audioFiles.isEmpty)
-                        
-                        // 刷新按钮
-                        Button(action: {
-                            Task {
-                                await playlistManager.refreshAllMetadata(audioPlayer: audioPlayer)
-                            }
-                        }) {
-                            HStack(spacing: 6) {
-                                Image(systemName: "arrow.clockwise")
-                                    .font(.caption)
-                                Text("完全刷新")
-                                    .font(.caption)
-                                    .fontWeight(.medium)
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .fill(theme.mutedSurface)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 12)
-                                            .stroke(theme.accentGradient, lineWidth: 1)
-                                    )
-                            )
-                            .foregroundStyle(theme.accentGradient)
-                        }
-                        .buttonStyle(PlainButtonStyle())
-                        .help("完全刷新：重载元数据、歌词、封面（清空歌词/封面缓存；保留音量均衡缓存）")
                     } else {
                         Button(action: { createPlaylist() }) {
                             HStack(spacing: 6) {
@@ -228,35 +183,9 @@ struct PlaylistView: View {
                             .foregroundStyle(theme.accentGradient)
                         }
                         .buttonStyle(PlainButtonStyle())
-
-                        Button(action: {
-                            Task {
-                                await playlistManager.refreshAllMetadata(audioPlayer: audioPlayer)
-                            }
-                        }) {
-                            HStack(spacing: 6) {
-                                Image(systemName: "arrow.clockwise")
-                                    .font(.caption)
-                                Text("完全刷新")
-                                    .font(.caption)
-                                    .fontWeight(.medium)
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .fill(theme.mutedSurface)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 12)
-                                            .stroke(theme.accentGradient, lineWidth: 1)
-                                    )
-                            )
-                            .foregroundStyle(theme.accentGradient)
-                        }
-                        .buttonStyle(PlainButtonStyle())
-                        .help("完全刷新：重载元数据、歌词、封面（清空歌词/封面缓存；保留音量均衡缓存）")
-                        .disabled(playlistManager.audioFiles.isEmpty)
                     }
+
+                    refreshButton
                 }
             }
             .padding(.horizontal, 20)
@@ -385,7 +314,7 @@ struct PlaylistView: View {
                                 guard let target else { return }
                                 scrollToQueueTrackIfPossible(targetID: target, proxy: proxy)
                             }
-                            .onChange(of: queueVisibleFiles.map(\.id)) { _ in
+                            .onChange(of: queueVisibleFiles.count) { _ in
                                 guard let target = queueScrollTargetID else { return }
                                 scrollToQueueTrackIfPossible(targetID: target, proxy: proxy)
                             }
@@ -452,7 +381,6 @@ struct PlaylistView: View {
                 window.close()
                 metadataEditWindow = nil
                 selectedFileForEdit = nil
-                windowDelegate = nil
             }
         }
     }
@@ -489,6 +417,36 @@ struct PlaylistView: View {
         queueVisibleFiles = sortState.option(for: .queue).applying(to: playlistManager.filteredFiles, weightScope: .queue)
     }
 
+    private var refreshButton: some View {
+        Button(action: {
+            Task {
+                await playlistManager.refreshAllMetadata(audioPlayer: audioPlayer)
+            }
+        }) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.caption)
+                Text("完全刷新")
+                    .font(.caption)
+                    .fontWeight(.medium)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(theme.mutedSurface)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(theme.accentGradient, lineWidth: 1)
+                    )
+            )
+            .foregroundStyle(theme.accentGradient)
+        }
+        .buttonStyle(PlainButtonStyle())
+        .help("完全刷新：重载元数据、歌词、封面（清空歌词/封面缓存；保留音量均衡缓存）")
+        .disabled(playlistManager.audioFiles.isEmpty)
+    }
+
     @MainActor
     private func createPlaylist() {
         let name = TextInputPrompt.prompt(
@@ -517,11 +475,7 @@ struct PlaylistView: View {
         
         // 保存窗口引用
         metadataEditWindow = window
-        
-        // 创建并设置窗口代理
-        windowDelegate = MetadataWindowDelegate(parentView: nil)
-        window.delegate = windowDelegate
-        
+
         let metadataEditView = MetadataEditView(
             audioFile: file,
             onSave: { title, artist, album, year, genre, _ in
@@ -608,7 +562,7 @@ struct SearchBarView: View {
                 .foregroundColor(theme.mutedText)
                 .font(.headline)
             
-            TextField("🔍 搜索歌曲、艺术家或专辑...", text: $searchText)
+            TextField("搜索歌曲、艺术家或专辑...", text: $searchText)
                 .textFieldStyle(PlainTextFieldStyle())
                 .font(.subheadline)
                 .focused($isFocused)
@@ -647,7 +601,7 @@ struct SearchBarView: View {
                 RoundedRectangle(cornerRadius: 12)
                     .fill(theme.mutedSurface)
                 RoundedRectangle(cornerRadius: 12)
-                    .stroke(theme.stroke, lineWidth: 1)
+                    .stroke(theme.accent.opacity(0.12), lineWidth: 1)
                 if isFocused {
                     RoundedRectangle(cornerRadius: 12)
                         .stroke(theme.accent.opacity(0.45), lineWidth: 2)
@@ -741,7 +695,7 @@ struct PlaylistItemView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 8) {
                         Text(highlightedText(file.metadata.title, searchText: searchText))
-                            .font(.system(size: 14, weight: .semibold))
+                            .font(.system(size: 13, weight: .semibold))
                             .lineLimit(1)
                             .foregroundStyle(titleStyle)
                             .layoutPriority(1)
@@ -791,13 +745,13 @@ struct PlaylistItemView: View {
                     }
 
                     Text("\(highlightedText(file.metadata.artist, searchText: searchText)) - \(highlightedText(file.metadata.album, searchText: searchText))")
-                        .font(.system(size: 12))
+                        .font(.system(size: 11))
                         .foregroundColor(theme.mutedText)
                         .lineLimit(1)
 
                     Text(file.url.lastPathComponent)
                         .font(.system(size: 11))
-                        .foregroundColor(theme.mutedText.opacity(0.7))
+                        .foregroundColor(theme.mutedText.opacity(0.8))
                         .lineLimit(1)
                 }
 
@@ -807,7 +761,7 @@ struct PlaylistItemView: View {
             .onTapGesture { playAction(file) }
             // 让按钮的可点击区域覆盖整行（含顶部/底部留白），避免只“选中”但点不到播放
             .padding(.leading, 16)
-            .padding(.vertical, 8)
+            .padding(.vertical, 5)
             .frame(maxWidth: .infinity, alignment: .leading)
 
             // 操作按钮组
@@ -841,8 +795,10 @@ struct PlaylistItemView: View {
                 .buttonStyle(PlainButtonStyle())
             }
             .padding(.trailing, 16)
-            .padding(.vertical, 8)
-            .opacity(isHovered ? 1 : 0.6)
+            .padding(.vertical, 5)
+            .opacity(isHovered ? 1 : 0)
+            .allowsHitTesting(isHovered)
+            .animation(.easeInOut(duration: 0.15), value: isHovered)
         }
         .background(
             Group {

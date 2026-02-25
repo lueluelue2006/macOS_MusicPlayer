@@ -10,14 +10,12 @@ struct PlayerView: View {
     
     var body: some View {
         ScrollView {
-            VStack(spacing: 20) {
+            VStack(spacing: 16) {
                 // 文件选择按钮
                 FileSelectionView(showFlowingBorder: playlistManager.audioFiles.isEmpty) { urls in
                     playlistManager.enqueueAddFiles(urls)
                 }
-                .padding(.horizontal)
-
-                // 导入/扫描进度（可取消）
+                .padding(.horizontal, 20)
                 if playlistManager.isAddingFiles {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 10) {
@@ -72,7 +70,7 @@ struct PlayerView: View {
                                     .stroke(theme.accent.opacity(0.22), lineWidth: 1)
                             )
                     )
-                    .padding(.horizontal)
+                    .padding(.horizontal, 20)
                 }
                 // 在文件/文件夹选择按钮下方展示当前音频输出设备
                 HStack {
@@ -88,7 +86,7 @@ struct PlayerView: View {
                     Spacer()
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal)
+                .padding(.horizontal, 20)
                 
                 // 当前播放信息
                 CurrentTrackView(audioPlayer: audioPlayer, playlistManager: playlistManager)
@@ -178,42 +176,47 @@ struct FlowingEdgeBorder: View {
     var segmentRatio: CGFloat = 0.18
 
     var body: some View {
-        GeometryReader { proxy in
-            let width = max(1, proxy.size.width)
-            let height = max(1, proxy.size.height)
-            let radius = min(cornerRadius, min(width, height) / 2)
-            let perimeter = roundedRectanglePerimeter(width: width, height: height, radius: radius)
-            let dashOn = max(8, perimeter * segmentRatio)
-            let dashOff = max(1, perimeter - dashOn)
+        if enabled {
+            GeometryReader { proxy in
+                let width = max(1, proxy.size.width)
+                let height = max(1, proxy.size.height)
+                let radius = min(cornerRadius, min(width, height) / 2)
+                let perimeter = roundedRectanglePerimeter(width: width, height: height, radius: radius)
+                let dashOn = max(8, perimeter * segmentRatio)
+                let dashOff = max(1, perimeter - dashOn)
 
-            TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { timeline in
-                let phase: CGFloat = {
-                    guard enabled, duration > 0 else { return 0 }
-                    let value = (timeline.date.timeIntervalSinceReferenceDate / duration).truncatingRemainder(dividingBy: 1)
-                    return CGFloat(value)
-                }()
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+                    let phase: CGFloat = {
+                        guard duration > 0 else { return 0 }
+                        let value = (timeline.date.timeIntervalSinceReferenceDate / duration).truncatingRemainder(dividingBy: 1)
+                        return CGFloat(value)
+                    }()
 
-                RoundedRectangle(cornerRadius: radius)
-                    .stroke(
-                        style: StrokeStyle(
-                            lineWidth: lineWidth,
-                            lineCap: .round,
-                            lineJoin: .round,
-                            dash: [dashOn, dashOff],
-                            dashPhase: -phase * perimeter
+                    RoundedRectangle(cornerRadius: radius)
+                        .stroke(
+                            style: StrokeStyle(
+                                lineWidth: lineWidth,
+                                lineCap: .round,
+                                lineJoin: .round,
+                                dash: [dashOn, dashOff],
+                                dashPhase: -phase * perimeter
+                            )
                         )
-                    )
-                    .foregroundStyle(
-                        LinearGradient(
-                            colors: [base.opacity(0.95), .white.opacity(0.95), secondary.opacity(0.95)],
-                            startPoint: .leading,
-                            endPoint: .trailing
+                        .foregroundStyle(
+                            LinearGradient(
+                                colors: [base.opacity(0.95), .white.opacity(0.95), secondary.opacity(0.95)],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
                         )
-                    )
-                    .opacity(enabled ? 1 : 0)
+                }
             }
+            .drawingGroup()
+            .allowsHitTesting(false)
+        } else {
+            Color.clear
+                .allowsHitTesting(false)
         }
-        .allowsHitTesting(false)
     }
 
     private func roundedRectanglePerimeter(width: CGFloat, height: CGFloat, radius: CGFloat) -> CGFloat {
@@ -405,18 +408,9 @@ struct CurrentTrackView: View {
                 }
                 .padding(.horizontal, 24)
                 
-                // 歌词来源与显示控制（如果有歌词）
+                // 歌词来源标签（如果有歌词）
                 if let timeline = audioPlayer.lyricsTimeline {
                     HStack(spacing: 12) {
-                        // 显示/隐藏开关
-                        Toggle(isOn: Binding(get: { audioPlayer.showLyrics }, set: { audioPlayer.showLyrics = $0 })) {
-                            Text("显示歌词")
-                                .font(.caption)
-                                .fontWeight(.medium)
-                        }
-                        .toggleStyle(SwitchToggleStyle())
-                        
-                        // 来源标签
                         Text(sourceLabel(for: timeline.source))
                             .font(.caption)
                             .foregroundColor(theme.mutedText)
@@ -425,7 +419,7 @@ struct CurrentTrackView: View {
                             .background(
                                 Capsule().fill(theme.surface.opacity(0.6))
                             )
-                        
+
                         Spacer()
                     }
                     .padding(.horizontal, 24)
@@ -530,8 +524,6 @@ struct CurrentTrackView: View {
 
 struct LyricsContainerView: View {
     @ObservedObject var audioPlayer: AudioPlayer
-    @State private var expanded: Bool = true
-    var onHoverChange: ((Bool) -> Void)? = nil
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
@@ -585,10 +577,7 @@ struct LyricsContainerView: View {
                         )
                         .shadow(color: theme.subtleShadow, radius: 6, x: 0, y: 2)
                 )
-                // 仅当展示实际歌词面板时才触发悬停（从而禁用外层滚动）
-                .onHover { hovering in
-                    onHoverChange?(hovering)
-                }
+                // 歌词面板展示区域
             }
         }
     }

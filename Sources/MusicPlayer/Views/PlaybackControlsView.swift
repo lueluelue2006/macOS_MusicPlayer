@@ -63,14 +63,8 @@ struct PlaybackControlsView: View {
                             Circle()
                                 .stroke(theme.accent.opacity(0.4), lineWidth: 3)
                                 .frame(width: 80, height: 80)
-                                .scaleEffect(isPulsing ? 1.25 : 1.0)
-                                .opacity(isPulsing ? 0 : 0.6)
-
-                            Circle()
-                                .stroke(theme.accentSecondary.opacity(0.3), lineWidth: 2)
-                                .frame(width: 80, height: 80)
-                                .scaleEffect(isPulsing ? 1.4 : 1.0)
-                                .opacity(isPulsing ? 0 : 0.4)
+                                .scaleEffect(isPulsing ? 1.3 : 1.0)
+                                .opacity(isPulsing ? 0 : 0.5)
                         }
 
                         // 发光背景
@@ -280,7 +274,7 @@ struct PlaybackControlsView: View {
     }
 
     private func startPulsingAnimation() {
-        withAnimation(.easeOut(duration: 1.5).repeatForever(autoreverses: false)) {
+        withAnimation(.easeOut(duration: 2.0).repeatForever(autoreverses: false)) {
             isPulsing = true
         }
     }
@@ -302,10 +296,6 @@ struct AudioControlsView: View {
                         .font(.system(size: 16))
                         .foregroundStyle(theme.accentGradient)
                         .frame(width: 24)
-
-                    Text("主音量")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(.primary)
 
                     Spacer()
 

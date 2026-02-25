@@ -51,31 +51,6 @@ struct AppTheme {
         }
     }
 
-    /// 活力渐变 - 用于当前播放项等高亮元素
-    var vibrantGradient: LinearGradient {
-        if scheme == .dark {
-            return LinearGradient(
-                colors: [
-                    Color(red: 0.55, green: 1.0, blue: 0.85),   // 极光绿
-                    Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
-                    Color(red: 0.50, green: 0.70, blue: 0.98)   // 淡紫蓝
-                ],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-        } else {
-            return LinearGradient(
-                colors: [
-                    Color(red: 0.55, green: 0.22, blue: 0.78),  // 深紫
-                    Color(red: 0.95, green: 0.36, blue: 0.50),  // 玫红
-                    Color(red: 1.0, green: 0.58, blue: 0.28)    // 暖橙
-                ],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-        }
-    }
-
     /// 进度条渐变
     var progressGradient: LinearGradient {
         if scheme == .dark {
@@ -163,13 +138,6 @@ struct AppTheme {
         scheme == .dark ? Color.white.opacity(0.04) : Color.white.opacity(0.70)
     }
 
-    /// 玻璃效果背景色
-    var glassSurface: Color {
-        scheme == .dark
-            ? Color(red: 0.15, green: 0.15, blue: 0.22).opacity(0.85)
-            : Color(red: 1.0, green: 0.97, blue: 0.96).opacity(0.80)
-    }
-
     // MARK: - 边框和阴影
 
     var stroke: Color {
@@ -193,12 +161,7 @@ struct AppTheme {
     // MARK: - 文字颜色
 
     var mutedText: Color {
-        scheme == .dark ? Color.white.opacity(0.65) : Color.secondary
-    }
-
-    /// 高亮文字色
-    var highlightText: Color {
-        scheme == .dark ? Color.white : Color.black
+        scheme == .dark ? Color.white.opacity(0.72) : Color.secondary
     }
 
     // MARK: - 交互状态
@@ -225,11 +188,6 @@ struct AppTheme {
         }
     }
 
-    /// 当前播放项的发光边框
-    func activeRowGlow(isActive: Bool) -> Color {
-        isActive ? accent.opacity(0.45) : Color.clear
-    }
-
     func dropZoneBorder(isActive: Bool) -> Color {
         isActive ? accent : (scheme == .dark ? Color.white.opacity(0.25) : Color.gray.opacity(0.4))
     }
@@ -243,11 +201,6 @@ struct AppTheme {
     }
 
     // MARK: - 动画配置
-
-    /// 标准弹簧动画
-    static var springAnimation: Animation {
-        .spring(response: 0.35, dampingFraction: 0.7, blendDuration: 0)
-    }
 
     /// 快速弹簧动画
     static var quickSpring: Animation {
