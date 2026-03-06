@@ -208,10 +208,8 @@ private struct FlowingEdgeBorderLayerView: NSViewRepresentable {
 }
 
 private final class FlowingEdgeBorderHostingView: NSView {
-    private let trailLayer = CAShapeLayer()
-    private let coreLayer = CAShapeLayer()
-    private let trailAnimationKey = "flow.trail"
-    private let coreAnimationKey = "flow.core"
+    private let bandLayer = CAShapeLayer()
+    private let bandAnimationKey = "flow.band"
 
     private var currentCornerRadius: CGFloat = 0
     private var currentLineWidth: CGFloat = 0
@@ -249,14 +247,12 @@ private final class FlowingEdgeBorderHostingView: NSView {
             cornerHeight: effectiveCornerRadius,
             transform: nil
         )
-        trailLayer.frame = bounds
-        trailLayer.path = path
-        coreLayer.frame = bounds
-        coreLayer.path = path
+        bandLayer.frame = bounds
+        bandLayer.path = path
         currentPerimeter = roundedRectPerimeter(for: insetRect, cornerRadius: effectiveCornerRadius)
         updateDashPattern()
         CATransaction.commit()
-        restartAnimations()
+        restartAnimation()
     }
 
     func update(cornerRadius: CGFloat, lineWidth: CGFloat, baseColor: NSColor, secondaryColor: NSColor) {
@@ -276,54 +272,37 @@ private final class FlowingEdgeBorderHostingView: NSView {
     private func setupLayers() {
         guard let layer else { return }
         layer.masksToBounds = false
-        layer.addSublayer(trailLayer)
-        layer.addSublayer(coreLayer)
+        layer.addSublayer(bandLayer)
 
-        trailLayer.fillColor = nil
-        trailLayer.lineCap = .round
-        trailLayer.lineJoin = .round
-
-        coreLayer.fillColor = nil
-        coreLayer.lineCap = .round
-        coreLayer.lineJoin = .round
+        bandLayer.fillColor = nil
+        bandLayer.lineCap = .round
+        bandLayer.lineJoin = .round
 
         updateStrokeStyle()
     }
 
     private func updateStrokeStyle() {
-        trailLayer.lineWidth = currentLineWidth + 1.4
-        trailLayer.strokeColor = currentSecondaryColor.withAlphaComponent(0.48).cgColor
-        trailLayer.shadowColor = currentSecondaryColor.withAlphaComponent(0.28).cgColor
-        trailLayer.shadowOpacity = 0.35
-        trailLayer.shadowRadius = 3
-        trailLayer.shadowOffset = .zero
-
-        coreLayer.lineWidth = currentLineWidth
-        coreLayer.strokeColor = NSColor.white.withAlphaComponent(0.92).cgColor
-        coreLayer.shadowColor = currentBaseColor.withAlphaComponent(0.22).cgColor
-        coreLayer.shadowOpacity = 0.25
-        coreLayer.shadowRadius = 1.5
-        coreLayer.shadowOffset = .zero
+        bandLayer.lineWidth = currentLineWidth
+        bandLayer.strokeColor = NSColor.white.withAlphaComponent(0.96).cgColor
+        bandLayer.shadowColor = currentSecondaryColor.withAlphaComponent(0.72).cgColor
+        bandLayer.shadowOpacity = 0.9
+        bandLayer.shadowRadius = 6
+        bandLayer.shadowOffset = .zero
+        bandLayer.opacity = 1.0
     }
 
     private func updateDashPattern() {
         guard currentPerimeter > 1 else { return }
 
-        let trailSegment = min(max(44, currentPerimeter * 0.16), max(2, currentPerimeter - 2))
-        let trailGap = max(1, currentPerimeter - trailSegment)
-        trailLayer.lineDashPattern = [trailSegment as NSNumber, trailGap as NSNumber]
-
-        let coreSegment = min(max(24, currentPerimeter * 0.08), max(2, currentPerimeter - 2))
-        let coreGap = max(1, currentPerimeter - coreSegment)
-        coreLayer.lineDashPattern = [coreSegment as NSNumber, coreGap as NSNumber]
+        let segment = min(max(54, currentPerimeter * 0.12), max(2, currentPerimeter - 2))
+        let gap = max(1, currentPerimeter - segment)
+        bandLayer.lineDashPattern = [segment as NSNumber, gap as NSNumber]
     }
 
-    private func restartAnimations() {
+    private func restartAnimation() {
         guard currentPerimeter > 1 else { return }
-        trailLayer.removeAnimation(forKey: trailAnimationKey)
-        coreLayer.removeAnimation(forKey: coreAnimationKey)
-        trailLayer.add(makeDashPhaseAnimation(distance: currentPerimeter, duration: 4.8), forKey: trailAnimationKey)
-        coreLayer.add(makeDashPhaseAnimation(distance: currentPerimeter, duration: 4.8), forKey: coreAnimationKey)
+        bandLayer.removeAnimation(forKey: bandAnimationKey)
+        bandLayer.add(makeDashPhaseAnimation(distance: currentPerimeter, duration: 4.8), forKey: bandAnimationKey)
     }
 
     private func makeDashPhaseAnimation(distance: CGFloat, duration: TimeInterval) -> CABasicAnimation {
