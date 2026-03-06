@@ -6,7 +6,6 @@ struct PlaybackControlsView: View {
     @State private var playButtonPressed = false
     @State private var previousButtonPressed = false
     @State private var nextButtonPressed = false
-    @State private var isPulsing = false
     @State private var previousHovered = false
     @State private var nextHovered = false
     @Environment(\.colorScheme) private var colorScheme
@@ -58,13 +57,11 @@ struct PlaybackControlsView: View {
                 // 主播放按钮
                 Button(action: togglePlayback) {
                     ZStack {
-                        // 脉动光环（播放时显示）
+                        // 静态光环：保留播放态强调，但避免常驻 repeatForever 动画持续重绘。
                         if audioPlayer.isPlaying {
                             Circle()
-                                .stroke(theme.accent.opacity(0.4), lineWidth: 3)
+                                .stroke(theme.accent.opacity(0.28), lineWidth: 2)
                                 .frame(width: 80, height: 80)
-                                .scaleEffect(isPulsing ? 1.3 : 1.0)
-                                .opacity(isPulsing ? 0 : 0.5)
                         }
 
                         // 发光背景
@@ -98,18 +95,6 @@ struct PlaybackControlsView: View {
                 .onLongPressGesture(minimumDuration: 0, maximumDistance: .infinity, pressing: { pressing in
                     playButtonPressed = pressing
                 }, perform: {})
-                .onChange(of: audioPlayer.isPlaying) { playing in
-                    if playing {
-                        startPulsingAnimation()
-                    } else {
-                        isPulsing = false
-                    }
-                }
-                .onAppear {
-                    if audioPlayer.isPlaying {
-                        startPulsingAnimation()
-                    }
-                }
 
                 // 下一首按钮
                 Button(action: nextTrack) {
@@ -270,12 +255,6 @@ struct PlaybackControlsView: View {
         guard !isEphemeralPlayback else { return }
         if let randomFile = playlistManager.getRandomFileExcludingCurrent() {
             audioPlayer.play(randomFile)
-        }
-    }
-
-    private func startPulsingAnimation() {
-        withAnimation(.easeOut(duration: 2.0).repeatForever(autoreverses: false)) {
-            isPulsing = true
         }
     }
 }

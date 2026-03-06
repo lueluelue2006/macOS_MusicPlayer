@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Darwin
 import MusicPlayerIPC
 
 final class IPCServer {
@@ -7,12 +8,23 @@ final class IPCServer {
     private let playlistManager: PlaylistManager
     private let playlistsStore: PlaylistsStore
     private let center = DistributedNotificationCenter.default()
+    private let instanceID: String
+    private let requestNotificationName: Notification.Name
+    private let replyNotificationName: Notification.Name
+    private let authToken: String
+    private let registrationURL: URL?
     private var observer: NSObjectProtocol?
 
     init(audioPlayer: AudioPlayer, playlistManager: PlaylistManager, playlistsStore: PlaylistsStore) {
         self.audioPlayer = audioPlayer
         self.playlistManager = playlistManager
         self.playlistsStore = playlistsStore
+        let instanceID = UUID().uuidString
+        self.instanceID = instanceID
+        self.requestNotificationName = MusicPlayerIPC.requestNotification(for: instanceID)
+        self.replyNotificationName = MusicPlayerIPC.replyNotification(for: instanceID)
+        self.authToken = Self.loadOrCreateAuthToken()
+        self.registrationURL = Self.registrationURL(for: instanceID)
         start()
     }
 
@@ -20,11 +32,13 @@ final class IPCServer {
         if let observer {
             center.removeObserver(observer)
         }
+        unregisterInstance()
     }
 
     private func start() {
+        registerInstance()
         observer = center.addObserver(
-            forName: MusicPlayerIPC.requestNotification,
+            forName: requestNotificationName,
             object: nil,
             queue: OperationQueue.main
         ) { [weak self] notification in
@@ -47,6 +61,14 @@ final class IPCServer {
 
     @MainActor
     private func handleRequest(_ request: IPCRequest) async -> IPCReply {
+        guard isAuthenticated(request) else {
+            return IPCReply(
+                id: request.id,
+                ok: false,
+                message: "CLI 鉴权失败。请使用同一用户环境下的最新版 musicplayerctl。"
+            )
+        }
+
         guard isRequestAllowed(request) else {
             return IPCReply(
                 id: request.id,
@@ -436,7 +458,11 @@ final class IPCServer {
                 let urlToRemove = playlistManager.audioFiles[idx].url
                 playlistManager.removeFile(at: idx)
                 if let currentURL, currentURL == urlToRemove {
-                    audioPlayer.handleCurrentTrackRemoved(remainingFiles: playlistManager.audioFiles, playNext: nil)
+                    audioPlayer.handleCurrentTrackRemoved(
+                        remainingFiles: playlistManager.audioFiles,
+                        playNext: { self.playlistManager.nextFile(isShuffling: false) },
+                        playRandom: { self.playlistManager.getRandomFile() }
+                    )
                 }
                 return IPCReply(
                     id: request.id,
@@ -508,7 +534,11 @@ final class IPCServer {
             }
 
             if let currentURL, urlsToRemove.contains(currentURL) {
-                audioPlayer.handleCurrentTrackRemoved(remainingFiles: playlistManager.audioFiles, playNext: nil)
+                audioPlayer.handleCurrentTrackRemoved(
+                    remainingFiles: playlistManager.audioFiles,
+                    playNext: { self.playlistManager.nextFile(isShuffling: false) },
+                    playRandom: { self.playlistManager.getRandomFile() }
+                )
             }
 
             return IPCReply(
@@ -1577,11 +1607,124 @@ final class IPCServer {
     private func postReply(_ reply: IPCReply) {
         guard let data = try? MusicPlayerIPC.encodePayload(reply) else { return }
         center.postNotificationName(
-            MusicPlayerIPC.replyNotification,
+            replyNotificationName,
             object: nil,
             userInfo: [MusicPlayerIPC.payloadKey: data],
             deliverImmediately: true
         )
+    }
+
+    private func isAuthenticated(_ request: IPCRequest) -> Bool {
+        guard let provided = request.authToken?.trimmingCharacters(in: .whitespacesAndNewlines), !provided.isEmpty else {
+            return false
+        }
+        return provided == authToken
+    }
+
+    private func registerInstance() {
+        Self.cleanupStaleRegistrations()
+        guard let registrationURL else { return }
+        let payload = IPCInstanceRegistration(
+            instanceID: instanceID,
+            pid: ProcessInfo.processInfo.processIdentifier,
+            startedAt: Date().timeIntervalSince1970,
+            bundlePath: Bundle.main.bundleURL.path,
+            requestNotificationName: requestNotificationName.rawValue,
+            replyNotificationName: replyNotificationName.rawValue
+        )
+        do {
+            let data = try JSONEncoder().encode(payload)
+            try data.write(to: registrationURL, options: .atomic)
+        } catch {
+            PersistenceLogger.log("写入 IPC 实例注册失败: \(error)")
+        }
+    }
+
+    private func unregisterInstance() {
+        guard let registrationURL else { return }
+        try? FileManager.default.removeItem(at: registrationURL)
+    }
+
+    private static func loadOrCreateAuthToken() -> String {
+        let generated = [UUID().uuidString, UUID().uuidString].joined()
+        guard let tokenURL = authTokenURL() else { return generated }
+        if let existing = try? String(contentsOf: tokenURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !existing.isEmpty {
+            return existing
+        }
+
+        do {
+            let fm = FileManager.default
+            try fm.createDirectory(at: tokenURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try generated.write(to: tokenURL, atomically: true, encoding: .utf8)
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tokenURL.path)
+        } catch {
+            PersistenceLogger.log("写入 IPC 鉴权 token 失败: \(error)")
+        }
+        return generated
+    }
+
+    private static func appSupportDirectory() -> URL? {
+        let fm = FileManager.default
+        guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+        let dir = base.appendingPathComponent("MusicPlayer", isDirectory: true)
+        if !fm.fileExists(atPath: dir.path) {
+            do {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            } catch {
+                return nil
+            }
+        }
+        return dir
+    }
+
+    private static func registryDirectoryURL() -> URL? {
+        guard let dir = appSupportDirectory() else { return nil }
+        let registry = dir.appendingPathComponent(MusicPlayerIPC.registryDirectoryName, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: registry.path) {
+            do {
+                try FileManager.default.createDirectory(at: registry, withIntermediateDirectories: true)
+            } catch {
+                return nil
+            }
+        }
+        return registry
+    }
+
+    private static func registrationURL(for instanceID: String) -> URL? {
+        registryDirectoryURL()?.appendingPathComponent("\(instanceID).json", isDirectory: false)
+    }
+
+    private static func authTokenURL() -> URL? {
+        appSupportDirectory()?.appendingPathComponent(MusicPlayerIPC.authTokenFileName, isDirectory: false)
+    }
+
+    private static func cleanupStaleRegistrations() {
+        guard let registryDirectory = registryDirectoryURL() else { return }
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: registryDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        for url in entries where url.pathExtension.lowercased() == "json" {
+            guard let data = try? Data(contentsOf: url),
+                  let registration = try? JSONDecoder().decode(IPCInstanceRegistration.self, from: data)
+            else {
+                try? FileManager.default.removeItem(at: url)
+                continue
+            }
+            if !processExists(pid: registration.pid) {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+
+    private static func processExists(pid: Int32) -> Bool {
+        guard pid > 0 else { return false }
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
     }
 
     private func formatMs(_ value: Double?) -> String {

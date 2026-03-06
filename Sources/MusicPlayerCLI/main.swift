@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import MusicPlayerIPC
 
 private enum ExitCode: Int32 {
@@ -65,16 +66,114 @@ private func defaultScreenshotPath() -> String {
     return desktop.appendingPathComponent(name, isDirectory: false).path
 }
 
+private func musicPlayerAppSupportDirectory() -> URL? {
+    let fm = FileManager.default
+    guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+    return base.appendingPathComponent("MusicPlayer", isDirectory: true)
+}
+
+private func ipcRegistryDirectoryURL() -> URL? {
+    musicPlayerAppSupportDirectory()?.appendingPathComponent(MusicPlayerIPC.registryDirectoryName, isDirectory: true)
+}
+
+private func ipcAuthTokenURL() -> URL? {
+    musicPlayerAppSupportDirectory()?.appendingPathComponent(MusicPlayerIPC.authTokenFileName, isDirectory: false)
+}
+
+private func loadIPCAuthToken() -> String? {
+    guard let url = ipcAuthTokenURL(),
+          let raw = try? String(contentsOf: url, encoding: .utf8)
+    else { return nil }
+    let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return token.isEmpty ? nil : token
+}
+
+private func processExists(_ pid: Int32) -> Bool {
+    guard pid > 0 else { return false }
+    if kill(pid, 0) == 0 { return true }
+    return errno == EPERM
+}
+
+private func loadIPCRegistrations() -> [IPCInstanceRegistration] {
+    guard let dir = ipcRegistryDirectoryURL(),
+          let urls = try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+          )
+    else { return [] }
+
+    var results: [IPCInstanceRegistration] = []
+    for url in urls where url.pathExtension.lowercased() == "json" {
+        guard let data = try? Data(contentsOf: url),
+              let registration = try? JSONDecoder().decode(IPCInstanceRegistration.self, from: data)
+        else {
+            try? FileManager.default.removeItem(at: url)
+            continue
+        }
+        if processExists(registration.pid) {
+            results.append(registration)
+        } else {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+    return results
+}
+
+private func registrationRank(_ registration: IPCInstanceRegistration) -> Int {
+    let path = registration.bundlePath
+    if path == "/Applications/MusicPlayer.app" { return 0 }
+    if path.hasSuffix(".app") { return 1 }
+    return 2
+}
+
+private func selectedIPCRegistration() -> IPCInstanceRegistration? {
+    let registrations = loadIPCRegistrations()
+    guard !registrations.isEmpty else { return nil }
+
+    if let forcedID = ProcessInfo.processInfo.environment["MUSICPLAYER_INSTANCE_ID"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+       !forcedID.isEmpty,
+       let matched = registrations.first(where: { $0.instanceID == forcedID }) {
+        return matched
+    }
+
+    return registrations.sorted {
+        let lhsRank = registrationRank($0)
+        let rhsRank = registrationRank($1)
+        if lhsRank != rhsRank { return lhsRank < rhsRank }
+        if $0.startedAt != $1.startedAt { return $0.startedAt > $1.startedAt }
+        return $0.pid > $1.pid
+    }.first
+}
+
+private func attachAuthToken(_ request: IPCRequest, authToken: String?) -> IPCRequest {
+    guard request.authToken == nil else { return request }
+    return IPCRequest(
+        id: request.id,
+        command: request.command,
+        arguments: request.arguments,
+        paths: request.paths,
+        authToken: authToken
+    )
+}
+
 private func sendRequest(_ request: IPCRequest, timeoutSeconds: TimeInterval) -> IPCReply? {
+    guard let registration = selectedIPCRegistration() else { return nil }
     let center = DistributedNotificationCenter.default()
+    let authedRequest = attachAuthToken(request, authToken: loadIPCAuthToken())
 
     var reply: IPCReply?
-    let observer = center.addObserver(forName: MusicPlayerIPC.replyNotification, object: nil, queue: OperationQueue.main) { notification in
+    let observer = center.addObserver(
+        forName: Notification.Name(registration.replyNotificationName),
+        object: nil,
+        queue: OperationQueue.main
+    ) { notification in
         guard
             let userInfo = notification.userInfo,
             let data = userInfo[MusicPlayerIPC.payloadKey] as? Data,
             let decoded = try? MusicPlayerIPC.decodePayload(IPCReply.self, from: data),
-            decoded.id == request.id
+            decoded.id == authedRequest.id
         else { return }
         reply = decoded
     }
@@ -82,9 +181,9 @@ private func sendRequest(_ request: IPCRequest, timeoutSeconds: TimeInterval) ->
     defer { center.removeObserver(observer) }
 
     do {
-        let data = try MusicPlayerIPC.encodePayload(request)
+        let data = try MusicPlayerIPC.encodePayload(authedRequest)
         center.postNotificationName(
-            MusicPlayerIPC.requestNotification,
+            Notification.Name(registration.requestNotificationName),
             object: nil,
             userInfo: [MusicPlayerIPC.payloadKey: data],
             deliverImmediately: true

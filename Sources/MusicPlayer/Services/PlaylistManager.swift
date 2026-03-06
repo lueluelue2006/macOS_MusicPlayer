@@ -341,13 +341,15 @@ final class PlaylistManager: ObservableObject {
         initialRestoreTask?.cancel()
         initialRestoreTask = Task.detached(priority: .userInitiated) { [weak self, weak audioPlayer] in
             guard let self, let audioPlayer else { return }
-            await playlistsStore.ensureLoaded()
-            await self.loadSavedPlaylist(audioPlayer: audioPlayer)
             let skipRestore = await MainActor.run {
-                // 若本次启动是通过 Finder/Dock 外部文件打开，则不恢复上次播放/播放范围
+                // 若本次启动是通过 Finder/Dock 外部文件打开，则整个恢复流程都应跳过，
+                // 否则“只想临时播放一首歌”仍会先支付完整队列恢复成本。
                 audioPlayer.consumeSkipRestoreThisLaunch()
             }
             if skipRestore { return }
+
+            await playlistsStore.ensureLoaded()
+            await self.loadSavedPlaylist(audioPlayer: audioPlayer)
 
             await self.restorePlaybackScopeIfNeeded(playlistsStore: playlistsStore)
 
@@ -1669,6 +1671,8 @@ final class PlaylistManager: ObservableObject {
         var restoredFiles: [AudioFile] = []
         restoredFiles.reserveCapacity(validURLs.count)
         var cacheHits = 0
+        var needsHydration: [URL] = []
+        needsHydration.reserveCapacity(validURLs.count)
         for url in validURLs {
             let duration = await DurationCache.shared.cachedDurationIfValid(for: url)
             if let cached = await MetadataCache.shared.cachedMetadataIfValid(for: url) {
@@ -1688,6 +1692,7 @@ final class PlaylistManager: ObservableObject {
                 artwork: nil
             )
             restoredFiles.append(AudioFile(url: url, metadata: metadata, duration: duration))
+            needsHydration.append(url)
         }
         debugLog("恢复播放列表元数据缓存命中: \(cacheHits)/\(validURLs.count)")
 
@@ -1707,9 +1712,11 @@ final class PlaylistManager: ObservableObject {
         }
 
         // 在后台逐步补全真实元数据（避免重启后整列表都显示“未知艺术家/未知专辑”）。
+        let hydrationURLs = needsHydration
+        guard !hydrationURLs.isEmpty else { return }
         restoredMetadataHydrationTask = Task.detached(priority: .utility) { [weak self, weak audioPlayer] in
             guard let self else { return }
-            await self.hydrateRestoredMetadata(urls: validURLs, audioPlayer: audioPlayer)
+            await self.hydrateRestoredMetadata(urls: hydrationURLs, audioPlayer: audioPlayer)
         }
     }
 

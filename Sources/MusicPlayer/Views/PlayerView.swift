@@ -172,57 +172,23 @@ struct FlowingEdgeBorder: View {
     let base: Color
     let secondary: Color
     let enabled: Bool
-    var duration: TimeInterval = 3.4
-    var segmentRatio: CGFloat = 0.18
 
     var body: some View {
         if enabled {
-            GeometryReader { proxy in
-                let width = max(1, proxy.size.width)
-                let height = max(1, proxy.size.height)
-                let radius = min(cornerRadius, min(width, height) / 2)
-                let perimeter = roundedRectanglePerimeter(width: width, height: height, radius: radius)
-                let dashOn = max(8, perimeter * segmentRatio)
-                let dashOff = max(1, perimeter - dashOn)
-
-                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
-                    let phase: CGFloat = {
-                        guard duration > 0 else { return 0 }
-                        let value = (timeline.date.timeIntervalSinceReferenceDate / duration).truncatingRemainder(dividingBy: 1)
-                        return CGFloat(value)
-                    }()
-
-                    RoundedRectangle(cornerRadius: radius)
-                        .stroke(
-                            style: StrokeStyle(
-                                lineWidth: lineWidth,
-                                lineCap: .round,
-                                lineJoin: .round,
-                                dash: [dashOn, dashOff],
-                                dashPhase: -phase * perimeter
-                            )
-                        )
-                        .foregroundStyle(
-                            LinearGradient(
-                                colors: [base.opacity(0.95), .white.opacity(0.95), secondary.opacity(0.95)],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
-                }
-            }
-            .drawingGroup()
-            .allowsHitTesting(false)
+            RoundedRectangle(cornerRadius: cornerRadius)
+                .stroke(
+                    LinearGradient(
+                        colors: [base.opacity(0.95), .white.opacity(0.95), secondary.opacity(0.95)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    ),
+                    lineWidth: lineWidth
+                )
+                .allowsHitTesting(false)
         } else {
             Color.clear
                 .allowsHitTesting(false)
         }
-    }
-
-    private func roundedRectanglePerimeter(width: CGFloat, height: CGFloat, radius: CGFloat) -> CGFloat {
-        let straight = 2 * (width + height - 4 * radius)
-        let arc = 2 * .pi * radius
-        return max(1, straight + arc)
     }
 }
 

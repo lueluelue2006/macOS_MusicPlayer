@@ -19,8 +19,12 @@ final class AudioPlayer: NSObject, ObservableObject {
     @Published var isShuffling = true  // 默认开启随机播放
     @Published var isNormalizationEnabled = true  // 音量均衡开关
     // 歌词相关
-    @Published var lyricsTimeline: LyricsTimeline?
-    @Published var showLyrics: Bool = true
+    @Published var lyricsTimeline: LyricsTimeline? {
+        didSet { refreshPlaybackTimerPrecisionIfNeeded() }
+    }
+    @Published var showLyrics: Bool = true {
+        didSet { refreshPlaybackTimerPrecisionIfNeeded() }
+    }
     // 当前曲目封面缩略图（低内存：仅保留缩放后的图，不保留原始 artwork Data）
     @Published var artworkImage: NSImage?
     // 当前系统音频输出设备显示（用于 UI 展示）
@@ -941,7 +945,8 @@ final class AudioPlayer: NSObject, ObservableObject {
     private func startTimer() {
         // 确保只存在一个计时器，并使用 .common 模式防止 UI 交互导致暂停
         stopTimer()
-	        let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+        let interval = playbackClockUpdateInterval()
+	        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
 	            guard let self = self, let player = self.player else { return }
             // 若系统层面导致播放器停止（例如音频路由变化/耳机断开），
             // AVAudioPlayer 可能会自行变为未播放状态，但未必触发 delegate 回调。
@@ -969,13 +974,29 @@ final class AudioPlayer: NSObject, ObservableObject {
         timer?.invalidate()
         timer = nil
     }
+
+    private func playbackClockUpdateInterval() -> TimeInterval {
+        if showLyrics, let timeline = lyricsTimeline, timeline.isSynced {
+            return 0.1
+        }
+        return 0.25
+    }
+
+    private func refreshPlaybackTimerPrecisionIfNeeded() {
+        guard isPlaying, player != nil else { return }
+        startTimer()
+    }
     
     // MARK: - 删除当前播放项后的回调处理
     /// 在“删除歌曲”时，如果删除的是当前播放曲目，由上层调用本方法以执行正确的后续动作
     /// - Parameters:
     ///   - remainingFiles: 删除后当前播放列表剩余的文件（用于随机/顺序继续播放）
     ///   - playNext: 可选的“获取下一首”的闭包（若上层有顺序管理器可传入），未提供时将不处理顺序下一首
-    func handleCurrentTrackRemoved(remainingFiles: [AudioFile], playNext: (() -> AudioFile?)? = nil) {
+    func handleCurrentTrackRemoved(
+        remainingFiles: [AudioFile],
+        playNext: (() -> AudioFile?)? = nil,
+        playRandom: (() -> AudioFile?)? = nil
+    ) {
         // 单曲循环：立即停止并清空当前歌曲
         if isLooping {
             stop()
@@ -985,7 +1006,7 @@ final class AudioPlayer: NSObject, ObservableObject {
         }
         // 随机模式：从剩余文件中随机一首继续播放；若空则停止并清空
         if isShuffling {
-            if let next = remainingFiles.randomElement() {
+            if let next = playRandom?() ?? remainingFiles.randomElement() {
                 play(next)
             } else {
                 stop()

@@ -290,7 +290,11 @@ struct PlaylistView: View {
 		                                        
 		                                        // 如果后续需要顺序“下一首”，可在此提供闭包：playNext: { playlistManager.nextAfterDeletion(from: index) }
 		                                        // 现阶段按约定：单曲循环->停止并清空；随机->随机一首；其他->停止并清空
-		                                        audioPlayer.handleCurrentTrackRemoved(remainingFiles: remaining, playNext: nil)
+		                                        audioPlayer.handleCurrentTrackRemoved(
+		                                            remainingFiles: remaining,
+		                                            playNext: { playlistManager.nextFile(isShuffling: false) },
+		                                            playRandom: { playlistManager.getRandomFile() }
+		                                        )
 		                                    }
 		                                }
 		                            },

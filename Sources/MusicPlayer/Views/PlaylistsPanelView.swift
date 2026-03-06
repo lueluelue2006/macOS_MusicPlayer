@@ -484,7 +484,6 @@ struct PlaylistsPanelView: View {
             func key(for url: URL) -> String {
                 url.standardizedFileURL.path
                     .precomposedStringWithCanonicalMapping
-                    .lowercased()
             }
             var results: [AudioFile?] = Array(repeating: nil, count: paths.count)
             var reasons: [String: String] = [:]
