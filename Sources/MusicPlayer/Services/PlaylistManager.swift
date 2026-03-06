@@ -198,8 +198,9 @@ final class PlaylistManager: ObservableObject {
                 let key = pathKey(url)
                 if existingQueueKeys.contains(key) { continue }
 
-                let duration = await DurationCache.shared.cachedDurationIfValid(for: url)
-                if let cached = await MetadataCache.shared.cachedMetadataIfValid(for: url) {
+                let snapshot = FileValidationSnapshot.load(for: url)
+                let duration = await DurationCache.shared.cachedDurationIfValid(for: url, snapshot: snapshot)
+                if let cached = await MetadataCache.shared.cachedMetadataIfValid(for: url, snapshot: snapshot) {
                     toAppend.append(AudioFile(url: url, metadata: cached, duration: duration))
                 } else {
                     let title = url.deletingPathExtension().lastPathComponent
@@ -339,8 +340,10 @@ final class PlaylistManager: ObservableObject {
         didPerformInitialRestore = true
 
         initialRestoreTask?.cancel()
-        initialRestoreTask = Task.detached(priority: .userInitiated) { [weak self, weak audioPlayer] in
+        initialRestoreTask = Task.detached(priority: .utility) { [weak self, weak audioPlayer] in
             guard let self, let audioPlayer else { return }
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            if Task.isCancelled { return }
             let skipRestore = await MainActor.run {
                 // 若本次启动是通过 Finder/Dock 外部文件打开，则整个恢复流程都应跳过，
                 // 否则“只想临时播放一首歌”仍会先支付完整队列恢复成本。
@@ -816,12 +819,12 @@ final class PlaylistManager: ObservableObject {
 
     /// 加载元数据（带磁盘缓存）：仅缓存标题/艺术家/专辑，并用 (mtime+size) 做失效判断。
     /// - 目的：重启/清空后重新导入时避免反复读取 AVAsset 元数据（更快、更省 CPU）。
-    func loadCachedMetadata(from url: URL) async -> AudioMetadata {
-        if let cached = await MetadataCache.shared.cachedMetadataIfValid(for: url) {
+    func loadCachedMetadata(from url: URL, snapshot: FileValidationSnapshot? = nil) async -> AudioMetadata {
+        if let cached = await MetadataCache.shared.cachedMetadataIfValid(for: url, snapshot: snapshot) {
             return cached
         }
         let fresh = await loadFreshMetadata(from: url)
-        await MetadataCache.shared.storeBasicMetadata(fresh, for: url)
+        await MetadataCache.shared.storeBasicMetadata(fresh, for: url, snapshot: snapshot)
         return fresh
     }
     
@@ -1645,10 +1648,13 @@ final class PlaylistManager: ObservableObject {
         }
 
         let fileManager = FileManager.default
-        let validURLs: [URL] = saved.paths.compactMap { path in
-            guard fileManager.fileExists(atPath: path) else { return nil }
-            return URL(fileURLWithPath: path)
+        let validEntries: [(url: URL, snapshot: FileValidationSnapshot)] = saved.paths.compactMap { path in
+            let url = URL(fileURLWithPath: path)
+            let snapshot = FileValidationSnapshot.load(for: url, fileManager: fileManager)
+            guard snapshot.exists else { return nil }
+            return (url, snapshot)
         }
+        let validURLs = validEntries.map(\.url)
 
         if validURLs.isEmpty {
             debugLog("保存的播放列表中没有任何仍然存在的文件")
@@ -1673,9 +1679,16 @@ final class PlaylistManager: ObservableObject {
         var cacheHits = 0
         var needsHydration: [URL] = []
         needsHydration.reserveCapacity(validURLs.count)
-        for url in validURLs {
-            let duration = await DurationCache.shared.cachedDurationIfValid(for: url)
-            if let cached = await MetadataCache.shared.cachedMetadataIfValid(for: url) {
+        var missingDurationURLs: [URL] = []
+        missingDurationURLs.reserveCapacity(validURLs.count)
+        for entry in validEntries {
+            let url = entry.url
+            let snapshot = entry.snapshot
+            let duration = await DurationCache.shared.cachedDurationIfValid(for: url, snapshot: snapshot)
+            if duration == nil {
+                missingDurationURLs.append(url)
+            }
+            if let cached = await MetadataCache.shared.cachedMetadataIfValid(for: url, snapshot: snapshot) {
                 restoredFiles.append(AudioFile(url: url, metadata: cached, duration: duration))
                 cacheHits += 1
                 continue
@@ -1697,13 +1710,14 @@ final class PlaylistManager: ObservableObject {
         debugLog("恢复播放列表元数据缓存命中: \(cacheHits)/\(validURLs.count)")
 
         let restoredFilesSnapshot = restoredFiles
+        let durationPrefetchURLs = missingDurationURLs
         await MainActor.run {
             self.audioFiles = restoredFilesSnapshot
             self.invalidateQueueIndexCache()
             self.currentIndex = 0
             self.updateFilteredFiles()
             self.resetShuffleQueue()
-            self.enqueueDurationPrefetch(for: validURLs)
+            self.enqueueDurationPrefetch(for: durationPrefetchURLs)
         }
 
         // 恢复完成；后续由 AudioPlayer.loadLastPlayedFile 按需定位到具体曲目

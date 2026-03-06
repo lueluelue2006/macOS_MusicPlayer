@@ -1,6 +1,7 @@
 import SwiftUI
 import Combine
 import AppKit
+import QuartzCore
 
 struct PlayerView: View {
     @ObservedObject var audioPlayer: AudioPlayer
@@ -175,20 +176,160 @@ struct FlowingEdgeBorder: View {
 
     var body: some View {
         if enabled {
-            RoundedRectangle(cornerRadius: cornerRadius)
-                .stroke(
-                    LinearGradient(
-                        colors: [base.opacity(0.95), .white.opacity(0.95), secondary.opacity(0.95)],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    ),
-                    lineWidth: lineWidth
-                )
+            FlowingEdgeBorderLayerView(
+                cornerRadius: cornerRadius,
+                lineWidth: lineWidth,
+                baseColor: NSColor(base),
+                secondaryColor: NSColor(secondary)
+            )
                 .allowsHitTesting(false)
         } else {
             Color.clear
                 .allowsHitTesting(false)
         }
+    }
+}
+
+private struct FlowingEdgeBorderLayerView: NSViewRepresentable {
+    let cornerRadius: CGFloat
+    let lineWidth: CGFloat
+    let baseColor: NSColor
+    let secondaryColor: NSColor
+
+    func makeNSView(context: Context) -> FlowingEdgeBorderHostingView {
+        let view = FlowingEdgeBorderHostingView()
+        view.update(cornerRadius: cornerRadius, lineWidth: lineWidth, baseColor: baseColor, secondaryColor: secondaryColor)
+        return view
+    }
+
+    func updateNSView(_ nsView: FlowingEdgeBorderHostingView, context: Context) {
+        nsView.update(cornerRadius: cornerRadius, lineWidth: lineWidth, baseColor: baseColor, secondaryColor: secondaryColor)
+    }
+}
+
+private final class FlowingEdgeBorderHostingView: NSView {
+    private let trailLayer = CAShapeLayer()
+    private let coreLayer = CAShapeLayer()
+    private let trailAnimationKey = "flow.trail"
+    private let coreAnimationKey = "flow.core"
+
+    private var currentCornerRadius: CGFloat = 0
+    private var currentLineWidth: CGFloat = 0
+    private var currentBaseColor: NSColor = .systemTeal
+    private var currentSecondaryColor: NSColor = .systemMint
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer = CALayer()
+        setupLayers()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+        layer = CALayer()
+        setupLayers()
+    }
+
+    override var isFlipped: Bool {
+        true
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let path = CGPath(
+            roundedRect: bounds.insetBy(dx: currentLineWidth / 2, dy: currentLineWidth / 2),
+            cornerWidth: currentCornerRadius,
+            cornerHeight: currentCornerRadius,
+            transform: nil
+        )
+        trailLayer.frame = bounds
+        trailLayer.path = path
+        trailLayer.shadowPath = path
+        coreLayer.frame = bounds
+        coreLayer.path = path
+        coreLayer.shadowPath = path
+        CATransaction.commit()
+    }
+
+    func update(cornerRadius: CGFloat, lineWidth: CGFloat, baseColor: NSColor, secondaryColor: NSColor) {
+        currentCornerRadius = cornerRadius
+        currentLineWidth = lineWidth
+        currentBaseColor = baseColor
+        currentSecondaryColor = secondaryColor
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        updateStrokeStyle()
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+        CATransaction.commit()
+
+        ensureAnimation()
+    }
+
+    private func setupLayers() {
+        guard let layer else { return }
+        layer.masksToBounds = false
+        layer.addSublayer(trailLayer)
+        layer.addSublayer(coreLayer)
+
+        trailLayer.fillColor = nil
+        trailLayer.lineCap = .round
+        trailLayer.lineJoin = .round
+
+        coreLayer.fillColor = nil
+        coreLayer.lineCap = .round
+        coreLayer.lineJoin = .round
+
+        updateStrokeStyle()
+        ensureAnimation()
+    }
+
+    private func updateStrokeStyle() {
+        trailLayer.lineWidth = currentLineWidth + 1.2
+        trailLayer.strokeColor = currentSecondaryColor.withAlphaComponent(0.72).cgColor
+        trailLayer.shadowColor = currentSecondaryColor.withAlphaComponent(0.55).cgColor
+        trailLayer.shadowOpacity = 0.85
+        trailLayer.shadowRadius = 8
+        trailLayer.shadowOffset = .zero
+
+        coreLayer.lineWidth = currentLineWidth
+        coreLayer.strokeColor = NSColor.white.withAlphaComponent(0.92).cgColor
+        coreLayer.shadowColor = currentBaseColor.withAlphaComponent(0.50).cgColor
+        coreLayer.shadowOpacity = 0.70
+        coreLayer.shadowRadius = 4
+        coreLayer.shadowOffset = .zero
+    }
+
+    private func ensureAnimation() {
+        if trailLayer.animation(forKey: trailAnimationKey) == nil {
+            trailLayer.add(makeStrokeAnimation(segmentLength: 0.20, duration: 4.8), forKey: trailAnimationKey)
+        }
+        if coreLayer.animation(forKey: coreAnimationKey) == nil {
+            coreLayer.add(makeStrokeAnimation(segmentLength: 0.11, duration: 4.8), forKey: coreAnimationKey)
+        }
+    }
+
+    private func makeStrokeAnimation(segmentLength: CGFloat, duration: TimeInterval) -> CAAnimationGroup {
+        let start = CABasicAnimation(keyPath: "strokeStart")
+        start.fromValue = -segmentLength
+        start.toValue = 1.0
+
+        let end = CABasicAnimation(keyPath: "strokeEnd")
+        end.fromValue = 0.0
+        end.toValue = 1.0 + segmentLength
+
+        let group = CAAnimationGroup()
+        group.animations = [start, end]
+        group.duration = duration
+        group.repeatCount = .infinity
+        group.timingFunction = CAMediaTimingFunction(name: .linear)
+        group.isRemovedOnCompletion = false
+        return group
     }
 }
 
@@ -573,13 +714,14 @@ struct StaticLyricsView: View {
 
 	struct SyncedLyricsView: View {
 	    let timeline: LyricsTimeline
-	    @ObservedObject var playbackClock: PlaybackClock
+	    let playbackClock: PlaybackClock
 	    let onSeek: (TimeInterval) -> Void
 
     // User interaction state
 	    @State private var isUserScrolling: Bool = false
 	    @State private var autoFollowEnabled: Bool = true
 	    @State private var lastScrolledLineID: Int? = nil
+	    @State private var activeLineID: Int? = nil
 
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
@@ -587,18 +729,16 @@ struct StaticLyricsView: View {
     var body: some View {
         // Place control bar and lyrics list inside one ScrollViewReader so we can scroll from the button
         ScrollViewReader { proxy in
-            VStack(spacing: 8) {
-                // Top control bar: locate/follow toggle and hint when paused
-                HStack(spacing: 8) {
-                    Button {
-                        if let idx = timeline.currentIndex(at: playbackClock.currentTime),
-                           idx >= 0, idx < timeline.lines.count {
-                            withAnimation(.easeInOut(duration: 0.25)) {
-                                let id = timeline.lines[idx].id
-                                proxy.scrollTo(id, anchor: .center)
-                            }
-                        }
-                        autoFollowEnabled = true
+	            VStack(spacing: 8) {
+	                // Top control bar: locate/follow toggle and hint when paused
+	                HStack(spacing: 8) {
+	                    Button {
+	                        if let activeLineID {
+	                            withAnimation(.easeInOut(duration: 0.25)) {
+	                                proxy.scrollTo(activeLineID, anchor: .center)
+	                            }
+	                        }
+	                        autoFollowEnabled = true
                         isUserScrolling = false
                     } label: {
                         Label("定位当前句", systemImage: "location.viewfinder")
@@ -622,18 +762,13 @@ struct StaticLyricsView: View {
                 }
                 .padding(.horizontal, 4)
 
-                // Lyrics list with programmatic scroll — 默认渲染完整歌词
-		                ScrollView {
-		                    // 将“行间距”做进每行的 padding，这样双击跳转不会在两行之间出现“无效区域”
-		                    LazyVStack(alignment: .center, spacing: 0) {
-		                        let activeLineID: Int? = {
-		                            guard let idx = timeline.currentIndex(at: playbackClock.currentTime),
-		                                  idx >= 0, idx < timeline.lines.count else { return nil }
-		                            return timeline.lines[idx].id
-		                        }()
-		                        ForEach(timeline.lines) { line in
-		                            let isActive = (activeLineID == line.id)
-	                            Text(line.text.isEmpty ? " " : line.text)
+	                // Lyrics list with programmatic scroll — 默认渲染完整歌词
+			                ScrollView {
+			                    // 将“行间距”做进每行的 padding，这样双击跳转不会在两行之间出现“无效区域”
+			                    LazyVStack(alignment: .center, spacing: 0) {
+			                        ForEach(timeline.lines) { line in
+			                            let isActive = (activeLineID == line.id)
+		                            Text(line.text.isEmpty ? " " : line.text)
 	                                .font(isActive ? .title3.bold() : .body)
 	                                .foregroundColor(isActive ? theme.accent : .primary)
 	                                .opacity(isActive ? 1.0 : 0.75)
@@ -665,29 +800,41 @@ struct StaticLyricsView: View {
                         }
                 )
                 // 使用更快的节流频率（100ms）以提升同步跟随流畅度
-                .onReceive(playbackClock.$currentTime.throttle(for: .milliseconds(100), scheduler: RunLoop.main, latest: true)) { t in
-                    guard autoFollowEnabled else { return }
-                    let newIndex = timeline.currentIndex(at: t)
-                    guard let idx = newIndex, idx >= 0, idx < timeline.lines.count else { return }
-                    let id = timeline.lines[idx].id
-                    if id != lastScrolledLineID {
-                        lastScrolledLineID = id
-                        withAnimation(.easeInOut(duration: 0.25)) {
-                            proxy.scrollTo(id, anchor: .center)
-                        }
-                    }
-                }
-                .onAppear {
-                    if let idx = timeline.currentIndex(at: playbackClock.currentTime),
-                       idx >= 0, idx < timeline.lines.count {
-                        proxy.scrollTo(timeline.lines[idx].id, anchor: .center)
-                    }
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, minHeight: 180, maxHeight: 260)
-    }
-}
+	                .onReceive(playbackClock.$currentTime.throttle(for: .milliseconds(100), scheduler: RunLoop.main, latest: true)) { t in
+	                    let newActiveLineID = activeLineIDForTime(t)
+	                    if newActiveLineID != activeLineID {
+	                        activeLineID = newActiveLineID
+	                    }
+	                    guard autoFollowEnabled, let id = newActiveLineID else { return }
+	                    if id != lastScrolledLineID {
+	                        lastScrolledLineID = id
+	                        withAnimation(.easeInOut(duration: 0.25)) {
+	                            proxy.scrollTo(id, anchor: .center)
+	                        }
+	                    }
+	                }
+	                .onAppear {
+	                    let initialActiveLineID = activeLineIDForTime(playbackClock.currentTime)
+	                    activeLineID = initialActiveLineID
+	                    if let initialActiveLineID {
+	                        lastScrolledLineID = initialActiveLineID
+	                        proxy.scrollTo(initialActiveLineID, anchor: .center)
+	                    }
+	                }
+	            }
+	        }
+	        .frame(maxWidth: .infinity, minHeight: 180, maxHeight: 260)
+	    }
+
+	    private func activeLineIDForTime(_ time: TimeInterval) -> Int? {
+	        guard let idx = timeline.currentIndex(at: time),
+	              idx >= 0,
+	              idx < timeline.lines.count else {
+	            return nil
+	        }
+	        return timeline.lines[idx].id
+	    }
+	}
 
 private func sourceLabel(for source: LyricsSource) -> String {
    switch source {

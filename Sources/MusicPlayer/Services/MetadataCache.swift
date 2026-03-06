@@ -44,7 +44,7 @@ actor MetadataCache {
         PathKey.legacy(for: url)
     }
 
-    func cachedMetadataIfValid(for url: URL) -> AudioMetadata? {
+    func cachedMetadataIfValid(for url: URL, snapshot: FileValidationSnapshot? = nil) -> AudioMetadata? {
         loadIfNeeded()
 
         let key = Self.key(for: url)
@@ -65,7 +65,7 @@ actor MetadataCache {
             matchedKey = key
             return legacy
         }() else { return nil }
-        guard let current = fileSignature(for: url) else {
+        guard let current = fileSignature(for: url, snapshot: snapshot) else {
             // File missing/unreadable -> drop cache entry.
             entries.removeValue(forKey: matchedKey)
             scheduleSave()
@@ -98,10 +98,10 @@ actor MetadataCache {
         )
     }
 
-    func storeBasicMetadata(_ metadata: AudioMetadata, for url: URL) {
+    func storeBasicMetadata(_ metadata: AudioMetadata, for url: URL, snapshot: FileValidationSnapshot? = nil) {
         loadIfNeeded()
 
-        guard let sig = fileSignature(for: url) else { return }
+        guard let sig = fileSignature(for: url, snapshot: snapshot) else { return }
         let key = Self.key(for: url)
         let legacyKey = Self.legacyKey(for: url)
 
@@ -199,15 +199,15 @@ actor MetadataCache {
         return dir.appendingPathComponent(cacheFileName, isDirectory: false)
     }
 
-    private func fileSignature(for url: URL) -> FileSignature? {
-        do {
-            let values = try url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-            guard let size = values.fileSize, let mtime = values.contentModificationDate else { return nil }
-            let mtimeNs = Int64((mtime.timeIntervalSince1970 * 1_000_000_000.0).rounded())
-            return FileSignature(fileSize: Int64(size), mtimeNs: mtimeNs)
-        } catch {
-            return nil
+    private func fileSignature(for url: URL, snapshot: FileValidationSnapshot?) -> FileSignature? {
+        if let snapshot {
+            guard snapshot.exists else { return nil }
+            return FileSignature(fileSize: snapshot.fileSize, mtimeNs: snapshot.mtimeNs)
         }
+
+        let loaded = FileValidationSnapshot.load(for: url)
+        guard loaded.exists else { return nil }
+        return FileSignature(fileSize: loaded.fileSize, mtimeNs: loaded.mtimeNs)
     }
 
     private func normalizeKeys(_ raw: [String: Entry]) -> [String: Entry] {

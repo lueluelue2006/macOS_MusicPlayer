@@ -12,6 +12,7 @@ struct PlaylistsPanelView: View {
 
 	    @State private var trackSearchText: String = ""
 	    @State private var loadedTracks: [AudioFile] = []
+	    @State private var visibleTracks: [AudioFile] = []
 	    @State private var trackUnplayableReasons: [String: String] = [:]
 	    @State private var isLoadingTracks: Bool = false
 	    @State private var loadTask: Task<Void, Never>?
@@ -57,22 +58,6 @@ struct PlaylistsPanelView: View {
         return audioPlayer.currentFile?.url
     }
 
-    private var filteredTracks: [AudioFile] {
-        let base: [AudioFile] = {
-            guard !trackSearchText.isEmpty else { return loadedTracks }
-            let q = trackSearchText
-            return loadedTracks.filter { f in
-                f.metadata.title.localizedCaseInsensitiveContains(q) ||
-                    f.metadata.artist.localizedCaseInsensitiveContains(q) ||
-                    f.metadata.album.localizedCaseInsensitiveContains(q) ||
-                    f.url.lastPathComponent.localizedCaseInsensitiveContains(q)
-            }
-        }()
-
-        guard let playlist = selectedPlaylist else { return base }
-        return sortState.option(for: .playlists).applying(to: base, weightScope: .playlist(playlist.id))
-    }
-
     var body: some View {
         HStack(spacing: 16) {
             playlistsSidebar
@@ -91,9 +76,22 @@ struct PlaylistsPanelView: View {
         .onAppear {
             playlistsStore.loadIfNeeded()
             reloadSelectedPlaylist()
+            refreshVisibleTracks()
         }
         .onChange(of: playlistsStore.selectedPlaylistID) { _ in
             reloadSelectedPlaylist()
+        }
+        .onChange(of: trackSearchText) { _ in
+            refreshVisibleTracks()
+        }
+        .onChange(of: loadedTracks) { _ in
+            refreshVisibleTracks()
+        }
+        .onChange(of: weights.revision) { _ in
+            refreshVisibleTracks()
+        }
+        .onReceive(sortState.objectWillChange) { _ in
+            refreshVisibleTracks()
         }
         .onReceive(NotificationCenter.default.publisher(for: .requestDismissAllSheets)) { _ in
             showAddFromQueueSheet = false
@@ -188,7 +186,7 @@ struct PlaylistsPanelView: View {
 
 		                if !trackSearchText.isEmpty {
 		                    HStack {
-		                        Text("找到 \(filteredTracks.count) / \(loadedTracks.count) 首歌曲")
+		                        Text("找到 \(visibleTracks.count) / \(loadedTracks.count) 首歌曲")
 		                            .font(.caption)
 		                            .foregroundColor(.secondary)
 		                        Spacer()
@@ -205,7 +203,7 @@ struct PlaylistsPanelView: View {
 	                                    .foregroundColor(theme.mutedText)
 	                            }
 	                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-	                        } else if filteredTracks.isEmpty {
+	                        } else if visibleTracks.isEmpty {
 	                            VStack(spacing: 10) {
 	                                Text(playlist.tracks.isEmpty ? "歌单为空" : "未找到匹配歌曲")
 	                                    .font(.subheadline)
@@ -216,7 +214,7 @@ struct PlaylistsPanelView: View {
 	                            }
 	                            .frame(maxWidth: .infinity, maxHeight: .infinity)
 	                        } else {
-	                            List(filteredTracks) { file in
+	                            List(visibleTracks) { file in
 	                                PlaylistItemView(
 	                                    file: file,
 	                                    isCurrentTrack: currentHighlightedURL == file.url,
@@ -380,7 +378,7 @@ struct PlaylistsPanelView: View {
 	    @MainActor
 	    private func scrollToPlaylistTrackIfPossible(targetID: String, proxy: ScrollViewProxy) {
 	        guard !isLoadingTracks else { return }
-	        guard filteredTracks.contains(where: { $0.id == targetID }) else { return }
+	        guard visibleTracks.contains(where: { $0.id == targetID }) else { return }
 	        withAnimation(.easeInOut(duration: 0.2)) {
 	            proxy.scrollTo(targetID, anchor: .center)
 	        }
@@ -468,6 +466,7 @@ struct PlaylistsPanelView: View {
 	        trackSearchText = ""
 	        playlistScrollTargetID = nil
 	        loadedTracks = []
+	        visibleTracks = []
 	        trackUnplayableReasons = [:]
 
         guard let playlist = selectedPlaylist else { return }
@@ -486,37 +485,41 @@ struct PlaylistsPanelView: View {
                     .precomposedStringWithCanonicalMapping
             }
             var results: [AudioFile?] = Array(repeating: nil, count: paths.count)
+            var missingFileIndices = Set<Int>()
             var reasons: [String: String] = [:]
 
-            await withTaskGroup(of: (Int, AudioFile).self) { group in
+            await withTaskGroup(of: (Int, AudioFile, Bool).self) { group in
                 for (idx, path) in paths.enumerated() {
                     group.addTask {
                         let url = URL(fileURLWithPath: path)
-                        let exists = fm.fileExists(atPath: url.path)
-                        if !exists {
+                        let snapshot = FileValidationSnapshot.load(for: url, fileManager: fm)
+                        if !snapshot.exists {
                             let title = url.deletingPathExtension().lastPathComponent
                             let meta = AudioMetadata(title: title, artist: "", album: "", year: nil, genre: nil, artwork: nil)
-                            return (idx, AudioFile(url: url, metadata: meta, duration: nil))
+                            return (idx, AudioFile(url: url, metadata: meta, duration: nil), true)
                         }
 
                         await gate.acquire()
-                        let metadata = await playlistManager.loadCachedMetadata(from: url)
-                        let duration = await DurationCache.shared.cachedDurationIfValid(for: url)
+                        let metadata = await playlistManager.loadCachedMetadata(from: url, snapshot: snapshot)
+                        let duration = await DurationCache.shared.cachedDurationIfValid(for: url, snapshot: snapshot)
                         await gate.release()
 
-                        return (idx, AudioFile(url: url, metadata: metadata, duration: duration))
+                        return (idx, AudioFile(url: url, metadata: metadata, duration: duration), false)
                     }
                 }
 
-                for await (idx, file) in group {
+                for await (idx, file, isMissing) in group {
                     results[idx] = file
+                    if isMissing {
+                        missingFileIndices.insert(idx)
+                    }
                 }
             }
 
             // Build unplayable reasons for missing files.
             for (idx, path) in paths.enumerated() {
                 let url = URL(fileURLWithPath: path)
-                if !fm.fileExists(atPath: url.path) {
+                if missingFileIndices.contains(idx) {
                     reasons[key(for: url)] = "文件不存在"
                 }
                 if results[idx] == nil {
@@ -554,6 +557,28 @@ struct PlaylistsPanelView: View {
 
     private func pathLookupKeys(_ url: URL) -> [String] {
         PathKey.lookupKeys(for: url)
+    }
+
+    @MainActor
+    private func refreshVisibleTracks() {
+        let base: [AudioFile]
+        if trackSearchText.isEmpty {
+            base = loadedTracks
+        } else {
+            let q = trackSearchText
+            base = loadedTracks.filter { f in
+                f.metadata.title.localizedCaseInsensitiveContains(q) ||
+                    f.metadata.artist.localizedCaseInsensitiveContains(q) ||
+                    f.metadata.album.localizedCaseInsensitiveContains(q) ||
+                    f.url.lastPathComponent.localizedCaseInsensitiveContains(q)
+            }
+        }
+
+        guard let playlist = selectedPlaylist else {
+            visibleTracks = base
+            return
+        }
+        visibleTracks = sortState.option(for: .playlists).applying(to: base, weightScope: .playlist(playlist.id))
     }
 
     // MARK: - Add from queue sheet

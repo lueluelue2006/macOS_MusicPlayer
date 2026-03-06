@@ -44,7 +44,7 @@ actor DurationCache {
         PathKey.legacy(for: url)
     }
 
-    func cachedDurationIfValid(for url: URL) -> TimeInterval? {
+    func cachedDurationIfValid(for url: URL, snapshot: FileValidationSnapshot? = nil) -> TimeInterval? {
         loadIfNeeded()
 
         let key = Self.key(for: url)
@@ -63,7 +63,7 @@ actor DurationCache {
             matchedKey = key
             return legacy
         }() else { return nil }
-        guard let current = fileSignature(for: url) else {
+        guard let current = fileSignature(for: url, snapshot: snapshot) else {
             // File missing/unreadable -> drop cache entry.
             entries.removeValue(forKey: matchedKey)
             scheduleSave()
@@ -82,11 +82,11 @@ actor DurationCache {
         return entry.durationSeconds
     }
 
-    func storeDuration(_ duration: TimeInterval, for url: URL) {
+    func storeDuration(_ duration: TimeInterval, for url: URL, snapshot: FileValidationSnapshot? = nil) {
         loadIfNeeded()
 
         guard duration.isFinite, duration > 0 else { return }
-        guard let sig = fileSignature(for: url) else { return }
+        guard let sig = fileSignature(for: url, snapshot: snapshot) else { return }
 
         let key = Self.key(for: url)
         let entry = Entry(
@@ -182,28 +182,15 @@ actor DurationCache {
         return dir.appendingPathComponent(cacheFileName, isDirectory: false)
     }
 
-    private func fileSignature(for url: URL) -> FileSignature? {
-        do {
-            let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
-            let values = try url.resourceValues(forKeys: keys)
-            guard let size = values.fileSize, let mtime = values.contentModificationDate else { return nil }
-
-            let mtimeNs = Int64((mtime.timeIntervalSince1970 * 1_000_000_000.0).rounded())
-            let inode: Int64? = {
-                let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
-                if let n = attrs?[.systemFileNumber] as? NSNumber {
-                    return n.int64Value
-                }
-                if let n = attrs?[.systemFileNumber] as? Int {
-                    return Int64(n)
-                }
-                return nil
-            }()
-
-            return FileSignature(fileSize: Int64(size), mtimeNs: mtimeNs, inode: inode)
-        } catch {
-            return nil
+    private func fileSignature(for url: URL, snapshot: FileValidationSnapshot?) -> FileSignature? {
+        if let snapshot {
+            guard snapshot.exists else { return nil }
+            return FileSignature(fileSize: snapshot.fileSize, mtimeNs: snapshot.mtimeNs, inode: snapshot.inode)
         }
+
+        let loaded = FileValidationSnapshot.load(for: url)
+        guard loaded.exists else { return nil }
+        return FileSignature(fileSize: loaded.fileSize, mtimeNs: loaded.mtimeNs, inode: loaded.inode)
     }
 
     private func normalizeKeys(_ raw: [String: Entry]) -> [String: Entry] {

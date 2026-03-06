@@ -255,9 +255,9 @@ struct ContentView: View {
 
         let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "3.9"
         updateCheckTask = Task(priority: .background) {
-            // 延迟一点：让加载/恢复后的 UI 与磁盘/元数据任务先跑一会儿
+            // 启动前几秒优先让 UI、恢复与缓存任务跑完，更新检查延后到用户已可稳定交互之后。
             do {
-                try await Task.sleep(nanoseconds: 3_000_000_000)
+                try await Task.sleep(nanoseconds: 12_000_000_000)
             } catch {
                 return
             }
