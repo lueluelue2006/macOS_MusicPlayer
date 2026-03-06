@@ -9,9 +9,14 @@ echo "🎵 开始创建 DMG 安装包..."
 SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+VERSION="$(tr -d '[:space:]' < VERSION)"
+if [[ -z "$VERSION" ]]; then
+    echo "❌ 错误：VERSION 文件为空"
+    exit 1
+fi
+
 # 配置参数（基于脚本目录）
 APP_NAME="MusicPlayer"
-VERSION="3.9"
 APP_BUNDLE="${APP_BUNDLE:-MusicPlayer.app}"
 DMG_SUFFIX="${DMG_SUFFIX:-}"
 DMG_NAME="MusicPlayer-v${VERSION}${DMG_SUFFIX}"

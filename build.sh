@@ -7,6 +7,12 @@ set -e
 
 echo "🎵 开始构建 macOS 音乐播放器..."
 
+VERSION="$(tr -d '[:space:]' < VERSION)"
+if [[ -z "$VERSION" ]]; then
+    echo "❌ 错误: VERSION 文件为空"
+    exit 1
+fi
+
 # 检查 Xcode 是否安装
 if ! command -v swift &> /dev/null; then
     echo "❌ 错误: 未找到 Swift。请安装 Xcode Command Line Tools:"
@@ -71,9 +77,9 @@ cat > MusicPlayer.app/Contents/Info.plist << EOF
     <key>NSPrincipalClass</key>
     <string>MusicPlayerApplication</string>
 	<key>CFBundleShortVersionString</key>
-	<string>3.9</string>
+	<string>${VERSION}</string>
 	    <key>CFBundleVersion</key>
-	    <string>3.9</string>
+	    <string>${VERSION}</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
