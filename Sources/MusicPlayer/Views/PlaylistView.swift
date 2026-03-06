@@ -248,10 +248,14 @@ struct PlaylistView: View {
                     
                     // 播放列表
                     if queueVisibleFiles.isEmpty {
-                        EmptyPlaylistView()
+                        if playlistManager.isInitialRestorePending || playlistManager.isRestoringPlaylist {
+                            RestoringPlaylistView()
+                        } else {
+                            EmptyPlaylistView()
+                        }
                     } else {
                         ScrollViewReader { proxy in
-			                    List(queueVisibleFiles) { file in
+				                    List(queueVisibleFiles) { file in
 		                        PlaylistItemView(
 		                            file: file,
 		                            isCurrentTrack: currentHighlightedURL == file.url,
@@ -951,5 +955,36 @@ struct EmptyPlaylistView: View {
                 )
                 .shadow(color: theme.subtleShadow, radius: 8, x: 0, y: 4)
         )
+    }
+}
+
+struct RestoringPlaylistView: View {
+    @Environment(\.colorScheme) private var colorScheme
+    private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+
+    var body: some View {
+        VStack(spacing: 18) {
+            ProgressView()
+                .controlSize(.regular)
+
+            Text("正在恢复播放列表…")
+                .font(.headline)
+                .foregroundColor(.primary)
+
+            Text("启动时正在读取上次队列，请稍候。")
+                .font(.caption)
+                .foregroundColor(theme.mutedText)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(24)
+        .background(
+            RoundedRectangle(cornerRadius: 18)
+                .fill(theme.mutedSurface)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18)
+                        .stroke(theme.stroke, lineWidth: 1)
+                )
+        )
+        .padding(.horizontal, 20)
     }
 }

@@ -27,6 +27,7 @@ final class PlaylistManager: ObservableObject {
     private var playlistShuffleIndex: Int = 0
     
     @Published var isRestoringPlaylist = false  // 标记是否正在恢复播放列表
+    @Published private(set) var isInitialRestorePending = false
     private var didPerformInitialRestore: Bool = false
     private var initialRestoreTask: Task<Void, Never>?
     private var restoredMetadataHydrationTask: Task<Void, Never>?
@@ -338,10 +339,16 @@ final class PlaylistManager: ObservableObject {
     func performInitialRestoreIfNeeded(audioPlayer: AudioPlayer, playlistsStore: PlaylistsStore) {
         guard !didPerformInitialRestore else { return }
         didPerformInitialRestore = true
+        isInitialRestorePending = true
 
         initialRestoreTask?.cancel()
         initialRestoreTask = Task.detached(priority: .utility) { [weak self, weak audioPlayer] in
             guard let self, let audioPlayer else { return }
+            defer {
+                Task { @MainActor [weak self] in
+                    self?.isInitialRestorePending = false
+                }
+            }
             try? await Task.sleep(nanoseconds: 180_000_000)
             if Task.isCancelled { return }
             let skipRestore = await MainActor.run {
