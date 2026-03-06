@@ -217,6 +217,7 @@ private final class FlowingEdgeBorderHostingView: NSView {
     private var currentLineWidth: CGFloat = 0
     private var currentBaseColor: NSColor = .systemTeal
     private var currentSecondaryColor: NSColor = .systemMint
+    private var currentPerimeter: CGFloat = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -240,19 +241,22 @@ private final class FlowingEdgeBorderHostingView: NSView {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        let insetRect = bounds.insetBy(dx: currentLineWidth / 2, dy: currentLineWidth / 2)
+        let effectiveCornerRadius = min(currentCornerRadius, min(insetRect.width, insetRect.height) / 2)
         let path = CGPath(
-            roundedRect: bounds.insetBy(dx: currentLineWidth / 2, dy: currentLineWidth / 2),
-            cornerWidth: currentCornerRadius,
-            cornerHeight: currentCornerRadius,
+            roundedRect: insetRect,
+            cornerWidth: effectiveCornerRadius,
+            cornerHeight: effectiveCornerRadius,
             transform: nil
         )
         trailLayer.frame = bounds
         trailLayer.path = path
-        trailLayer.shadowPath = path
         coreLayer.frame = bounds
         coreLayer.path = path
-        coreLayer.shadowPath = path
+        currentPerimeter = roundedRectPerimeter(for: insetRect, cornerRadius: effectiveCornerRadius)
+        updateDashPattern()
         CATransaction.commit()
+        restartAnimations()
     }
 
     func update(cornerRadius: CGFloat, lineWidth: CGFloat, baseColor: NSColor, secondaryColor: NSColor) {
@@ -267,8 +271,6 @@ private final class FlowingEdgeBorderHostingView: NSView {
         needsLayout = true
         layoutSubtreeIfNeeded()
         CATransaction.commit()
-
-        ensureAnimation()
     }
 
     private func setupLayers() {
@@ -286,50 +288,62 @@ private final class FlowingEdgeBorderHostingView: NSView {
         coreLayer.lineJoin = .round
 
         updateStrokeStyle()
-        ensureAnimation()
     }
 
     private func updateStrokeStyle() {
-        trailLayer.lineWidth = currentLineWidth + 1.2
-        trailLayer.strokeColor = currentSecondaryColor.withAlphaComponent(0.72).cgColor
-        trailLayer.shadowColor = currentSecondaryColor.withAlphaComponent(0.55).cgColor
-        trailLayer.shadowOpacity = 0.85
-        trailLayer.shadowRadius = 8
+        trailLayer.lineWidth = currentLineWidth + 1.4
+        trailLayer.strokeColor = currentSecondaryColor.withAlphaComponent(0.48).cgColor
+        trailLayer.shadowColor = currentSecondaryColor.withAlphaComponent(0.28).cgColor
+        trailLayer.shadowOpacity = 0.35
+        trailLayer.shadowRadius = 3
         trailLayer.shadowOffset = .zero
 
         coreLayer.lineWidth = currentLineWidth
         coreLayer.strokeColor = NSColor.white.withAlphaComponent(0.92).cgColor
-        coreLayer.shadowColor = currentBaseColor.withAlphaComponent(0.50).cgColor
-        coreLayer.shadowOpacity = 0.70
-        coreLayer.shadowRadius = 4
+        coreLayer.shadowColor = currentBaseColor.withAlphaComponent(0.22).cgColor
+        coreLayer.shadowOpacity = 0.25
+        coreLayer.shadowRadius = 1.5
         coreLayer.shadowOffset = .zero
     }
 
-    private func ensureAnimation() {
-        if trailLayer.animation(forKey: trailAnimationKey) == nil {
-            trailLayer.add(makeStrokeAnimation(segmentLength: 0.20, duration: 4.8), forKey: trailAnimationKey)
-        }
-        if coreLayer.animation(forKey: coreAnimationKey) == nil {
-            coreLayer.add(makeStrokeAnimation(segmentLength: 0.11, duration: 4.8), forKey: coreAnimationKey)
-        }
+    private func updateDashPattern() {
+        guard currentPerimeter > 1 else { return }
+
+        let trailSegment = min(max(44, currentPerimeter * 0.16), max(2, currentPerimeter - 2))
+        let trailGap = max(1, currentPerimeter - trailSegment)
+        trailLayer.lineDashPattern = [trailSegment as NSNumber, trailGap as NSNumber]
+
+        let coreSegment = min(max(24, currentPerimeter * 0.08), max(2, currentPerimeter - 2))
+        let coreGap = max(1, currentPerimeter - coreSegment)
+        coreLayer.lineDashPattern = [coreSegment as NSNumber, coreGap as NSNumber]
     }
 
-    private func makeStrokeAnimation(segmentLength: CGFloat, duration: TimeInterval) -> CAAnimationGroup {
-        let start = CABasicAnimation(keyPath: "strokeStart")
-        start.fromValue = -segmentLength
-        start.toValue = 1.0
+    private func restartAnimations() {
+        guard currentPerimeter > 1 else { return }
+        trailLayer.removeAnimation(forKey: trailAnimationKey)
+        coreLayer.removeAnimation(forKey: coreAnimationKey)
+        trailLayer.add(makeDashPhaseAnimation(distance: currentPerimeter, duration: 4.8), forKey: trailAnimationKey)
+        coreLayer.add(makeDashPhaseAnimation(distance: currentPerimeter, duration: 4.8), forKey: coreAnimationKey)
+    }
 
-        let end = CABasicAnimation(keyPath: "strokeEnd")
-        end.fromValue = 0.0
-        end.toValue = 1.0 + segmentLength
+    private func makeDashPhaseAnimation(distance: CGFloat, duration: TimeInterval) -> CABasicAnimation {
+        let animation = CABasicAnimation(keyPath: "lineDashPhase")
+        animation.fromValue = 0
+        animation.toValue = -distance
+        animation.duration = duration
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        animation.isRemovedOnCompletion = false
+        return animation
+    }
 
-        let group = CAAnimationGroup()
-        group.animations = [start, end]
-        group.duration = duration
-        group.repeatCount = .infinity
-        group.timingFunction = CAMediaTimingFunction(name: .linear)
-        group.isRemovedOnCompletion = false
-        return group
+    private func roundedRectPerimeter(for rect: CGRect, cornerRadius: CGFloat) -> CGFloat {
+        let width = max(0, rect.width)
+        let height = max(0, rect.height)
+        let radius = min(max(0, cornerRadius), min(width, height) / 2)
+        let straight = max(0, 2 * (width + height - 4 * radius))
+        let arc = 2 * .pi * radius
+        return straight + arc
     }
 }
 
