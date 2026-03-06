@@ -72,6 +72,17 @@ struct PlaylistView: View {
         return audioPlayer.currentFile?.url
     }
 
+    private var queueSourceFiles: [AudioFile] {
+        playlistManager.searchText.isEmpty ? playlistManager.audioFiles : playlistManager.filteredFiles
+    }
+
+    private var displayedQueueFiles: [AudioFile] {
+        if !queueVisibleFiles.isEmpty || queueSourceFiles.isEmpty {
+            return queueVisibleFiles
+        }
+        return sortState.option(for: .queue).applying(to: queueSourceFiles, weightScope: .queue)
+    }
+
     
     // 确保窗口在视图销毁时被清理
     init(audioPlayer: AudioPlayer, playlistManager: PlaylistManager, playlistsStore: PlaylistsStore) {
@@ -247,7 +258,7 @@ struct PlaylistView: View {
                     }
                     
                     // 播放列表
-                    if queueVisibleFiles.isEmpty {
+                    if displayedQueueFiles.isEmpty {
                         if playlistManager.isInitialRestorePending || playlistManager.isRestoringPlaylist {
                             RestoringPlaylistView()
                         } else {
@@ -255,7 +266,7 @@ struct PlaylistView: View {
                         }
                     } else {
                         ScrollViewReader { proxy in
-				                    List(queueVisibleFiles) { file in
+				                    List(displayedQueueFiles) { file in
 		                        PlaylistItemView(
 		                            file: file,
 		                            isCurrentTrack: currentHighlightedURL == file.url,
@@ -322,7 +333,7 @@ struct PlaylistView: View {
                                 guard let target else { return }
                                 scrollToQueueTrackIfPossible(targetID: target, proxy: proxy)
                             }
-                            .onChange(of: queueVisibleFiles.count) { _ in
+                            .onChange(of: displayedQueueFiles.count) { _ in
                                 guard let target = queueScrollTargetID else { return }
                                 scrollToQueueTrackIfPossible(targetID: target, proxy: proxy)
                             }
@@ -353,10 +364,22 @@ struct PlaylistView: View {
         .onReceive(playlistManager.$filteredFiles) { _ in
             refreshQueueVisibleFiles()
         }
+        .onReceive(playlistManager.$audioFiles) { _ in
+            refreshQueueVisibleFiles()
+        }
         .onReceive(sortState.objectWillChange) { _ in
             refreshQueueVisibleFiles()
         }
         .onChange(of: weights.revision) { _ in
+            refreshQueueVisibleFiles()
+        }
+        .onChange(of: playlistManager.isInitialRestorePending) { _ in
+            refreshQueueVisibleFiles()
+        }
+        .onChange(of: playlistManager.isRestoringPlaylist) { _ in
+            refreshQueueVisibleFiles()
+        }
+        .onChange(of: currentHighlightedURL) { _ in
             refreshQueueVisibleFiles()
         }
         .onChange(of: panelModeRaw) { _ in
@@ -411,7 +434,7 @@ struct PlaylistView: View {
 
     @MainActor
     private func scrollToQueueTrackIfPossible(targetID: String, proxy: ScrollViewProxy) {
-        guard queueVisibleFiles.contains(where: { $0.id == targetID }) else { return }
+        guard displayedQueueFiles.contains(where: { $0.id == targetID }) else { return }
         withAnimation(.easeInOut(duration: 0.2)) {
             proxy.scrollTo(targetID, anchor: .center)
         }
@@ -422,7 +445,7 @@ struct PlaylistView: View {
 
     @MainActor
     private func refreshQueueVisibleFiles() {
-        queueVisibleFiles = sortState.option(for: .queue).applying(to: playlistManager.filteredFiles, weightScope: .queue)
+        queueVisibleFiles = sortState.option(for: .queue).applying(to: queueSourceFiles, weightScope: .queue)
     }
 
     private var refreshButton: some View {
