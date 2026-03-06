@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct PlaylistsPanelView: View {
     @ObservedObject var audioPlayer: AudioPlayer
@@ -17,6 +18,8 @@ struct PlaylistsPanelView: View {
 	    @State private var isLoadingTracks: Bool = false
 	    @State private var loadTask: Task<Void, Never>?
 	    @State private var playlistScrollTargetID: String?
+	    @State private var playlistScrollTask: Task<Void, Never>?
+        @State private var playlistTableView: NSTableView?
 
     // Add-from-queue multi-select sheet
     @State private var showAddFromQueueSheet: Bool = false
@@ -249,19 +252,32 @@ struct PlaylistsPanelView: View {
 	                            .listStyle(PlainListStyle())
 	                            .scrollContentBackground(.hidden)
 	                            .background(Color.clear)
+                                .background(
+                                    ListTableViewAccessor { tableView in
+                                        let currentID = playlistTableView.map(ObjectIdentifier.init)
+                                        let newID = tableView.map(ObjectIdentifier.init)
+                                        if currentID != newID {
+                                            playlistTableView = tableView
+                                        }
+                                    }
+                                )
 	                        }
 	                    }
 	                    .onChange(of: playlistScrollTargetID) { target in
 	                        guard let target else { return }
-	                        scrollToPlaylistTrackIfPossible(targetID: target, proxy: proxy)
+	                        performPlaylistScrollSequence(targetID: target, proxy: proxy)
 	                    }
-	                    .onChange(of: loadedTracks.count) { _ in
+	                    .onChange(of: loadedTracks.map(\.id)) { _ in
 	                        guard let target = playlistScrollTargetID else { return }
-	                        scrollToPlaylistTrackIfPossible(targetID: target, proxy: proxy)
+	                        performPlaylistScrollSequence(targetID: target, proxy: proxy)
 	                    }
 	                    .onChange(of: trackSearchText) { _ in
 	                        guard let target = playlistScrollTargetID else { return }
-	                        scrollToPlaylistTrackIfPossible(targetID: target, proxy: proxy)
+	                        performPlaylistScrollSequence(targetID: target, proxy: proxy)
+	                    }
+	                    .onAppear {
+	                        guard let target = playlistScrollTargetID else { return }
+	                        performPlaylistScrollSequence(targetID: target, proxy: proxy)
 	                    }
 	                }
 	            }
@@ -376,14 +392,33 @@ struct PlaylistsPanelView: View {
 	    }
 
 	    @MainActor
-	    private func scrollToPlaylistTrackIfPossible(targetID: String, proxy: ScrollViewProxy) {
+	    private func performPlaylistScrollSequence(targetID: String, proxy: ScrollViewProxy) {
 	        guard !isLoadingTracks else { return }
-	        guard visibleTracks.contains(where: { $0.id == targetID }) else { return }
-	        withAnimation(.easeInOut(duration: 0.2)) {
-	            proxy.scrollTo(targetID, anchor: .center)
-	        }
-	        DispatchQueue.main.async {
-	            playlistScrollTargetID = nil
+
+	        playlistScrollTask?.cancel()
+	        playlistScrollTask = Task { @MainActor in
+	            let retryIntervals: [UInt64] = [0, 120_000_000, 180_000_000, 260_000_000]
+
+	            for pause in retryIntervals {
+	                if pause > 0 {
+	                    try? await Task.sleep(nanoseconds: pause)
+	                }
+	                if Task.isCancelled { return }
+	                guard !isLoadingTracks else { continue }
+	                guard let targetIndex = visibleTracks.firstIndex(where: { $0.id == targetID }) else { continue }
+	                if let tableView = playlistTableView, tableView.numberOfRows > targetIndex {
+	                    centerListRow(targetIndex, in: tableView)
+	                } else {
+	                    withAnimation(.easeInOut(duration: 0.2)) {
+	                        proxy.scrollTo(targetID, anchor: .center)
+	                    }
+	                }
+	            }
+
+	            if Task.isCancelled { return }
+	            if playlistScrollTargetID == targetID {
+	                playlistScrollTargetID = nil
+	            }
 	        }
 	    }
 

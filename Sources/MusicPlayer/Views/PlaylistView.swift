@@ -11,6 +11,8 @@ struct PlaylistView: View {
     @State private var selectedFileForEdit: AudioFile?
     @State private var metadataEditWindow: NSWindow?
     @State private var queueScrollTargetID: String?
+    @State private var queueScrollTask: Task<Void, Never>?
+    @State private var queueTableView: NSTableView?
     @State private var queueVisibleFiles: [AudioFile] = []
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
@@ -266,7 +268,7 @@ struct PlaylistView: View {
                         }
                     } else {
                         ScrollViewReader { proxy in
-				                    List(displayedQueueFiles) { file in
+	                            List(displayedQueueFiles) { file in
 		                        PlaylistItemView(
 		                            file: file,
 		                            isCurrentTrack: currentHighlightedURL == file.url,
@@ -329,13 +331,30 @@ struct PlaylistView: View {
 	                        .listStyle(PlainListStyle())
 	                        .background(Color.clear)
 	                        .scrollContentBackground(.hidden)
+                            .background(
+                                ListTableViewAccessor { tableView in
+                                    let currentID = queueTableView.map(ObjectIdentifier.init)
+                                    let newID = tableView.map(ObjectIdentifier.init)
+                                    if currentID != newID {
+                                        queueTableView = tableView
+                                    }
+                                }
+                            )
                             .onChange(of: queueScrollTargetID) { target in
                                 guard let target else { return }
-                                scrollToQueueTrackIfPossible(targetID: target, proxy: proxy)
+                                performQueueScrollSequence(targetID: target, proxy: proxy)
                             }
-                            .onChange(of: displayedQueueFiles.count) { _ in
+                            .onChange(of: displayedQueueFiles.map(\.id)) { _ in
                                 guard let target = queueScrollTargetID else { return }
-                                scrollToQueueTrackIfPossible(targetID: target, proxy: proxy)
+                                performQueueScrollSequence(targetID: target, proxy: proxy)
+                            }
+                            .onChange(of: playlistManager.searchText) { _ in
+                                guard let target = queueScrollTargetID else { return }
+                                performQueueScrollSequence(targetID: target, proxy: proxy)
+                            }
+                            .onAppear {
+                                guard let target = queueScrollTargetID else { return }
+                                performQueueScrollSequence(targetID: target, proxy: proxy)
                             }
                         }
                     }
@@ -407,6 +426,8 @@ struct PlaylistView: View {
             }
         }
         .onDisappear {
+            queueScrollTask?.cancel()
+            queueTableView = nil
             // 视图消失时确保清理窗口资源
             if let window = metadataEditWindow {
                 window.close()
@@ -433,13 +454,31 @@ struct PlaylistView: View {
     }
 
     @MainActor
-    private func scrollToQueueTrackIfPossible(targetID: String, proxy: ScrollViewProxy) {
-        guard displayedQueueFiles.contains(where: { $0.id == targetID }) else { return }
-        withAnimation(.easeInOut(duration: 0.2)) {
-            proxy.scrollTo(targetID, anchor: .center)
-        }
-        DispatchQueue.main.async {
-            queueScrollTargetID = nil
+    private func performQueueScrollSequence(targetID: String, proxy: ScrollViewProxy) {
+        queueScrollTask?.cancel()
+        queueScrollTask = Task { @MainActor in
+            let retryIntervals: [UInt64] = [0, 120_000_000, 180_000_000, 260_000_000]
+
+            for pause in retryIntervals {
+                if pause > 0 {
+                    try? await Task.sleep(nanoseconds: pause)
+                }
+                if Task.isCancelled { return }
+                guard let targetIndex = displayedQueueFiles.firstIndex(where: { $0.id == targetID }) else { continue }
+
+                if let tableView = queueTableView, tableView.numberOfRows > targetIndex {
+                    centerListRow(targetIndex, in: tableView)
+                } else {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        proxy.scrollTo(targetID, anchor: .center)
+                    }
+                }
+            }
+
+            if Task.isCancelled { return }
+            if queueScrollTargetID == targetID {
+                queueScrollTargetID = nil
+            }
         }
     }
 
