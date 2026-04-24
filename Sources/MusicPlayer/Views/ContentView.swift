@@ -36,8 +36,7 @@ struct ContentView: View {
                     // 上方播放器面板
                     PlayerView(audioPlayer: audioPlayer, playlistManager: playlistManager)
                         .frame(height: max(200, geometry.size.height * 0.4))
-                        .background(.ultraThinMaterial)
-                        .background(theme.panelBackground.opacity(0.6))
+                        .background(theme.glassPanelFill)
                         .clipShape(RoundedRectangle(cornerRadius: 20))
                         .overlay(
                             RoundedRectangle(cornerRadius: 20)
@@ -48,8 +47,7 @@ struct ContentView: View {
                     // 下方播放列表
                     PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
                         .frame(minHeight: 200)
-                        .background(.ultraThinMaterial)
-                        .background(theme.surface.opacity(0.3))
+                        .background(theme.glassPanelFill)
                 }
             } else {
                 // 大屏幕：水平布局
@@ -57,8 +55,7 @@ struct ContentView: View {
                     // 左侧播放器面板
                     PlayerView(audioPlayer: audioPlayer, playlistManager: playlistManager)
                         .frame(width: 440)
-                        .background(.ultraThinMaterial)
-                        .background(theme.panelBackground.opacity(0.6))
+                        .background(theme.glassPanelFill)
                         .clipShape(RoundedRectangle(cornerRadius: 20))
                         .overlay(
                             RoundedRectangle(cornerRadius: 20)
@@ -69,8 +66,7 @@ struct ContentView: View {
                     // 右侧播放列表
                     PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
                         .frame(minWidth: 400)
-                        .background(.ultraThinMaterial)
-                        .background(theme.surface.opacity(0.3))
+                        .background(theme.glassPanelFill)
                         .clipShape(RoundedRectangle(cornerRadius: 20))
                         .overlay(
                             RoundedRectangle(cornerRadius: 20)

@@ -363,7 +363,7 @@ struct PlaylistView: View {
                 )
             }
         }
-        .background(theme.surface)
+        .background(Color.clear)
         .onAppear {
             AppFocusState.shared.activeSearchTarget = (panelMode == .queue) ? .queue : .playlists
             refreshQueueVisibleFiles()
@@ -866,7 +866,7 @@ struct PlaylistItemView: View {
                 } else {
                     // 默认态不加阴影，提升滚动性能
                     RoundedRectangle(cornerRadius: 14)
-                        .fill(theme.surface.opacity(0.6))
+                        .fill(theme.glassRowFill)
                 }
             }
         )

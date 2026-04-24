@@ -103,20 +103,20 @@ struct AppTheme {
     }
 
     var backgroundArtworkOpacity: Double {
-        scheme == .dark ? 0.78 : 0.22
+        scheme == .dark ? 0.95 : 0.28
     }
 
     var backgroundArtworkScrim: Color {
-        scheme == .dark ? Color.black.opacity(0.24) : Color.white.opacity(0.74)
+        scheme == .dark ? Color.black.opacity(0.12) : Color.white.opacity(0.64)
     }
 
     var backgroundArtworkVignette: LinearGradient {
         if scheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color.black.opacity(0.38),
-                    Color.black.opacity(0.10),
-                    Color.black.opacity(0.46)
+                    Color.black.opacity(0.24),
+                    Color.black.opacity(0.04),
+                    Color.black.opacity(0.28)
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -132,6 +132,18 @@ struct AppTheme {
                 endPoint: .bottom
             )
         }
+    }
+
+    var glassPanelFill: Color {
+        scheme == .dark ? Color.black.opacity(0.34) : Color.white.opacity(0.72)
+    }
+
+    var glassCardFill: Color {
+        scheme == .dark ? Color.black.opacity(0.30) : Color.white.opacity(0.74)
+    }
+
+    var glassRowFill: Color {
+        scheme == .dark ? Color.black.opacity(0.20) : Color.white.opacity(0.62)
     }
 
     var panelBackground: LinearGradient {
