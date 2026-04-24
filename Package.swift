@@ -26,6 +26,9 @@ let package = Package(
         .executableTarget(
             name: "MusicPlayer",
             dependencies: ["MusicPlayerIPC"],
+            resources: [
+                .process("Resources")
+            ],
             linkerSettings: [
                 .linkedFramework("CoreAudio")
             ]

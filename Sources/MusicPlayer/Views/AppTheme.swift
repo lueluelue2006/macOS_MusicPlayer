@@ -102,6 +102,38 @@ struct AppTheme {
         }
     }
 
+    var backgroundArtworkOpacity: Double {
+        scheme == .dark ? 0.78 : 0.22
+    }
+
+    var backgroundArtworkScrim: Color {
+        scheme == .dark ? Color.black.opacity(0.24) : Color.white.opacity(0.74)
+    }
+
+    var backgroundArtworkVignette: LinearGradient {
+        if scheme == .dark {
+            return LinearGradient(
+                colors: [
+                    Color.black.opacity(0.38),
+                    Color.black.opacity(0.10),
+                    Color.black.opacity(0.46)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        } else {
+            return LinearGradient(
+                colors: [
+                    Color.white.opacity(0.82),
+                    Color.white.opacity(0.54),
+                    Color.white.opacity(0.86)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+    }
+
     var panelBackground: LinearGradient {
         if scheme == .dark {
             return LinearGradient(

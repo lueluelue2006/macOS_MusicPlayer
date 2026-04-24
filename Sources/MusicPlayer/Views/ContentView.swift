@@ -87,7 +87,7 @@ struct ContentView: View {
         let base = AnyView(layoutView)
 
         let withChrome = base
-            .background(theme.backgroundGradient)
+            .background(AppBackgroundView(theme: theme))
             .onAppear {
                 // 启动时确保搜索框不自动聚焦
                 NotificationCenter.default.post(name: .blurSearchField, object: nil)
