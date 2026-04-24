@@ -12,7 +12,6 @@ struct PlaylistView: View {
     @State private var metadataEditWindow: NSWindow?
     @State private var queueScrollTargetID: String?
     @State private var queueScrollTask: Task<Void, Never>?
-    @State private var queueTableView: NSTableView?
     @State private var queueVisibleFiles: [AudioFile] = []
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
@@ -260,86 +259,75 @@ struct PlaylistView: View {
                     }
                     
                     // 播放列表
-                    if displayedQueueFiles.isEmpty {
-                        if playlistManager.isInitialRestorePending || playlistManager.isRestoringPlaylist {
-                            RestoringPlaylistView()
-                        } else {
-                            EmptyPlaylistView()
-                        }
+                    if playlistManager.isInitialRestorePending || playlistManager.isRestoringPlaylist {
+                        RestoringPlaylistView()
+                    } else if displayedQueueFiles.isEmpty {
+                        EmptyPlaylistView()
                     } else {
                         ScrollViewReader { proxy in
-	                            List(displayedQueueFiles) { file in
-		                        PlaylistItemView(
-		                            file: file,
-		                            isCurrentTrack: currentHighlightedURL == file.url,
-		                            isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
-		                            unplayableReason: playlistManager.unplayableReason(for: file.url),
-		                            searchText: playlistManager.searchText,
-		                            playAction: { selectedFile in
-		                                // 点击列表条目也顺便取消搜索聚焦
-		                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
-		                                // 从队列播放：后续“下一首/随机/骰子”等都应作用于队列范围
-		                                playlistManager.setPlaybackScopeQueue()
-		                                guard let index = playlistManager.audioFiles.firstIndex(of: selectedFile),
-		                                      let file = playlistManager.selectFile(at: index)
-		                                else { return }
-		                                // 若点击的是“当前已加载/正在播放”的曲目，不要重启到 0:00。
-		                                if audioPlayer.currentFile?.url == file.url {
-		                                    if !audioPlayer.isPlaying {
-		                                        audioPlayer.resume()
-		                                    }
-		                                    return
-		                                }
-		                                audioPlayer.play(file)
-		                            },
-		                            deleteAction: { fileToDelete in
-		                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
-		                                // 删除前判断是否命中当前播放
-		                                let isDeletingCurrent = (audioPlayer.currentFile?.url == fileToDelete.url)
-		                                if let index = playlistManager.audioFiles.firstIndex(of: fileToDelete) {
-		                                    // 先执行删除
-		                                    playlistManager.removeFile(at: index)
-		                                    
-		                                    // 若删除的是当前播放，根据播放模式处理
-		                                    if isDeletingCurrent {
-		                                        // 删除后剩余文件列表（从真实数据源拿）
-		                                        let remaining = playlistManager.audioFiles
-		                                        
-		                                        // 如果后续需要顺序“下一首”，可在此提供闭包：playNext: { playlistManager.nextAfterDeletion(from: index) }
-		                                        // 现阶段按约定：单曲循环->停止并清空；随机->随机一首；其他->停止并清空
-		                                        audioPlayer.handleCurrentTrackRemoved(
-		                                            remainingFiles: remaining,
-		                                            playNext: { playlistManager.nextFile(isShuffling: false) },
-		                                            playRandom: { playlistManager.getRandomFile() }
-		                                        )
-		                                    }
-		                                }
-		                            },
-                            editAction: { fileToEdit in
-                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                                selectedFileForEdit = fileToEdit
-                                showingMetadataEdit = true
-                            },
-                            weightScope: .queue,
-                            showsWeightControl: true
-                        )
-		                        .id(file.id)
-		                        .listRowBackground(Color.clear)
-		                        .listRowSeparator(.hidden)
-		                        .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 2, trailing: 0))
-		                    }
-	                        .listStyle(PlainListStyle())
-	                        .background(Color.clear)
-	                        .scrollContentBackground(.hidden)
-                            .background(
-                                ListTableViewAccessor { tableView in
-                                    let currentID = queueTableView.map(ObjectIdentifier.init)
-                                    let newID = tableView.map(ObjectIdentifier.init)
-                                    if currentID != newID {
-                                        queueTableView = tableView
+                            ScrollView {
+                                LazyVStack(spacing: 4) {
+                                    ForEach(displayedQueueFiles) { file in
+                                        PlaylistItemView(
+                                            file: file,
+                                            isCurrentTrack: currentHighlightedURL == file.url,
+                                            isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
+                                            unplayableReason: playlistManager.unplayableReason(for: file.url),
+                                            searchText: playlistManager.searchText,
+                                            playAction: { selectedFile in
+                                                // 点击列表条目也顺便取消搜索聚焦
+                                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
+                                                // 从队列播放：后续“下一首/随机/骰子”等都应作用于队列范围
+                                                playlistManager.setPlaybackScopeQueue()
+                                                guard let index = playlistManager.audioFiles.firstIndex(of: selectedFile),
+                                                      let file = playlistManager.selectFile(at: index)
+                                                else { return }
+                                                // 若点击的是“当前已加载/正在播放”的曲目，不要重启到 0:00。
+                                                if audioPlayer.currentFile?.url == file.url {
+                                                    if !audioPlayer.isPlaying {
+                                                        audioPlayer.resume()
+                                                    }
+                                                    return
+                                                }
+                                                audioPlayer.play(file)
+                                            },
+                                            deleteAction: { fileToDelete in
+                                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
+                                                // 删除前判断是否命中当前播放
+                                                let isDeletingCurrent = (audioPlayer.currentFile?.url == fileToDelete.url)
+                                                if let index = playlistManager.audioFiles.firstIndex(of: fileToDelete) {
+                                                    // 先执行删除
+                                                    playlistManager.removeFile(at: index)
+
+                                                    // 若删除的是当前播放，根据播放模式处理
+                                                    if isDeletingCurrent {
+                                                        // 删除后剩余文件列表（从真实数据源拿）
+                                                        let remaining = playlistManager.audioFiles
+
+                                                        // 如果后续需要顺序“下一首”，可在此提供闭包：playNext: { playlistManager.nextAfterDeletion(from: index) }
+                                                        // 现阶段按约定：单曲循环->停止并清空；随机->随机一首；其他->停止并清空
+                                                        audioPlayer.handleCurrentTrackRemoved(
+                                                            remainingFiles: remaining,
+                                                            playNext: { playlistManager.nextFile(isShuffling: false) },
+                                                            playRandom: { playlistManager.getRandomFile() }
+                                                        )
+                                                    }
+                                                }
+                                            },
+                                            editAction: { fileToEdit in
+                                                NotificationCenter.default.post(name: .blurSearchField, object: nil)
+                                                selectedFileForEdit = fileToEdit
+                                                showingMetadataEdit = true
+                                            },
+                                            weightScope: .queue,
+                                            showsWeightControl: true
+                                        )
+                                        .id(file.id)
                                     }
                                 }
-                            )
+                                .padding(.vertical, 2)
+                            }
+                            .background(Color.clear)
                             .onChange(of: queueScrollTargetID) { target in
                                 guard let target else { return }
                                 performQueueScrollSequence(targetID: target, proxy: proxy)
@@ -427,7 +415,6 @@ struct PlaylistView: View {
         }
         .onDisappear {
             queueScrollTask?.cancel()
-            queueTableView = nil
             // 视图消失时确保清理窗口资源
             if let window = metadataEditWindow {
                 window.close()
@@ -466,12 +453,8 @@ struct PlaylistView: View {
                 if Task.isCancelled { return }
                 guard let targetIndex = displayedQueueFiles.firstIndex(where: { $0.id == targetID }) else { continue }
 
-                if let tableView = queueTableView, tableView.numberOfRows > targetIndex {
-                    centerListRow(targetIndex, in: tableView)
-                } else {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        proxy.scrollTo(targetID, anchor: .center)
-                    }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    proxy.scrollTo(displayedQueueFiles[targetIndex].id, anchor: .center)
                 }
             }
 

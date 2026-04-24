@@ -61,6 +61,15 @@ struct ListTableViewAccessor: NSViewRepresentable {
 func centerListRow(_ row: Int, in tableView: NSTableView) {
     guard row >= 0, row < tableView.numberOfRows else { return }
 
+    DispatchQueue.main.async {
+        performCenteredListScroll(row, in: tableView)
+    }
+}
+
+@MainActor
+private func performCenteredListScroll(_ row: Int, in tableView: NSTableView) {
+    guard row >= 0, row < tableView.numberOfRows else { return }
+
     tableView.scrollRowToVisible(row)
 
     guard let scrollView = tableView.enclosingScrollView else { return }
