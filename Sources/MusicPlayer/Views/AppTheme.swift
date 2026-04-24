@@ -82,9 +82,9 @@ struct AppTheme {
         if scheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.04, green: 0.08, blue: 0.12),  // 深夜蓝
-                    Color(red: 0.06, green: 0.10, blue: 0.14),  // 午夜色
-                    Color(red: 0.03, green: 0.06, blue: 0.10)   // 深海蓝
+                    Color(red: 0.08, green: 0.16, blue: 0.19),
+                    Color(red: 0.06, green: 0.13, blue: 0.17),
+                    Color(red: 0.09, green: 0.12, blue: 0.15)
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
@@ -103,20 +103,20 @@ struct AppTheme {
     }
 
     var backgroundArtworkOpacity: Double {
-        scheme == .dark ? 0.95 : 0.28
+        scheme == .dark ? 0.86 : 0.28
     }
 
     var backgroundArtworkScrim: Color {
-        scheme == .dark ? Color.black.opacity(0.12) : Color.white.opacity(0.64)
+        scheme == .dark ? Color(red: 0.02, green: 0.07, blue: 0.09).opacity(0.08) : Color.white.opacity(0.64)
     }
 
     var backgroundArtworkVignette: LinearGradient {
         if scheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color.black.opacity(0.24),
-                    Color.black.opacity(0.04),
-                    Color.black.opacity(0.28)
+                    Color.black.opacity(0.16),
+                    Color.black.opacity(0.00),
+                    Color.black.opacity(0.18)
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -135,15 +135,15 @@ struct AppTheme {
     }
 
     var glassPanelFill: Color {
-        scheme == .dark ? Color.black.opacity(0.34) : Color.white.opacity(0.72)
+        scheme == .dark ? Color(red: 0.05, green: 0.11, blue: 0.13).opacity(0.52) : Color.white.opacity(0.72)
     }
 
     var glassCardFill: Color {
-        scheme == .dark ? Color.black.opacity(0.30) : Color.white.opacity(0.74)
+        scheme == .dark ? Color(red: 0.04, green: 0.09, blue: 0.11).opacity(0.48) : Color.white.opacity(0.74)
     }
 
     var glassRowFill: Color {
-        scheme == .dark ? Color.black.opacity(0.20) : Color.white.opacity(0.62)
+        scheme == .dark ? Color(red: 0.04, green: 0.09, blue: 0.11).opacity(0.42) : Color.white.opacity(0.62)
     }
 
     var panelBackground: LinearGradient {
