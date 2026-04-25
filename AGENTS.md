@@ -58,7 +58,8 @@ gh release delete vOLD -R lueluelue2006/macOS_MusicPlayer --yes
 
 ### 5) 发布细节规范（必须）
 
-- Release 文案必须使用 `--notes-file`（或 `--notes-file` + 本地 markdown 文件），避免 `\n` 字面量导致页面格式错乱。
+- 不写传统更新日志 / changelog；发布说明只保留最小必要信息，符合 vibe coding。
+- 如 GitHub CLI 需要 notes 文件，使用临时 `--notes-file`，内容只写一两句必要说明，避免 `\n` 字面量导致页面格式错乱。
 - 上传资产前必须校验架构：
   - Apple Silicon 包内可执行文件应为 `arm64`
   - Intel 包内可执行文件应为 `x86_64`
