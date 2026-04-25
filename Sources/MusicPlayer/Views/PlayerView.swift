@@ -581,7 +581,7 @@ struct CurrentTrackView: View {
         .padding()
         .background(
             RoundedRectangle(cornerRadius: 20)
-                .fill(theme.glassCardFill)
+                .fill(theme.elevatedSurface)
                 .overlay(
                     RoundedRectangle(cornerRadius: 20)
                         .stroke(theme.stroke, lineWidth: 1)
@@ -670,7 +670,7 @@ struct LyricsContainerView: View {
                 .padding(12)
                 .background(
                     RoundedRectangle(cornerRadius: 12)
-                        .fill(theme.glassCardFill)
+                        .fill(theme.surface)
                         .overlay(
                             RoundedRectangle(cornerRadius: 12)
                                 .stroke(theme.stroke, lineWidth: 1)

@@ -57,15 +57,6 @@ mkdir -p MusicPlayer.app/Contents/Resources
 # 复制可执行文件
 cp ".build/release/MusicPlayer" "MusicPlayer.app/Contents/MacOS/"
 
-# 复制应用背景资源到标准 app Resources 目录，避免在 .app 根目录产生未密封内容。
-BACKGROUND_RESOURCE="Sources/MusicPlayer/Resources/generated-music-background.png"
-if [[ -f "$BACKGROUND_RESOURCE" ]]; then
-    cp "$BACKGROUND_RESOURCE" "MusicPlayer.app/Contents/Resources/"
-    echo "🖼️  应用背景资源已添加"
-else
-    echo "⚠️  警告: 未找到应用背景资源 ${BACKGROUND_RESOURCE}"
-fi
-
 # 复制应用图标
 if [ -f "AppIcon.icns" ]; then
     cp AppIcon.icns MusicPlayer.app/Contents/Resources/

@@ -36,7 +36,8 @@ struct ContentView: View {
                     // 上方播放器面板
                     PlayerView(audioPlayer: audioPlayer, playlistManager: playlistManager)
                         .frame(height: max(200, geometry.size.height * 0.4))
-                        .background(theme.glassPanelFill)
+                        .background(.ultraThinMaterial)
+                        .background(theme.panelBackground.opacity(0.6))
                         .clipShape(RoundedRectangle(cornerRadius: 20))
                         .overlay(
                             RoundedRectangle(cornerRadius: 20)
@@ -47,7 +48,8 @@ struct ContentView: View {
                     // 下方播放列表
                     PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
                         .frame(minHeight: 200)
-                        .background(theme.glassPanelFill)
+                        .background(.ultraThinMaterial)
+                        .background(theme.surface.opacity(0.3))
                 }
             } else {
                 // 大屏幕：水平布局
@@ -55,7 +57,8 @@ struct ContentView: View {
                     // 左侧播放器面板
                     PlayerView(audioPlayer: audioPlayer, playlistManager: playlistManager)
                         .frame(width: 440)
-                        .background(theme.glassPanelFill)
+                        .background(.ultraThinMaterial)
+                        .background(theme.panelBackground.opacity(0.6))
                         .clipShape(RoundedRectangle(cornerRadius: 20))
                         .overlay(
                             RoundedRectangle(cornerRadius: 20)
@@ -66,7 +69,8 @@ struct ContentView: View {
                     // 右侧播放列表
                     PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
                         .frame(minWidth: 400)
-                        .background(theme.glassPanelFill)
+                        .background(.ultraThinMaterial)
+                        .background(theme.surface.opacity(0.3))
                         .clipShape(RoundedRectangle(cornerRadius: 20))
                         .overlay(
                             RoundedRectangle(cornerRadius: 20)
@@ -83,7 +87,7 @@ struct ContentView: View {
         let base = AnyView(layoutView)
 
         let withChrome = base
-            .background(AppBackgroundView(theme: theme))
+            .background(theme.backgroundGradient)
             .onAppear {
                 // 启动时确保搜索框不自动聚焦
                 NotificationCenter.default.post(name: .blurSearchField, object: nil)

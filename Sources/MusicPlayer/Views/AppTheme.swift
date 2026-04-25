@@ -3,37 +3,37 @@ import SwiftUI
 struct AppTheme {
     let scheme: ColorScheme
 
-    // MARK: - 双模式配色（暗色玫瑰石墨 / 亮色暖霞）
+    // MARK: - 双模式配色（暗色极光 / 亮色暖霞）
 
-    /// 主强调色 - 暗色柔和玫瑰 / 亮色玫瑰粉
+    /// 主强调色 - 暗色冰蓝 / 亮色玫瑰粉
     var accent: Color {
         scheme == .dark
-            ? Color(red: 0.86, green: 0.46, blue: 0.52)
+            ? Color(red: 0.35, green: 0.85, blue: 0.92)   // 冰蓝色
             : Color(red: 0.93, green: 0.32, blue: 0.52)    // 玫瑰粉
     }
 
-    /// 次要强调色 - 暗色暖铜 / 亮色暖橙
+    /// 次要强调色 - 暗色薄荷绿 / 亮色暖橙
     var accentSecondary: Color {
         scheme == .dark
-            ? Color(red: 0.86, green: 0.60, blue: 0.36)
+            ? Color(red: 0.30, green: 0.95, blue: 0.70)   // 薄荷绿
             : Color(red: 1.0, green: 0.55, blue: 0.32)    // 暖橙
     }
 
-    /// 第三强调色 - 暗色钢蓝灰 / 亮色梦幻紫
+    /// 第三强调色 - 暗色极光绿 / 亮色梦幻紫
     var accentTertiary: Color {
         scheme == .dark
-            ? Color(red: 0.48, green: 0.56, blue: 0.70)
+            ? Color(red: 0.55, green: 1.0, blue: 0.85)    // 极光绿
             : Color(red: 0.58, green: 0.25, blue: 0.80)    // 梦幻紫
     }
 
-    /// 主渐变 - 暗色低饱和玫瑰铜 / 亮色暖霞渐变
+    /// 主渐变 - 暗色极光效果 / 亮色暖霞渐变
     var accentGradient: LinearGradient {
         if scheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.84, green: 0.44, blue: 0.52),
-                    Color(red: 0.84, green: 0.58, blue: 0.36),
-                    Color(red: 0.48, green: 0.56, blue: 0.70)
+                    Color(red: 0.30, green: 0.95, blue: 0.70),  // 薄荷绿
+                    Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
+                    Color(red: 0.45, green: 0.75, blue: 0.95)   // 天青
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
@@ -56,8 +56,9 @@ struct AppTheme {
         if scheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.84, green: 0.44, blue: 0.52),
-                    Color(red: 0.86, green: 0.60, blue: 0.36)
+                    Color(red: 0.30, green: 0.95, blue: 0.70),  // 薄荷绿
+                    Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
+                    Color(red: 0.50, green: 0.75, blue: 0.98)   // 极光蓝
                 ],
                 startPoint: .leading,
                 endPoint: .trailing
@@ -81,9 +82,9 @@ struct AppTheme {
         if scheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.11, green: 0.11, blue: 0.12),
-                    Color(red: 0.13, green: 0.13, blue: 0.15),
-                    Color(red: 0.14, green: 0.12, blue: 0.13)
+                    Color(red: 0.04, green: 0.08, blue: 0.12),  // 深夜蓝
+                    Color(red: 0.06, green: 0.10, blue: 0.14),  // 午夜色
+                    Color(red: 0.03, green: 0.06, blue: 0.10)   // 深海蓝
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
@@ -101,56 +102,12 @@ struct AppTheme {
         }
     }
 
-    var backgroundArtworkOpacity: Double {
-        scheme == .dark ? 0.18 : 0.28
-    }
-
-    var backgroundArtworkScrim: Color {
-        scheme == .dark ? Color(red: 0.10, green: 0.10, blue: 0.11).opacity(0.50) : Color.white.opacity(0.64)
-    }
-
-    var backgroundArtworkVignette: LinearGradient {
-        if scheme == .dark {
-            return LinearGradient(
-                colors: [
-                    Color.black.opacity(0.42),
-                    Color.black.opacity(0.18),
-                    Color.black.opacity(0.52)
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        } else {
-            return LinearGradient(
-                colors: [
-                    Color.white.opacity(0.82),
-                    Color.white.opacity(0.54),
-                    Color.white.opacity(0.86)
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        }
-    }
-
-    var glassPanelFill: Color {
-        scheme == .dark ? Color(red: 0.12, green: 0.13, blue: 0.14).opacity(0.90) : Color.white.opacity(0.72)
-    }
-
-    var glassCardFill: Color {
-        scheme == .dark ? Color(red: 0.13, green: 0.14, blue: 0.15).opacity(0.86) : Color.white.opacity(0.74)
-    }
-
-    var glassRowFill: Color {
-        scheme == .dark ? Color(red: 0.14, green: 0.15, blue: 0.16).opacity(0.80) : Color.white.opacity(0.62)
-    }
-
     var panelBackground: LinearGradient {
         if scheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.14, green: 0.15, blue: 0.16),
-                    Color(red: 0.11, green: 0.11, blue: 0.12)
+                    Color(red: 0.08, green: 0.12, blue: 0.16),  // 极夜蓝
+                    Color(red: 0.06, green: 0.10, blue: 0.14)   // 深渊蓝
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
@@ -170,41 +127,41 @@ struct AppTheme {
     // MARK: - 表面和层级
 
     var surface: Color {
-        scheme == .dark ? Color.white.opacity(0.08) : Color.white.opacity(0.92)
+        scheme == .dark ? Color.white.opacity(0.06) : Color.white.opacity(0.92)
     }
 
     var elevatedSurface: Color {
-        scheme == .dark ? Color.white.opacity(0.13) : Color.white.opacity(0.85)
+        scheme == .dark ? Color.white.opacity(0.10) : Color.white.opacity(0.85)
     }
 
     var mutedSurface: Color {
-        scheme == .dark ? Color.white.opacity(0.065) : Color.white.opacity(0.70)
+        scheme == .dark ? Color.white.opacity(0.04) : Color.white.opacity(0.70)
     }
 
     // MARK: - 边框和阴影
 
     var stroke: Color {
-        scheme == .dark ? Color.white.opacity(0.13) : Color.black.opacity(0.06)
+        scheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.06)
     }
 
     /// 发光边框色
     var glowStroke: Color {
-        scheme == .dark ? accent.opacity(0.28) : accent.opacity(0.30)
+        scheme == .dark ? accent.opacity(0.35) : accent.opacity(0.30)
     }
 
     var subtleShadow: Color {
-        scheme == .dark ? Color.black.opacity(0.34) : Color.black.opacity(0.10)
+        scheme == .dark ? Color.black.opacity(0.50) : Color.black.opacity(0.10)
     }
 
     /// 强调阴影 - 带颜色的阴影
     var accentShadow: Color {
-        scheme == .dark ? accent.opacity(0.18) : accentSecondary.opacity(0.22)
+        scheme == .dark ? accent.opacity(0.30) : accentSecondary.opacity(0.22)
     }
 
     // MARK: - 文字颜色
 
     var mutedText: Color {
-        scheme == .dark ? Color.white.opacity(0.76) : Color.secondary
+        scheme == .dark ? Color.white.opacity(0.72) : Color.secondary
     }
 
     // MARK: - 交互状态
@@ -213,8 +170,8 @@ struct AppTheme {
         if isActive {
             return LinearGradient(
                 colors: [
-                    accent.opacity(0.18),
-                    accentSecondary.opacity(0.10)
+                    accent.opacity(0.25),
+                    accentSecondary.opacity(0.15)
                 ],
                 startPoint: .leading,
                 endPoint: .trailing
