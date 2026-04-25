@@ -15,6 +15,7 @@ struct PlaylistsPanelView: View {
 	    @State private var trackSearchText: String = ""
 	    @State private var loadedTracks: [AudioFile] = []
 	    @State private var visibleTracks: [AudioFile] = []
+        @State private var visibleTracksRevision: UInt64 = 0
 	    @State private var trackUnplayableReasons: [String: String] = [:]
 	    @State private var isLoadingTracks: Bool = false
 	    @State private var loadTask: Task<Void, Never>?
@@ -247,7 +248,10 @@ struct PlaylistsPanelView: View {
                                         }
                                         onRequestEditMetadata(fileToEdit)
                                     },
-                                    weightScope: .playlist(playlist.id),
+                                    weightLevel: weights.level(for: file.url, scope: .playlist(playlist.id)),
+                                    onWeightSelect: { newLevel in
+                                        weights.setLevel(newLevel, for: file.url, scope: .playlist(playlist.id))
+                                    },
                                     showsWeightControl: true
                                 )
 	                                .id(file.id)
@@ -273,7 +277,7 @@ struct PlaylistsPanelView: View {
 	                        guard let target else { return }
 	                        performPlaylistScrollSequence(targetID: target, proxy: proxy)
 	                    }
-	                    .onChange(of: loadedTracks.map(\.id)) { _ in
+	                    .onChange(of: visibleTracksRevision) { _ in
 	                        guard let target = playlistScrollTargetID else { return }
 	                        performPlaylistScrollSequence(targetID: target, proxy: proxy)
 	                    }
@@ -622,9 +626,11 @@ struct PlaylistsPanelView: View {
 
         guard let playlist = selectedPlaylist else {
             visibleTracks = base
+            visibleTracksRevision &+= 1
             return
         }
         visibleTracks = sortState.option(for: .playlists).applying(to: base, weightScope: .playlist(playlist.id))
+        visibleTracksRevision &+= 1
     }
 
     @MainActor

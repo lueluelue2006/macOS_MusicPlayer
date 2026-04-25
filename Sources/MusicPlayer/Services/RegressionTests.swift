@@ -33,7 +33,8 @@ enum RegressionTests {
         }
     }
 
-    static func runAll() async {
+    @discardableResult
+    static func runAll() async -> Bool {
         print("\n🧪 Starting Regression Tests...")
         print(String(repeating: "=", count: 58))
 
@@ -69,6 +70,7 @@ enum RegressionTests {
         } else {
             print("⚠️ Regression failures detected")
         }
+        return failed == 0
     }
 
     private static func testPathKeyMigrationIncrementalTrigger() async -> Bool {
@@ -228,25 +230,6 @@ enum RegressionTests {
     }
 
     private static func testQueueRestoreKeepsSavedIndex() async -> Bool {
-        let defaults = UserDefaults.standard
-        let pathsKey = "savedPlaylistPaths"
-        let indexKey = "savedPlaylistIndex"
-        let originalPaths = defaults.stringArray(forKey: pathsKey)
-        let hadOriginalIndex = defaults.object(forKey: indexKey) != nil
-        let originalIndex = defaults.integer(forKey: indexKey)
-        defer {
-            if let originalPaths {
-                defaults.set(originalPaths, forKey: pathsKey)
-            } else {
-                defaults.removeObject(forKey: pathsKey)
-            }
-            if hadOriginalIndex {
-                defaults.set(originalIndex, forKey: indexKey)
-            } else {
-                defaults.removeObject(forKey: indexKey)
-            }
-        }
-
         let fm = FileManager.default
         let tempRoot = fm.temporaryDirectory.appendingPathComponent("musicplayer-regression-queue-index-\(UUID().uuidString)", isDirectory: true)
         defer { try? fm.removeItem(at: tempRoot) }
@@ -258,11 +241,15 @@ enum RegressionTests {
                 try Data("x".utf8).write(to: url)
                 return url
             }
+            let playlistURL = tempRoot.appendingPathComponent("playlist.json", isDirectory: false)
+            let payload: [String: Any] = [
+                "paths": urls.map(\.path),
+                "currentIndex": 2
+            ]
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+            try data.write(to: playlistURL, options: .atomic)
 
-            defaults.set(urls.map(\.path), forKey: pathsKey)
-            defaults.set(2, forKey: indexKey)
-
-            let manager = PlaylistManager()
+            let manager = PlaylistManager(playlistFileURLOverride: playlistURL)
             await manager.loadSavedPlaylist()
             return await MainActor.run {
                 manager.audioFiles.count == 3 && manager.currentIndex == 2

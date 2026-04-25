@@ -50,6 +50,7 @@ final class PlaylistManager: ObservableObject {
         let currentIndex: Int
     }
     private let playlistFileName = "playlist.json"
+    private let playlistFileURLOverride: URL?
     private let isRunningRegressionTests = ProcessInfo.processInfo.environment["MUSICPLAYER_RUN_REGRESSION_TESTS"] == "1"
     private let playlistIOQueue = DispatchQueue(label: "playlist.persistence", qos: .utility)
     private let playlistIOQueueKey = DispatchSpecificKey<Void>()
@@ -69,7 +70,8 @@ final class PlaylistManager: ObservableObject {
     @MainActor private var pendingDurationURLKeys: Set<String> = []
     @MainActor private var pendingDurationIndex: Int = 0
 
-    init() {
+    init(playlistFileURLOverride: URL? = nil) {
+        self.playlistFileURLOverride = playlistFileURLOverride
         playlistIOQueue.setSpecific(key: playlistIOQueueKey, value: ())
         loadScanSubfoldersPreference()
 
@@ -1880,6 +1882,19 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func playlistFileURL() -> URL? {
+        if let playlistFileURLOverride {
+            let dir = playlistFileURLOverride.deletingLastPathComponent()
+            if !FileManager.default.fileExists(atPath: dir.path) {
+                do {
+                    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                } catch {
+                    debugLog("创建测试播放列表目录失败: \(error)")
+                    return nil
+                }
+            }
+            return playlistFileURLOverride
+        }
+
         let fm = FileManager.default
         guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             return nil

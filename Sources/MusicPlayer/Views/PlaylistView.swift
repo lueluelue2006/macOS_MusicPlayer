@@ -13,6 +13,7 @@ struct PlaylistView: View {
     @State private var queueScrollTargetID: String?
     @State private var queueScrollTask: Task<Void, Never>?
     @State private var queueVisibleFiles: [AudioFile] = []
+    @State private var queueVisibleRevision: UInt64 = 0
     @State private var playlistLocateRequestID: Int = 0
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
@@ -320,7 +321,10 @@ struct PlaylistView: View {
                                                 selectedFileForEdit = fileToEdit
                                                 showingMetadataEdit = true
                                             },
-                                            weightScope: .queue,
+                                            weightLevel: weights.level(for: file.url, scope: .queue),
+                                            onWeightSelect: { newLevel in
+                                                weights.setLevel(newLevel, for: file.url, scope: .queue)
+                                            },
                                             showsWeightControl: true
                                         )
                                         .id(file.id)
@@ -333,7 +337,7 @@ struct PlaylistView: View {
                                 guard let target else { return }
                                 performQueueScrollSequence(targetID: target, proxy: proxy)
                             }
-                            .onChange(of: displayedQueueFiles.map(\.id)) { _ in
+                            .onChange(of: queueVisibleRevision) { _ in
                                 guard let target = queueScrollTargetID else { return }
                                 performQueueScrollSequence(targetID: target, proxy: proxy)
                             }
@@ -474,6 +478,7 @@ struct PlaylistView: View {
     @MainActor
     private func refreshQueueVisibleFiles() {
         queueVisibleFiles = sortState.option(for: .queue).applying(to: queueSourceFiles, weightScope: .queue)
+        queueVisibleRevision &+= 1
     }
 
     private var refreshButton: some View {
@@ -714,12 +719,12 @@ struct PlaylistItemView: View {
     let playAction: (AudioFile) -> Void
     let deleteAction: (AudioFile) -> Void
     let editAction: (AudioFile) -> Void
-    let weightScope: PlaybackWeights.Scope?
+    let weightLevel: PlaybackWeights.Level?
+    let onWeightSelect: ((PlaybackWeights.Level) -> Void)?
     let showsWeightControl: Bool
     @State private var isHovered = false
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
-    @ObservedObject private var weights = PlaybackWeights.shared
     private var iconStyle: AnyShapeStyle {
         if isCurrentTrack { return AnyShapeStyle(theme.accentGradient) }
         if unplayableReason != nil { return AnyShapeStyle(Color.orange) }
@@ -780,10 +785,9 @@ struct PlaylistItemView: View {
                         Spacer(minLength: 8)
 
                         HStack(alignment: .center, spacing: 8) {
-                            if showsWeightControl, let scope = weightScope {
-                                let level = weights.level(for: file.url, scope: scope)
-                                WeightDotsView(level: level) { newLevel in
-                                    weights.setLevel(newLevel, for: file.url, scope: scope)
+                            if showsWeightControl, let weightLevel, let onWeightSelect {
+                                WeightDotsView(level: weightLevel) { newLevel in
+                                    onWeightSelect(newLevel)
                                 }
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 4)
