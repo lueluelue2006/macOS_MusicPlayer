@@ -56,6 +56,7 @@ mkdir -p MusicPlayer.app/Contents/Resources
 
 # 复制可执行文件
 cp ".build/release/MusicPlayer" "MusicPlayer.app/Contents/MacOS/"
+cp ".build/release/musicplayerctl" "MusicPlayer.app/Contents/MacOS/"
 
 # 复制应用图标
 if [ -f "AppIcon.icns" ]; then
@@ -146,6 +147,7 @@ EOF
 
 # 设置可执行权限
 chmod +x MusicPlayer.app/Contents/MacOS/MusicPlayer
+chmod +x MusicPlayer.app/Contents/MacOS/musicplayerctl
 
 # 尝试进行临时(adhoc)签名以提升通知注册可靠性
 echo "🔏 对应用进行临时签名(adhoc)…"

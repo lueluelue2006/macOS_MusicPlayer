@@ -6,6 +6,7 @@ struct PlaylistsPanelView: View {
     @ObservedObject var playlistManager: PlaylistManager
     @ObservedObject var playlistsStore: PlaylistsStore
 
+    let locateNowPlayingRequestID: Int
     let onRequestEditMetadata: (AudioFile) -> Void
 
     @ObservedObject private var weights = PlaybackWeights.shared
@@ -20,6 +21,7 @@ struct PlaylistsPanelView: View {
 	    @State private var playlistScrollTargetID: String?
 	    @State private var playlistScrollTask: Task<Void, Never>?
         @State private var playlistTableView: NSTableView?
+        @State private var handledLocateNowPlayingRequestID: Int = 0
 
     // Add-from-queue multi-select sheet
     @State private var showAddFromQueueSheet: Bool = false
@@ -80,6 +82,7 @@ struct PlaylistsPanelView: View {
             playlistsStore.loadIfNeeded()
             reloadSelectedPlaylist()
             refreshVisibleTracks()
+            handlePendingLocateNowPlayingRequest()
         }
         .onChange(of: playlistsStore.selectedPlaylistID) { _ in
             reloadSelectedPlaylist()
@@ -93,7 +96,7 @@ struct PlaylistsPanelView: View {
         .onChange(of: weights.revision) { _ in
             refreshVisibleTracks()
         }
-        .onReceive(sortState.objectWillChange) { _ in
+        .onChange(of: sortState.revision) { _ in
             refreshVisibleTracks()
         }
         .onReceive(NotificationCenter.default.publisher(for: .requestDismissAllSheets)) { _ in
@@ -102,6 +105,9 @@ struct PlaylistsPanelView: View {
         .onReceive(NotificationCenter.default.publisher(for: .requestLocateNowPlayingInPlaylist)) { _ in
             guard let playlist = selectedPlaylist else { return }
             requestScrollToNowPlayingInPlaylist(playlist)
+        }
+        .onChange(of: locateNowPlayingRequestID) { _ in
+            handlePendingLocateNowPlayingRequest()
         }
     }
 
@@ -498,6 +504,7 @@ struct PlaylistsPanelView: View {
 
 	    private func reloadSelectedPlaylist() {
 	        loadTask?.cancel()
+            isLoadingTracks = false
 	        trackSearchText = ""
 	        playlistScrollTargetID = nil
 	        loadedTracks = []
@@ -507,7 +514,10 @@ struct PlaylistsPanelView: View {
         guard let playlist = selectedPlaylist else { return }
         let playlistID = playlist.id
         let paths = playlist.tracks.map(\.path)
-        guard !paths.isEmpty else { return }
+        guard !paths.isEmpty else {
+            playlistManager.updatePlaybackScopePlaylistTracksIfActive(playlistID, trackURLsInOrder: [])
+            return
+        }
 
         isLoadingTracks = true
 
@@ -567,6 +577,7 @@ struct PlaylistsPanelView: View {
             let finalTracks = results.compactMap { $0 }
             let finalReasons = reasons
             await MainActor.run {
+                guard self.selectedPlaylist?.id == playlistID else { return }
                 if Task.isCancelled { return }
                 self.loadedTracks = finalTracks
                 self.trackUnplayableReasons = finalReasons
@@ -616,6 +627,16 @@ struct PlaylistsPanelView: View {
         visibleTracks = sortState.option(for: .playlists).applying(to: base, weightScope: .playlist(playlist.id))
     }
 
+    @MainActor
+    private func handlePendingLocateNowPlayingRequest() {
+        guard locateNowPlayingRequestID != 0,
+              locateNowPlayingRequestID != handledLocateNowPlayingRequestID,
+              let playlist = selectedPlaylist
+        else { return }
+        handledLocateNowPlayingRequestID = locateNowPlayingRequestID
+        requestScrollToNowPlayingInPlaylist(playlist)
+    }
+
     // MARK: - Add from queue sheet
 
     private var addFromQueueCandidates: [AudioFile] {
@@ -637,8 +658,16 @@ struct PlaylistsPanelView: View {
         let keySet = addFromQueueSelectedKeys
         guard !keySet.isEmpty else { return [] }
         return playlistManager.audioFiles.filter {
-            !Set(pathLookupKeys($0.url)).isDisjoint(with: keySet)
+            keySet.contains(pathKey($0.url))
         }
+    }
+
+    private var addFromQueueSelectedCount: Int {
+        addFromQueueSelectedFiles.count
+    }
+
+    private func isAddFromQueueSelected(_ file: AudioFile) -> Bool {
+        addFromQueueSelectedKeys.contains(pathKey(file.url))
     }
 
 	    @ViewBuilder
@@ -673,7 +702,9 @@ struct PlaylistsPanelView: View {
 	                    Spacer()
 	                    Button("本页全不选") {
 	                        for f in addFromQueueCandidates {
-	                            addFromQueueSelectedKeys.remove(pathKey(f.url))
+                                for key in pathLookupKeys(f.url) {
+                                    addFromQueueSelectedKeys.remove(key)
+                                }
 	                        }
 	                    }
 	                    .disabled(addFromQueueCandidates.isEmpty)
@@ -700,22 +731,16 @@ struct PlaylistsPanelView: View {
 	            List(addFromQueueCandidates) { file in
                 Button {
                     let k = pathKey(file.url)
-                    let selected = !Set(pathLookupKeys(file.url)).isDisjoint(with: addFromQueueSelectedKeys)
+                    let selected = isAddFromQueueSelected(file)
                     if selected {
-                        addFromQueueSelectedKeys.remove(k)
-                        let legacy = PathKey.legacy(for: file.url)
-                        if legacy != k {
-                            addFromQueueSelectedKeys.remove(legacy)
+                        for key in pathLookupKeys(file.url) {
+                            addFromQueueSelectedKeys.remove(key)
                         }
                     } else {
                         addFromQueueSelectedKeys.insert(k)
-                        let legacy = PathKey.legacy(for: file.url)
-                        if legacy != k {
-                            addFromQueueSelectedKeys.insert(legacy)
-                        }
                     }
                 } label: {
-                    let selected = !Set(pathLookupKeys(file.url)).isDisjoint(with: addFromQueueSelectedKeys)
+                    let selected = isAddFromQueueSelected(file)
                     HStack(spacing: 10) {
                         Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                             .foregroundStyle(selected ? AnyShapeStyle(theme.accentGradient) : AnyShapeStyle(theme.mutedText))
@@ -744,7 +769,7 @@ struct PlaylistsPanelView: View {
 
             // Bottom "selected files" area
             VStack(alignment: .leading, spacing: 8) {
-                Text("已选 \(addFromQueueSelectedKeys.count) 首：")
+                Text("已选 \(addFromQueueSelectedCount) 首：")
                     .font(.caption)
                     .foregroundColor(theme.mutedText)
 
@@ -779,7 +804,7 @@ struct PlaylistsPanelView: View {
 
                 Spacer()
 
-                Button("添加 \(addFromQueueSelectedKeys.count) 首") {
+                Button("添加 \(addFromQueueSelectedCount) 首") {
                     guard let targetID = addFromQueueTargetPlaylistID else {
                         showAddFromQueueSheet = false
                         return
@@ -791,7 +816,7 @@ struct PlaylistsPanelView: View {
                     postToast(title: "已添加 \(urls.count) 首", subtitle: nil, kind: "success")
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(addFromQueueSelectedKeys.isEmpty)
+                .disabled(addFromQueueSelectedCount == 0)
             }
         }
         .onAppear {

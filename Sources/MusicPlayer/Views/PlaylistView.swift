@@ -13,6 +13,7 @@ struct PlaylistView: View {
     @State private var queueScrollTargetID: String?
     @State private var queueScrollTask: Task<Void, Never>?
     @State private var queueVisibleFiles: [AudioFile] = []
+    @State private var playlistLocateRequestID: Int = 0
     @Environment(\.colorScheme) private var colorScheme
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
@@ -308,7 +309,7 @@ struct PlaylistView: View {
                                                         // 现阶段按约定：单曲循环->停止并清空；随机->随机一首；其他->停止并清空
                                                         audioPlayer.handleCurrentTrackRemoved(
                                                             remainingFiles: remaining,
-                                                            playNext: { playlistManager.nextFile(isShuffling: false) },
+                                                            playNext: { playlistManager.nextFileAfterRemovingQueueItem(atDeletedIndex: index) },
                                                             playRandom: { playlistManager.getRandomFile() }
                                                         )
                                                     }
@@ -356,6 +357,7 @@ struct PlaylistView: View {
                     audioPlayer: audioPlayer,
                     playlistManager: playlistManager,
                     playlistsStore: playlistsStore,
+                    locateNowPlayingRequestID: playlistLocateRequestID,
                     onRequestEditMetadata: { file in
                         selectedFileForEdit = file
                         showingMetadataEdit = true
@@ -374,7 +376,7 @@ struct PlaylistView: View {
         .onReceive(playlistManager.$audioFiles) { _ in
             refreshQueueVisibleFiles()
         }
-        .onReceive(sortState.objectWillChange) { _ in
+        .onChange(of: sortState.revision) { _ in
             refreshQueueVisibleFiles()
         }
         .onChange(of: weights.revision) { _ in
@@ -406,6 +408,10 @@ struct PlaylistView: View {
         .onReceive(NotificationCenter.default.publisher(for: .requestLocateNowPlayingInQueue)) { _ in
             panelMode = .queue
             requestScrollToNowPlayingInQueue()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .requestLocateNowPlayingInPlaylist)) { _ in
+            panelMode = .playlists
+            playlistLocateRequestID += 1
         }
         .onChange(of: showingMetadataEdit) { isShowing in
             if isShowing, let file = selectedFileForEdit {

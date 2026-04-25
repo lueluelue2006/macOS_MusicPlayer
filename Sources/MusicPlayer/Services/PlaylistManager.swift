@@ -110,6 +110,10 @@ final class PlaylistManager: ObservableObject {
     /// keeping the existing shuffle queue as stable as possible.
     func updatePlaybackScopePlaylistTracksIfActive(_ playlistID: UserPlaylist.ID, trackURLsInOrder: [URL]) {
         guard playbackScope == .playlist(playlistID) else { return }
+        guard !trackURLsInOrder.isEmpty else {
+            setPlaybackScopeQueue()
+            return
+        }
 
         let oldKeys = playbackPlaylistTrackKeys
         let newKeys = trackURLsInOrder.map { pathKey($0) }
@@ -836,7 +840,7 @@ final class PlaylistManager: ObservableObject {
     }
     
     func removeFile(at index: Int) {
-        guard index < audioFiles.count else { return }
+        guard audioFiles.indices.contains(index) else { return }
         let removedURL = audioFiles[index].url
         audioFiles.remove(at: index)
         invalidateQueueIndexCache()
@@ -853,6 +857,14 @@ final class PlaylistManager: ObservableObject {
         updateFilteredFiles()
         resetShuffleQueue()
         savePlaylist() // 保存播放列表
+    }
+
+    func nextFileAfterRemovingQueueItem(atDeletedIndex deletedIndex: Int) -> AudioFile? {
+        guard !audioFiles.isEmpty else { return nil }
+        let nextIndex = audioFiles.indices.contains(deletedIndex) ? deletedIndex : 0
+        currentIndex = nextIndex
+        savePlaylist()
+        return audioFiles[nextIndex]
     }
     
     @MainActor
@@ -970,7 +982,7 @@ final class PlaylistManager: ObservableObject {
     }
     
     func selectFile(at index: Int) -> AudioFile? {
-        guard index < audioFiles.count else { return nil }
+        guard audioFiles.indices.contains(index) else { return nil }
         currentIndex = index
         savePlaylist() // 保存当前索引
         return audioFiles[index]
@@ -1064,7 +1076,7 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func getRandomFileInQueue() -> AudioFile? {
-        createShuffleQueue()
+        createShuffleQueue(startFromRandom: true)
         if !shuffleQueue.isEmpty {
             currentIndex = shuffleQueue[0]
             shuffleIndex = 1
@@ -1256,10 +1268,23 @@ final class PlaylistManager: ObservableObject {
     }
 
     // 洗牌算法
-    private func createShuffleQueue() {
+    private func createShuffleQueue(startFromRandom: Bool = false) {
         let playable = audioFiles.indices.filter { !isUnplayableIndex($0) }
-        shuffleQueue = weightedShuffleIndices(playable, scope: .queue)
-        shuffleIndex = 0
+        guard !playable.isEmpty else {
+            shuffleQueue.removeAll(keepingCapacity: true)
+            shuffleIndex = 0
+            return
+        }
+
+        if startFromRandom || !playable.contains(currentIndex) || playable.count == 1 {
+            shuffleQueue = weightedShuffleIndices(playable, scope: .queue)
+            shuffleIndex = 0
+            return
+        }
+
+        let rest = weightedShuffleIndices(playable.filter { $0 != currentIndex }, scope: .queue)
+        shuffleQueue = [currentIndex] + rest
+        shuffleIndex = 1
     }
 
     private func createPlaylistShuffleQueue(startFromRandom: Bool = false) {
@@ -1721,7 +1746,7 @@ final class PlaylistManager: ObservableObject {
         await MainActor.run {
             self.audioFiles = restoredFilesSnapshot
             self.invalidateQueueIndexCache()
-            self.currentIndex = 0
+            self.currentIndex = min(max(saved.currentIndex, 0), restoredFilesSnapshot.count - 1)
             self.updateFilteredFiles()
             self.resetShuffleQueue()
             self.enqueueDurationPrefetch(for: durationPrefetchURLs)

@@ -540,7 +540,7 @@ final class AudioPlayer: NSObject, ObservableObject {
                             "message": reason
                         ]
                     )
-                    if !isLoop {
+                    if autostart && !isLoop {
                         NotificationCenter.default.post(name: .audioPlayerDidFinish, object: nil)
                     }
                 }
@@ -670,7 +670,7 @@ final class AudioPlayer: NSObject, ObservableObject {
                             "message": "加载超时(20s)：\(url.lastPathComponent)"
                         ]
                     )
-                    if !self.isLooping {
+                    if autostart && !self.isLooping {
                         NotificationCenter.default.post(name: .audioPlayerDidFinish, object: nil)
                     }
                 }
@@ -686,7 +686,7 @@ final class AudioPlayer: NSObject, ObservableObject {
                             "message": "播放失败：\(url.lastPathComponent)\n\(error.localizedDescription)"
                         ]
                     )
-                    if !self.isLooping {
+                    if autostart && !self.isLooping {
                         NotificationCenter.default.post(name: .audioPlayerDidFinish, object: nil)
                     }
                 }

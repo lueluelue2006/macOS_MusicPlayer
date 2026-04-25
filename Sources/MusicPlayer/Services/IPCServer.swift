@@ -460,7 +460,7 @@ final class IPCServer {
                 if let currentURL, currentURL == urlToRemove {
                     audioPlayer.handleCurrentTrackRemoved(
                         remainingFiles: playlistManager.audioFiles,
-                        playNext: { self.playlistManager.nextFile(isShuffling: false) },
+                        playNext: { self.playlistManager.nextFileAfterRemovingQueueItem(atDeletedIndex: idx) },
                         playRandom: { self.playlistManager.getRandomFile() }
                     )
                 }
@@ -526,6 +526,16 @@ final class IPCServer {
                 guard idx >= 0, idx < playlistManager.audioFiles.count else { return nil }
                 return playlistManager.audioFiles[idx].url
             }
+            let deletedCurrentIndex: Int? = currentURL.flatMap { current in
+                indicesToRemove.first { idx in
+                    idx >= 0 &&
+                    idx < playlistManager.audioFiles.count &&
+                    playlistManager.audioFiles[idx].url == current
+                }
+            }
+            let adjustedDeletedCurrentIndex = deletedCurrentIndex.map { deletedIndex in
+                deletedIndex - indicesToRemove.filter { $0 < deletedIndex }.count
+            }
 
             for idx in indicesToRemove.sorted(by: >) {
                 if idx >= 0, idx < playlistManager.audioFiles.count {
@@ -536,7 +546,11 @@ final class IPCServer {
             if let currentURL, urlsToRemove.contains(currentURL) {
                 audioPlayer.handleCurrentTrackRemoved(
                     remainingFiles: playlistManager.audioFiles,
-                    playNext: { self.playlistManager.nextFile(isShuffling: false) },
+                    playNext: {
+                        self.playlistManager.nextFileAfterRemovingQueueItem(
+                            atDeletedIndex: adjustedDeletedCurrentIndex ?? 0
+                        )
+                    },
                     playRandom: { self.playlistManager.getRandomFile() }
                 )
             }
