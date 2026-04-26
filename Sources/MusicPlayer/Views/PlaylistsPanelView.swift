@@ -365,7 +365,7 @@ struct PlaylistsPanelView: View {
                     Button {
                         let result = weights.syncPlaylistOverridesToQueue(from: playlist.id)
 	                        if result.total == 0 {
-	                            postToast(title: "歌单没有设置随机权重", subtitle: "先在歌单里点一下 5 个方块设置权重", kind: "info")
+	                            postToast(title: "歌单没有设置随机权重", subtitle: "先在歌单里点一下 6 个方块设置权重", kind: "info")
 	                            return
 	                        }
 	                        if result.changed == 0 {

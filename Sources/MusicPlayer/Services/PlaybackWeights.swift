@@ -20,14 +20,20 @@ final class PlaybackWeights: ObservableObject {
     }
 
     enum Level: Int, CaseIterable, Sendable {
+        case white = -1
         case green = 0
         case blue = 1
         case purple = 2
         case gold = 3
         case red = 4
 
+        static let defaultLevel: Level = .green
+        static let minimumStoredRawValue = Level.white.rawValue
+        static let maximumStoredRawValue = Level.red.rawValue
+
         var multiplier: Double {
             switch self {
+            case .white: return 0.5
             case .green: return 1.0
             case .blue: return 1.6
             case .purple: return 3.2
@@ -41,6 +47,7 @@ final class PlaybackWeights: ObservableObject {
 
     private let cacheFileName = "playback-weights.json"
     private let formatVersion = 1
+    private let cacheFileURLOverride: URL?
     private let lock = NSLock()
 
     private struct CacheFile: Codable {
@@ -54,7 +61,8 @@ final class PlaybackWeights: ObservableObject {
     private var playlistLevels: [String: [String: Int]] = [:] // playlistID.uuidString -> (pathKey -> level)
     private var pendingSaveTask: Task<Void, Never>?
 
-    private init() {
+    init(cacheFileURLOverride: URL? = nil) {
+        self.cacheFileURLOverride = cacheFileURLOverride
         loadIfNeeded()
     }
 
@@ -86,7 +94,7 @@ final class PlaybackWeights: ObservableObject {
                 return valueWithMigration(in: &playlistLevels[pid]!, lookupKeys: lookupKeys, canonicalKey: canonicalKey)
             }
         }()
-        return Level(rawValue: raw ?? 0) ?? .green
+        return Level(rawValue: raw ?? Level.defaultLevel.rawValue) ?? .green
     }
 
     func multiplier(for url: URL, scope: Scope) -> Double {
@@ -104,12 +112,12 @@ final class PlaybackWeights: ObservableObject {
 
     func setLevelRaw(_ raw: Int, forKey key: String, scope: Scope) {
         loadIfNeeded()
-        let clamped = max(0, min(4, raw))
+        let clamped = normalizedStoredRaw(raw)
         var changed = false
         lock.lock()
         switch scope {
         case .queue:
-            if clamped == 0 {
+            if clamped == Level.defaultLevel.rawValue {
                 if removeKeyVariants(key, from: &queueLevels) { changed = true }
             } else if queueLevels[key] != clamped {
                 queueLevels[key] = clamped
@@ -120,7 +128,7 @@ final class PlaybackWeights: ObservableObject {
         case .playlist(let id):
             let pid = id.uuidString
             if playlistLevels[pid] == nil { playlistLevels[pid] = [:] }
-            if clamped == 0 {
+            if clamped == Level.defaultLevel.rawValue {
                 if removeKeyVariants(key, from: &playlistLevels[pid]!) { changed = true }
                 if playlistLevels[pid]?.isEmpty == true { playlistLevels.removeValue(forKey: pid) }
             } else if playlistLevels[pid]?[key] != clamped {
@@ -209,8 +217,8 @@ final class PlaybackWeights: ObservableObject {
 
         var changed = 0
         for (key, raw) in source {
-            let clamped = max(0, min(4, raw))
-            guard clamped != 0 else { continue }
+            let clamped = normalizedStoredRaw(raw)
+            guard clamped != Level.defaultLevel.rawValue else { continue }
             if queueLevels[key] != clamped {
                 queueLevels[key] = clamped
                 changed += 1
@@ -286,6 +294,18 @@ final class PlaybackWeights: ObservableObject {
     }
 
     private func cacheFileURL() -> URL? {
+        if let cacheFileURLOverride {
+            let dir = cacheFileURLOverride.deletingLastPathComponent()
+            if !FileManager.default.fileExists(atPath: dir.path) {
+                do {
+                    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                } catch {
+                    return nil
+                }
+            }
+            return cacheFileURLOverride
+        }
+
         let fm = FileManager.default
         guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
         let dir = base.appendingPathComponent("MusicPlayer", isDirectory: true)
@@ -305,12 +325,16 @@ final class PlaybackWeights: ObservableObject {
         normalized.reserveCapacity(raw.count)
         for (path, level) in raw {
             let key = PathKey.canonical(path: path)
-            let clamped = max(0, min(4, level))
-            if clamped != 0 {
+            let clamped = normalizedStoredRaw(level)
+            if clamped != Level.defaultLevel.rawValue {
                 normalized[key] = clamped
             }
         }
         return normalized
+    }
+
+    private func normalizedStoredRaw(_ raw: Int) -> Int {
+        max(Level.minimumStoredRawValue, min(Level.maximumStoredRawValue, raw))
     }
 
     nonisolated static func key(for url: URL) -> String {

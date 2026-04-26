@@ -1521,9 +1521,13 @@ final class IPCServer {
     private func parseWeightLevel(_ raw: String) -> PlaybackWeights.Level? {
         let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if let numeric = Int(normalized) {
-            return PlaybackWeights.Level(rawValue: max(0, min(4, numeric)))
+            return PlaybackWeights.Level(rawValue: max(
+                PlaybackWeights.Level.minimumStoredRawValue,
+                min(PlaybackWeights.Level.maximumStoredRawValue, numeric)
+            ))
         }
         switch normalized {
+        case "white", "w", "low", "half", "0.5", "0.5x": return .white
         case "green", "g": return .green
         case "blue", "b": return .blue
         case "purple", "p": return .purple

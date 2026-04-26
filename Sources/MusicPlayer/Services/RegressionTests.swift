@@ -49,7 +49,8 @@ enum RegressionTests {
             ("Playlist manager rejects negative indices", testPlaylistManagerRejectsNegativeIndices),
             ("Queue shuffle does not repeat direct selection", testQueueShuffleDoesNotRepeatDirectSelection),
             ("Restore probe failure does not auto-advance", testRestoreProbeFailureDoesNotAutoAdvance),
-            ("Delete-current sequential fallback keeps next item", testDeleteCurrentSequentialFallbackKeepsNextItem)
+            ("Delete-current sequential fallback keeps next item", testDeleteCurrentSequentialFallbackKeepsNextItem),
+            ("Playback weight white tier preserves green default", testPlaybackWeightWhiteTierPreservesGreenDefault)
         ]
 
         for (name, test) in tests {
@@ -336,5 +337,35 @@ enum RegressionTests {
             return false
         }
         return next.url == files[1].url && manager.currentIndex == 0
+    }
+
+    private static func testPlaybackWeightWhiteTierPreservesGreenDefault() async -> Bool {
+        let fm = FileManager.default
+        let tempRoot = fm.temporaryDirectory.appendingPathComponent("musicplayer-regression-weights-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: tempRoot) }
+
+        let weights = PlaybackWeights(cacheFileURLOverride: tempRoot.appendingPathComponent("playback-weights.json"))
+        let url = URL(fileURLWithPath: "/tmp/musicplayer-regression-weight-\(UUID().uuidString).mp3")
+        let playlistID = UUID()
+
+        guard PlaybackWeights.Level.allCases.prefix(2).elementsEqual([.white, .green]) else { return false }
+        guard weights.level(for: url, scope: .queue) == .green else { return false }
+        guard PlaybackWeights.Level.white.rawValue == -1,
+              PlaybackWeights.Level.green.rawValue == 0,
+              PlaybackWeights.Level.white.multiplier == 0.5,
+              PlaybackWeights.Level.green.multiplier == 1.0
+        else { return false }
+
+        weights.setLevel(.white, for: url, scope: .queue)
+        guard weights.level(for: url, scope: .queue) == .white else { return false }
+
+        weights.setLevel(.green, for: url, scope: .queue)
+        guard weights.level(for: url, scope: .queue) == .green else { return false }
+
+        weights.setLevel(.white, for: url, scope: .playlist(playlistID))
+        let sync = weights.syncPlaylistOverridesToQueue(from: playlistID)
+        return sync.total == 1 &&
+            sync.changed == 1 &&
+            weights.level(for: url, scope: .queue) == .white
     }
 }
