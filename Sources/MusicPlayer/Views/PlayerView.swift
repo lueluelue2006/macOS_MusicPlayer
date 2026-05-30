@@ -126,27 +126,24 @@ struct FileSelectionView: View {
         Button(action: selectFiles) {
             HStack(spacing: 12) {
                 Image(systemName: "folder.badge.plus")
-                    .font(.system(size: 20, weight: .bold))
-                    .foregroundStyle(.white)
-                    .shadow(color: Color.black.opacity(0.45), radius: 3, x: 0, y: 2)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(theme.accent)
                 Text("选择音乐文件或文件夹")
-                    .font(.system(size: 17, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .shadow(color: Color.black.opacity(0.45), radius: 3, x: 0, y: 2)
+                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.primary)
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 16)
-            .padding(.horizontal, 24)
+            .padding(.vertical, 12)
+            .padding(.horizontal, 20)
             .background(
-                theme.accentGradient
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(hovering ? theme.elevatedSurface : theme.surface)
             )
-            .clipShape(RoundedRectangle(cornerRadius: 16))
             .overlay(
-                RoundedRectangle(cornerRadius: 16)
-                    .stroke(Color.white.opacity(showFlowingBorder ? 0.24 : 0.14), lineWidth: showFlowingBorder ? 1.8 : 1.0)
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(theme.stroke, lineWidth: 1.0)
             )
-            .shadow(color: theme.subtleShadow, radius: 10, x: 0, y: 5)
-            .scaleEffect(hovering ? 1.02 : 1.0)
+            .scaleEffect(hovering ? 1.015 : 1.0)
             .animation(.easeInOut(duration: 0.15), value: hovering)
         }
         .buttonStyle(PlainButtonStyle())
@@ -154,6 +151,7 @@ struct FileSelectionView: View {
             hovering = isHovering
         }
     }
+
     
     private func selectFiles() {
         let panel = NSOpenPanel()
@@ -344,48 +342,16 @@ struct CurrentTrackView: View {
 
                 // 专辑封面
                 ZStack {
-                    // 播放中的静态光晕（去除旋转动画）
-                    if audioPlayer.isPlaying {
-                        Circle()
-                            .fill(
-                                RadialGradient(
-                                    colors: [
-                                        theme.accent.opacity(0.28),
-                                        theme.accentSecondary.opacity(0.12),
-                                        Color.clear
-                                    ],
-                                    center: .center,
-                                    startRadius: 50,
-                                    endRadius: 145
-                                )
-                            )
-                            .frame(width: coverContainerSize - 24, height: coverContainerSize - 24)
-                            .blur(radius: 24)
-                            .opacity(0.8)
-                    }
-
                     // 主封面
                     AlbumArtworkView(image: audioPlayer.artworkImage, isPlaying: audioPlayer.isPlaying)
                         .frame(width: artworkSize, height: artworkSize)
-                        .shadow(color: audioPlayer.isPlaying ? theme.accentShadow : theme.subtleShadow, radius: audioPlayer.isPlaying ? 20 : 12, x: 0, y: 8)
+                        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.45 : 0.12), radius: 16, x: 0, y: 10)
                 }
                 .frame(width: coverContainerSize, height: coverContainerSize)
                 .clipShape(RoundedRectangle(cornerRadius: 24))
                 .overlay(
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 24)
-                            .stroke(audioPlayer.isPlaying ? theme.glowStroke : theme.stroke, lineWidth: audioPlayer.isPlaying ? 1.2 : 1.0)
-
-                        FlowingEdgeBorder(
-                            cornerRadius: 24,
-                            lineWidth: 2.0,
-                            base: theme.accent,
-                            secondary: theme.accentSecondary,
-                            enabled: audioPlayer.isPlaying && !reduceMotion
-                        )
-                        .opacity(audioPlayer.isPlaying && !reduceMotion ? 1 : 0)
-                        .animation(.easeInOut(duration: 0.2), value: audioPlayer.isPlaying)
-                    }
+                    RoundedRectangle(cornerRadius: 24)
+                        .stroke(theme.stroke, lineWidth: 1.0)
                 )
 
                 // 临时播放标注：提示关闭或再次临时打开会丢失当前进度

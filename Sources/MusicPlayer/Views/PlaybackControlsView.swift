@@ -16,34 +16,23 @@ struct PlaybackControlsView: View {
     var body: some View {
         VStack(spacing: 24) {
             // 主要播放控制按钮
-            HStack(spacing: 32) {
+            HStack(spacing: 28) {
                 // 上一首按钮
                 Button(action: previousTrack) {
                     ZStack {
-                        // 悬停时的发光背景
                         Circle()
-                            .fill(theme.accent.opacity(previousHovered ? 0.15 : 0))
-                            .frame(width: 52, height: 52)
-                            .blur(radius: 4)
-
+                            .fill(previousHovered ? theme.elevatedSurface : theme.surface)
+                            .frame(width: 42, height: 42)
+                        
                         Circle()
-                            .fill(.ultraThinMaterial)
-                            .overlay(
-                                Circle()
-                                    .fill(theme.surface.opacity(0.5))
-                            )
-                            .overlay(
-                                Circle()
-                                    .stroke(previousHovered ? theme.glowStroke : theme.stroke, lineWidth: 1)
-                            )
-                            .frame(width: 48, height: 48)
-                            .shadow(color: theme.subtleShadow, radius: 8, x: 0, y: 4)
+                            .stroke(theme.stroke, lineWidth: 1)
+                            .frame(width: 42, height: 42)
 
                         Image(systemName: "backward.fill")
-                            .font(.title2)
+                            .font(.system(size: 14, weight: .semibold))
                             .foregroundColor(previousHovered ? theme.accent : .primary)
                     }
-                    .scaleEffect(previousButtonPressed ? 0.92 : (previousHovered ? 1.08 : 1.0))
+                    .scaleEffect(previousButtonPressed ? 0.94 : 1.0)
                     .animation(AppTheme.quickSpring, value: previousButtonPressed)
                     .animation(AppTheme.quickSpring, value: previousHovered)
                 }
@@ -57,38 +46,18 @@ struct PlaybackControlsView: View {
                 // 主播放按钮
                 Button(action: togglePlayback) {
                     ZStack {
-                        // 静态光环：保留播放态强调，但避免常驻 repeatForever 动画持续重绘。
-                        if audioPlayer.isPlaying {
-                            Circle()
-                                .stroke(theme.accent.opacity(0.28), lineWidth: 2)
-                                .frame(width: 80, height: 80)
-                        }
-
-                        // 发光背景
                         Circle()
-                            .fill(
-                                RadialGradient(
-                                    colors: [
-                                        theme.accent.opacity(audioPlayer.isPlaying ? 0.35 : 0.15),
-                                        Color.clear
-                                    ],
-                                    center: .center,
-                                    startRadius: 30,
-                                    endRadius: 55
-                                )
-                            )
-                            .frame(width: 90, height: 90)
-                            .blur(radius: 8)
+                            .fill(theme.accentGradient)
+                            .frame(width: 60, height: 60)
+                            .shadow(color: Color.black.opacity(0.12), radius: 6, x: 0, y: 3)
 
-                        // 主按钮
-                        Image(systemName: audioPlayer.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                            .font(.system(size: 72))
-                            .foregroundStyle(theme.accentGradient)
-                            .shadow(color: theme.accentShadow, radius: 12, x: 0, y: 6)
+                        Image(systemName: audioPlayer.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 20, weight: .bold))
+                            .foregroundColor(.white)
+                            .offset(x: audioPlayer.isPlaying ? 0 : 2) // Play icon offset
                     }
-                    .scaleEffect(playButtonPressed ? 0.92 : 1.0)
+                    .scaleEffect(playButtonPressed ? 0.94 : 1.0)
                     .animation(AppTheme.quickSpring, value: playButtonPressed)
-                    .animation(AppTheme.smoothTransition, value: audioPlayer.isPlaying)
                 }
                 .disabled(audioPlayer.currentFile == nil)
                 .buttonStyle(PlainButtonStyle())
@@ -99,30 +68,19 @@ struct PlaybackControlsView: View {
                 // 下一首按钮
                 Button(action: nextTrack) {
                     ZStack {
-                        // 悬停时的发光背景
                         Circle()
-                            .fill(theme.accent.opacity(nextHovered ? 0.15 : 0))
-                            .frame(width: 52, height: 52)
-                            .blur(radius: 4)
-
+                            .fill(nextHovered ? theme.elevatedSurface : theme.surface)
+                            .frame(width: 42, height: 42)
+                        
                         Circle()
-                            .fill(.ultraThinMaterial)
-                            .overlay(
-                                Circle()
-                                    .fill(theme.surface.opacity(0.5))
-                            )
-                            .overlay(
-                                Circle()
-                                    .stroke(nextHovered ? theme.glowStroke : theme.stroke, lineWidth: 1)
-                            )
-                            .frame(width: 48, height: 48)
-                            .shadow(color: theme.subtleShadow, radius: 8, x: 0, y: 4)
+                            .stroke(theme.stroke, lineWidth: 1)
+                            .frame(width: 42, height: 42)
 
                         Image(systemName: "forward.fill")
-                            .font(.title2)
+                            .font(.system(size: 14, weight: .semibold))
                             .foregroundColor(nextHovered ? theme.accent : .primary)
                     }
-                    .scaleEffect(nextButtonPressed ? 0.92 : (nextHovered ? 1.08 : 1.0))
+                    .scaleEffect(nextButtonPressed ? 0.94 : 1.0)
                     .animation(AppTheme.quickSpring, value: nextButtonPressed)
                     .animation(AppTheme.quickSpring, value: nextHovered)
                 }
@@ -135,7 +93,7 @@ struct PlaybackControlsView: View {
             }
             
             // 循环和随机播放控制
-            HStack(spacing: 16) {
+            HStack(spacing: 12) {
                 Button(action: { audioPlayer.toggleLoop() }) {
                     HStack(spacing: 6) {
                         Image(systemName: "repeat")
@@ -144,26 +102,18 @@ struct PlaybackControlsView: View {
                             .font(.caption)
                             .fontWeight(.medium)
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
                     .background(
-                        RoundedRectangle(cornerRadius: 20)
-                            .fill(
-                                audioPlayer.isLooping ? 
-                                theme.accentGradient :
-                                LinearGradient(
-                                    colors: [
-                                        theme.mutedSurface,
-                                        theme.surface
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                            .shadow(color: theme.subtleShadow, radius: 6, x: 0, y: 2)
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(audioPlayer.isLooping ? theme.accent.opacity(0.12) : theme.surface)
                     )
-                    .foregroundColor(audioPlayer.isLooping ? onAccentPillForeground : .primary)
-                    .animation(.easeInOut(duration: 0.2), value: audioPlayer.isLooping)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(audioPlayer.isLooping ? theme.accent.opacity(0.3) : theme.stroke, lineWidth: 1)
+                    )
+                    .foregroundColor(audioPlayer.isLooping ? theme.accent : .primary)
+                    .animation(.easeInOut(duration: 0.15), value: audioPlayer.isLooping)
                 }
                 .buttonStyle(PlainButtonStyle())
                 
@@ -176,48 +126,34 @@ struct PlaybackControlsView: View {
                                 .font(.caption)
                                 .fontWeight(.medium)
                         }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
                         .background(
-                            RoundedRectangle(cornerRadius: 20)
-                                .fill(
-                                    audioPlayer.isShuffling ? 
-                                    theme.accentGradient :
-                                    LinearGradient(
-                                        colors: [
-                                            theme.mutedSurface,
-                                            theme.surface
-                                        ],
-                                        startPoint: .topLeading,
-                                        endPoint: .bottomTrailing
-                                    )
-                                )
-                                .shadow(color: theme.subtleShadow, radius: 6, x: 0, y: 2)
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(audioPlayer.isShuffling ? theme.accent.opacity(0.12) : theme.surface)
                         )
-                        .foregroundColor(audioPlayer.isShuffling ? onAccentPillForeground : .primary)
-                        .animation(.easeInOut(duration: 0.2), value: audioPlayer.isShuffling)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(audioPlayer.isShuffling ? theme.accent.opacity(0.3) : theme.stroke, lineWidth: 1)
+                        )
+                        .foregroundColor(audioPlayer.isShuffling ? theme.accent : .primary)
+                        .animation(.easeInOut(duration: 0.15), value: audioPlayer.isShuffling)
                     }
                     .buttonStyle(PlainButtonStyle())
                     
                     // 随机下一首按钮
                     Button(action: playRandomTrack) {
                         Image(systemName: "dice")
-                            .font(.system(size: 14))
-                            .foregroundColor(.primary)
-                            .frame(width: 32, height: 32)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundColor(Color.orange)
+                            .frame(width: 28, height: 28)
                             .background(
                                 Circle()
-                                    .fill(
-                                        LinearGradient(
-                                            gradient: Gradient(colors: [
-                                                Color.orange.opacity(0.8),
-                                                Color.orange.opacity(0.6)
-                                            ]),
-                                            startPoint: .topLeading,
-                                            endPoint: .bottomTrailing
-                                        )
-                                    )
-                                    .shadow(color: Color.orange.opacity(0.3), radius: 4, x: 0, y: 2)
+                                    .fill(theme.surface)
+                            )
+                            .overlay(
+                                Circle()
+                                    .stroke(theme.stroke, lineWidth: 1)
                             )
                     }
                     .disabled(playlistManager.playbackScopePlayableCount() < 2 || isEphemeralPlayback)

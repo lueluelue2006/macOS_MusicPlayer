@@ -3,62 +3,59 @@ import SwiftUI
 struct AppTheme {
     let scheme: ColorScheme
 
-    // MARK: - 双模式配色（暗色极光 / 亮色暖霞）
+    // MARK: - 精致、高级的现代 macOS 配色风格（Nordic / Apple Pro）
 
-    /// 主强调色 - 暗色冰蓝 / 亮色玫瑰粉
+    /// 主强调色 - 经典的 macOS 蓝，优雅、沉稳且对比度高
     var accent: Color {
         scheme == .dark
-            ? Color(red: 0.35, green: 0.85, blue: 0.92)   // 冰蓝色
-            : Color(red: 0.93, green: 0.32, blue: 0.52)    // 玫瑰粉
+            ? Color(red: 0.18, green: 0.49, blue: 0.96)    // 苹果蓝/Cupertino Blue
+            : Color(red: 0.00, green: 0.40, blue: 0.85)    // 深海蓝
     }
 
-    /// 次要强调色 - 暗色薄荷绿 / 亮色暖橙
+    /// 次要强调色 - 优雅的蓝灰色
     var accentSecondary: Color {
         scheme == .dark
-            ? Color(red: 0.30, green: 0.95, blue: 0.70)   // 薄荷绿
-            : Color(red: 1.0, green: 0.55, blue: 0.32)    // 暖橙
+            ? Color(red: 0.50, green: 0.60, blue: 0.75)    // 钢蓝
+            : Color(red: 0.35, green: 0.45, blue: 0.55)    // 石板蓝
     }
 
-    /// 第三强调色 - 暗色极光绿 / 亮色梦幻紫
+    /// 第三强调色 - 辅助灰色
     var accentTertiary: Color {
         scheme == .dark
-            ? Color(red: 0.55, green: 1.0, blue: 0.85)    // 极光绿
-            : Color(red: 0.58, green: 0.25, blue: 0.80)    // 梦幻紫
+            ? Color(red: 0.35, green: 0.35, blue: 0.38)
+            : Color(red: 0.60, green: 0.60, blue: 0.65)
     }
 
-    /// 主渐变 - 暗色极光效果 / 亮色暖霞渐变
+    /// 主渐变 - 极为低调且高级的微渐变（不再使用高饱和度的青色到薄荷绿）
     var accentGradient: LinearGradient {
         if scheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.30, green: 0.95, blue: 0.70),  // 薄荷绿
-                    Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
-                    Color(red: 0.45, green: 0.75, blue: 0.95)   // 天青
+                    Color(red: 0.20, green: 0.52, blue: 0.98), // 明亮蓝
+                    Color(red: 0.15, green: 0.42, blue: 0.88)  // 深蔚蓝
                 ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
+                startPoint: .top,
+                endPoint: .bottom
             )
         } else {
             return LinearGradient(
                 colors: [
-                    accentTertiary,
-                    accent,
-                    accentSecondary
+                    Color(red: 0.05, green: 0.45, blue: 0.90),
+                    Color(red: 0.00, green: 0.35, blue: 0.80)
                 ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
+                startPoint: .top,
+                endPoint: .bottom
             )
         }
     }
 
-    /// 进度条渐变
+    /// 进度条渐变 - 同样使用单色系高级渐变
     var progressGradient: LinearGradient {
         if scheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.30, green: 0.95, blue: 0.70),  // 薄荷绿
-                    Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
-                    Color(red: 0.50, green: 0.75, blue: 0.98)   // 极光蓝
+                    Color(red: 0.22, green: 0.55, blue: 1.0),
+                    Color(red: 0.16, green: 0.45, blue: 0.92)
                 ],
                 startPoint: .leading,
                 endPoint: .trailing
@@ -66,9 +63,8 @@ struct AppTheme {
         } else {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.60, green: 0.28, blue: 0.82),  // 紫色
-                    Color(red: 0.93, green: 0.34, blue: 0.52),  // 品红
-                    Color(red: 1.0, green: 0.55, blue: 0.32)    // 珊瑚
+                    Color(red: 0.00, green: 0.48, blue: 0.95),
+                    Color(red: 0.00, green: 0.36, blue: 0.82)
                 ],
                 startPoint: .leading,
                 endPoint: .trailing
@@ -76,28 +72,28 @@ struct AppTheme {
         }
     }
 
-    // MARK: - 背景系统
+    // MARK: - 高级质感的背景系统（中性灰色，摒弃高饱和彩色背景）
 
     var backgroundGradient: LinearGradient {
         if scheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.04, green: 0.08, blue: 0.12),  // 深夜蓝
-                    Color(red: 0.06, green: 0.10, blue: 0.14),  // 午夜色
-                    Color(red: 0.03, green: 0.06, blue: 0.10)   // 深海蓝
+                    Color(red: 0.08, green: 0.08, blue: 0.09),  // 纯正极客暗灰
+                    Color(red: 0.10, green: 0.10, blue: 0.11),
+                    Color(red: 0.07, green: 0.07, blue: 0.08)
                 ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
+                startPoint: .top,
+                endPoint: .bottom
             )
         } else {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.97, green: 0.95, blue: 0.98),  // 淡紫白
-                    Color(red: 0.99, green: 0.96, blue: 0.95),  // 暖桃白
-                    Color(red: 0.98, green: 0.95, blue: 0.93)   // 暖杏白
+                    Color(red: 0.96, green: 0.96, blue: 0.97),  // 苹果视网膜灰
+                    Color(red: 0.98, green: 0.98, blue: 0.98),
+                    Color(red: 0.95, green: 0.95, blue: 0.96)
                 ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
+                startPoint: .top,
+                endPoint: .bottom
             )
         }
     }
@@ -106,20 +102,20 @@ struct AppTheme {
         if scheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color(red: 0.08, green: 0.12, blue: 0.16),  // 极夜蓝
-                    Color(red: 0.06, green: 0.10, blue: 0.14)   // 深渊蓝
+                    Color(red: 0.13, green: 0.13, blue: 0.15),  // 面板低调深灰
+                    Color(red: 0.11, green: 0.11, blue: 0.13)
                 ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
+                startPoint: .top,
+                endPoint: .bottom
             )
         } else {
             return LinearGradient(
                 colors: [
-                    Color(red: 1.0, green: 0.97, blue: 0.97),   // 暖玫白
-                    Color(red: 0.99, green: 0.96, blue: 0.95)   // 暖桃色
+                    Color(red: 1.0, green: 1.0, blue: 1.0),
+                    Color(red: 0.98, green: 0.98, blue: 0.99)
                 ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
+                startPoint: .top,
+                endPoint: .bottom
             )
         }
     }
@@ -127,41 +123,41 @@ struct AppTheme {
     // MARK: - 表面和层级
 
     var surface: Color {
-        scheme == .dark ? Color.white.opacity(0.06) : Color.white.opacity(0.92)
+        scheme == .dark ? Color.white.opacity(0.04) : Color.black.opacity(0.03)
     }
 
     var elevatedSurface: Color {
-        scheme == .dark ? Color.white.opacity(0.10) : Color.white.opacity(0.85)
+        scheme == .dark ? Color.white.opacity(0.07) : Color.black.opacity(0.05)
     }
 
     var mutedSurface: Color {
-        scheme == .dark ? Color.white.opacity(0.04) : Color.white.opacity(0.70)
+        scheme == .dark ? Color.white.opacity(0.03) : Color.black.opacity(0.02)
     }
 
     // MARK: - 边框和阴影
 
     var stroke: Color {
-        scheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.06)
+        scheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.08)
     }
 
-    /// 发光边框色
+    /// 发光边框色：不再使用亮青色，仅作为辅助强调边框
     var glowStroke: Color {
-        scheme == .dark ? accent.opacity(0.35) : accent.opacity(0.30)
+        scheme == .dark ? accent.opacity(0.20) : accent.opacity(0.15)
     }
 
     var subtleShadow: Color {
-        scheme == .dark ? Color.black.opacity(0.50) : Color.black.opacity(0.10)
+        scheme == .dark ? Color.black.opacity(0.35) : Color.black.opacity(0.05)
     }
 
-    /// 强调阴影 - 带颜色的阴影
+    /// 强调阴影 - 极低透明度的微投影，杜绝发光感
     var accentShadow: Color {
-        scheme == .dark ? accent.opacity(0.30) : accentSecondary.opacity(0.22)
+        scheme == .dark ? Color.black.opacity(0.40) : Color.black.opacity(0.08)
     }
 
     // MARK: - 文字颜色
 
     var mutedText: Color {
-        scheme == .dark ? Color.white.opacity(0.72) : Color.secondary
+        scheme == .dark ? Color.white.opacity(0.55) : Color.secondary
     }
 
     // MARK: - 交互状态
@@ -170,8 +166,8 @@ struct AppTheme {
         if isActive {
             return LinearGradient(
                 colors: [
-                    accent.opacity(0.25),
-                    accentSecondary.opacity(0.15)
+                    accent.opacity(0.12),
+                    accent.opacity(0.06)
                 ],
                 startPoint: .leading,
                 endPoint: .trailing
@@ -180,23 +176,23 @@ struct AppTheme {
             return LinearGradient(
                 colors: [
                     surface,
-                    surface.opacity(0.85)
+                    surface.opacity(0.6)
                 ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
+                startPoint: .top,
+                endPoint: .bottom
             )
         }
     }
 
     func dropZoneBorder(isActive: Bool) -> Color {
-        isActive ? accent : (scheme == .dark ? Color.white.opacity(0.25) : Color.gray.opacity(0.4))
+        isActive ? accent : (scheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.12))
     }
 
     func dropZoneFill(isActive: Bool) -> Color {
         if isActive {
-            return accent.opacity(0.15)
+            return accent.opacity(0.08)
         } else {
-            return scheme == .dark ? Color.white.opacity(0.03) : Color.gray.opacity(0.04)
+            return scheme == .dark ? Color.white.opacity(0.01) : Color.black.opacity(0.01)
         }
     }
 
@@ -204,11 +200,12 @@ struct AppTheme {
 
     /// 快速弹簧动画
     static var quickSpring: Animation {
-        .spring(response: 0.25, dampingFraction: 0.75, blendDuration: 0)
+        .spring(response: 0.22, dampingFraction: 0.8, blendDuration: 0)
     }
 
     /// 柔和过渡动画
     static var smoothTransition: Animation {
-        .easeInOut(duration: 0.25)
+        .easeInOut(duration: 0.2)
     }
 }
+
