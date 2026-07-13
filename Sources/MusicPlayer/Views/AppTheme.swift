@@ -1,134 +1,115 @@
 import AppKit
 import SwiftUI
 
-/// A restrained, semantic theme for a native macOS music workspace.
+/// Semantic visual tokens for the album-first MusicPlayer interface.
 ///
-/// Album artwork provides the expressive color. Chrome stays neutral so the
-/// interface remains legible in both appearances and cheap to render on
-/// lower-memory Macs.
+/// The listening stage is intentionally dark in both appearances; the library
+/// follows the system appearance. Album artwork is the only large decorative
+/// object, so routine chrome remains flat and inexpensive to render.
 struct AppTheme {
   let scheme: ColorScheme
 
-  // MARK: - Accent
+  // MARK: - Brand and semantic color
 
   var accent: Color {
-    Color(nsColor: .controlAccentColor)
+    Color(red: 1.0, green: 0.31, blue: 0.38)
   }
 
   var accentSecondary: Color {
-    Color(nsColor: .systemTeal)
+    Color(red: 1.0, green: 0.58, blue: 0.31)
   }
 
-  /// Kept as a ShapeStyle-compatible gradient for existing call sites, but
-  /// intentionally monochromatic to avoid rainbow chrome.
   var accentGradient: LinearGradient {
     LinearGradient(
-      colors: [accent.opacity(0.88), accent],
+      colors: [accentSecondary, accent],
       startPoint: .topLeading,
       endPoint: .bottomTrailing
     )
   }
 
-  // MARK: - Backgrounds
+  // MARK: - Structural backgrounds
 
+  var libraryBackground: Color {
+    scheme == .dark
+      ? Color(red: 0.075, green: 0.078, blue: 0.088)
+      : Color(red: 0.965, green: 0.962, blue: 0.958)
+  }
+
+  var nowPlayingBackground: Color {
+    Color(red: 0.065, green: 0.064, blue: 0.073)
+  }
+
+  /// Compatibility aliases used by secondary windows.
   var backgroundGradient: LinearGradient {
-    let colors: [Color] =
-      scheme == .dark
-      ? [
-        Color(red: 0.055, green: 0.058, blue: 0.066),
-        Color(red: 0.070, green: 0.073, blue: 0.082),
-      ]
-      : [
-        Color(red: 0.955, green: 0.957, blue: 0.962),
-        Color(red: 0.925, green: 0.930, blue: 0.940),
-      ]
-    return LinearGradient(colors: colors, startPoint: .top, endPoint: .bottom)
+    LinearGradient(
+      colors: [libraryBackground, libraryBackground],
+      startPoint: .top,
+      endPoint: .bottom
+    )
   }
 
   var panelBackground: LinearGradient {
-    let colors: [Color] =
-      scheme == .dark
-      ? [
-        Color(red: 0.095, green: 0.098, blue: 0.108),
-        Color(red: 0.078, green: 0.081, blue: 0.090),
-      ]
-      : [
-        Color.white.opacity(0.90),
-        Color.white.opacity(0.72),
-      ]
-    return LinearGradient(colors: colors, startPoint: .top, endPoint: .bottom)
+    let color = scheme == .dark
+      ? Color(red: 0.095, green: 0.098, blue: 0.108)
+      : Color(red: 0.985, green: 0.982, blue: 0.978)
+    return LinearGradient(colors: [color, color], startPoint: .top, endPoint: .bottom)
   }
 
   // MARK: - Surfaces
 
   var surface: Color {
-    scheme == .dark ? Color.white.opacity(0.045) : Color.white.opacity(0.68)
+    scheme == .dark ? Color.white.opacity(0.045) : Color.white.opacity(0.70)
   }
 
   var elevatedSurface: Color {
-    scheme == .dark ? Color.white.opacity(0.075) : Color.white.opacity(0.92)
+    scheme == .dark ? Color.white.opacity(0.075) : Color.white.opacity(0.94)
   }
 
   var mutedSurface: Color {
-    scheme == .dark ? Color.white.opacity(0.055) : Color.black.opacity(0.045)
+    scheme == .dark ? Color.white.opacity(0.055) : Color.black.opacity(0.042)
   }
 
   // MARK: - Borders and depth
 
   var stroke: Color {
-    scheme == .dark ? Color.white.opacity(0.105) : Color.black.opacity(0.095)
+    scheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.085)
   }
 
-  var glowStroke: Color {
-    accent.opacity(scheme == .dark ? 0.46 : 0.38)
+  var paneDivider: Color {
+    scheme == .dark ? Color.white.opacity(0.075) : Color.black.opacity(0.10)
   }
+
+  var glowStroke: Color { accent.opacity(0.42) }
 
   var subtleShadow: Color {
-    scheme == .dark ? Color.black.opacity(0.28) : Color.black.opacity(0.08)
+    scheme == .dark ? Color.black.opacity(0.34) : Color.black.opacity(0.14)
   }
 
-  var accentShadow: Color {
-    accent.opacity(scheme == .dark ? 0.15 : 0.10)
-  }
+  var accentShadow: Color { accent.opacity(0.18) }
 
   // MARK: - Text
 
-  var mutedText: Color {
-    Color(nsColor: .secondaryLabelColor)
-  }
+  var mutedText: Color { Color(nsColor: .secondaryLabelColor) }
+
+  var stagePrimaryText: Color { Color.white.opacity(0.96) }
+  var stageSecondaryText: Color { Color.white.opacity(0.58) }
+  var stageTertiaryText: Color { Color.white.opacity(0.36) }
 
   // MARK: - Interaction states
 
   func rowBackground(isActive: Bool) -> LinearGradient {
-    if isActive {
-      return LinearGradient(
-        colors: [accent.opacity(0.16), accent.opacity(0.09)],
-        startPoint: .leading,
-        endPoint: .trailing
-      )
-    }
-    return LinearGradient(
-      colors: [surface, surface],
-      startPoint: .leading,
-      endPoint: .trailing
-    )
+    let color = isActive ? accent.opacity(scheme == .dark ? 0.13 : 0.09) : Color.clear
+    return LinearGradient(colors: [color, color], startPoint: .leading, endPoint: .trailing)
   }
 
-  func dropZoneBorder(isActive: Bool) -> Color {
-    isActive ? accent : stroke
-  }
-
-  func dropZoneFill(isActive: Bool) -> Color {
-    isActive ? accent.opacity(0.10) : mutedSurface
-  }
+  func dropZoneBorder(isActive: Bool) -> Color { isActive ? accent : stroke }
+  func dropZoneFill(isActive: Bool) -> Color { isActive ? accent.opacity(0.10) : mutedSurface }
 
   // MARK: - Motion
 
   static var quickSpring: Animation {
-    .spring(response: 0.28, dampingFraction: 0.92, blendDuration: 0)
+    .spring(response: 0.24, dampingFraction: 0.96, blendDuration: 0)
   }
 
-  static var smoothTransition: Animation {
-    .easeOut(duration: 0.18)
-  }
+  static var smoothTransition: Animation { .easeOut(duration: 0.16) }
 }

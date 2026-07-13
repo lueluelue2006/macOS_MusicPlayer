@@ -30,27 +30,35 @@ struct ContentView: View {
 
     private var layoutView: some View {
         GeometryReader { geometry in
-            if geometry.size.width < 800 {
+            if geometry.size.width < 920 {
                 VStack(spacing: 0) {
                     PlayerView(audioPlayer: audioPlayer, playlistManager: playlistManager)
-                        .frame(height: max(300, geometry.size.height * 0.46))
-                        .background(theme.panelBackground)
+                        .environment(\.colorScheme, .dark)
+                        .frame(height: max(260, geometry.size.height * 0.48))
+                        .background(theme.nowPlayingBackground)
 
-                    Divider()
+                    Rectangle()
+                        .fill(theme.paneDivider)
+                        .frame(height: 1)
 
                     PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
                         .frame(minHeight: 200)
+                        .background(theme.libraryBackground)
                 }
             } else {
                 HStack(spacing: 0) {
                     PlayerView(audioPlayer: audioPlayer, playlistManager: playlistManager)
-                        .frame(width: min(max(360, geometry.size.width * 0.32), 430))
-                        .background(theme.panelBackground)
+                        .environment(\.colorScheme, .dark)
+                        .frame(width: min(max(410, geometry.size.width * 0.30), 500))
+                        .background(theme.nowPlayingBackground)
 
-                    Divider()
+                    Rectangle()
+                        .fill(theme.paneDivider)
+                        .frame(width: 1)
 
                     PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
-                        .frame(minWidth: 400)
+                        .frame(minWidth: 480)
+                        .background(theme.libraryBackground)
                 }
             }
         }
@@ -58,7 +66,7 @@ struct ContentView: View {
 
     var body: some View {
         let withChrome = layoutView
-            .background(theme.backgroundGradient)
+            .background(theme.libraryBackground)
             .onAppear {
                 // 启动时确保搜索框不自动聚焦
                 NotificationCenter.default.post(name: .blurSearchField, object: nil)

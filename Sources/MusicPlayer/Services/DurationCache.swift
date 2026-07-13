@@ -7,9 +7,13 @@ import Foundation
     /// - Avoid stale durations: cache invalidates by (mtime + size + inode).
 /// - Keep memory usage low: store only numbers + small signatures.
 actor DurationCache {
-    static let shared = DurationCache()
+    static let shared = DurationCache(cacheFileURLOverride: isolatedTestCacheURL())
 
-    private init() {}
+    private let cacheFileURLOverride: URL?
+
+    init(cacheFileURLOverride: URL? = nil) {
+        self.cacheFileURLOverride = cacheFileURLOverride
+    }
 
     private let cacheFileName = "duration-cache.json"
     private let formatVersion = 2
@@ -161,7 +165,9 @@ actor DurationCache {
         guard let url = cacheFileURL() else { return }
         let payload = CacheFile(version: formatVersion, entries: entries)
         do {
-            let data = try JSONEncoder().encode(payload)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let data = try encoder.encode(payload)
             try data.write(to: url, options: .atomic)
         } catch {
             // Best-effort only.
@@ -169,6 +175,8 @@ actor DurationCache {
     }
 
     private func cacheFileURL() -> URL? {
+        if let cacheFileURLOverride { return cacheFileURLOverride }
+
         let fm = FileManager.default
         guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
         let dir = base.appendingPathComponent("MusicPlayer", isDirectory: true)
@@ -180,6 +188,22 @@ actor DurationCache {
             }
         }
         return dir.appendingPathComponent(cacheFileName, isDirectory: false)
+    }
+
+    nonisolated private static func isolatedTestCacheURL() -> URL? {
+        let process = ProcessInfo.processInfo
+        let environment = process.environment
+        let isRegressionRun = environment["MUSICPLAYER_RUN_REGRESSION_TESTS"] == "1"
+        let isTestProcess =
+            environment["XCTestConfigurationFilePath"] != nil
+            || process.processName.localizedCaseInsensitiveContains("test")
+            || process.processName.localizedCaseInsensitiveContains("xctest")
+        guard isRegressionRun || isTestProcess else { return nil }
+
+        return FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-duration-cache-\(process.processIdentifier).json",
+            isDirectory: false
+        )
     }
 
     private func fileSignature(for url: URL, snapshot: FileValidationSnapshot?) -> FileSignature? {

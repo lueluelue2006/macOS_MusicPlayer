@@ -96,115 +96,118 @@ struct PlaylistView: View {
   }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 16) {
-      // 标题和操作按钮
-      HStack {
-        HStack(spacing: 10) {
-          Image(systemName: panelMode == .queue ? "music.note.list" : "rectangle.stack")
-            .font(.system(size: 15, weight: .semibold))
-            .foregroundStyle(theme.accent)
-          Text(panelMode == .queue ? "播放列表" : "歌单")
-            .font(.title3)
-            .fontWeight(.semibold)
-            .foregroundColor(.primary)
+    VStack(alignment: .leading, spacing: 0) {
+      HStack(alignment: .center, spacing: 18) {
+        VStack(alignment: .leading, spacing: 5) {
+          Text(panelMode == .queue ? "播放队列" : "我的歌单")
+            .font(.system(size: 26, weight: .bold))
+            .tracking(-0.5)
 
-          Picker("", selection: $panelModeRaw) {
-            Text("队列").tag(PanelMode.queue.rawValue)
-            Text("歌单").tag(PanelMode.playlists.rawValue)
-          }
-          .pickerStyle(.segmented)
-          .frame(width: 150)
-          .labelsHidden()
+          HStack(spacing: 10) {
+            Text(panelMode == .queue ? "\(playlistManager.audioFiles.count) 首本地音乐" : "整理你的收藏")
+              .font(.system(size: 11, weight: .medium))
+              .foregroundStyle(theme.mutedText)
 
-          if let scopeBadge = activePlaybackScopeBadge {
-            Button(action: {
-              panelMode = scopeBadge.targetPanel
-              NotificationCenter.default.post(name: .blurSearchField, object: nil)
-            }) {
-              HStack(spacing: 6) {
-                ActivePlaybackScopeIndicator(
-                  systemName: scopeIndicatorSystemName, isPlaying: audioPlayer.isPlaying)
-                Text(scopeBadge.title)
-                  .font(.caption)
-                  .fontWeight(.semibold)
-                  .lineLimit(1)
-                  .truncationMode(.tail)
+            if let scopeBadge = activePlaybackScopeBadge {
+              Button(action: {
+                panelMode = scopeBadge.targetPanel
+                NotificationCenter.default.post(name: .blurSearchField, object: nil)
+              }) {
+                HStack(spacing: 5) {
+                  ActivePlaybackScopeIndicator(
+                    systemName: scopeIndicatorSystemName, isPlaying: audioPlayer.isPlaying)
+                  Text(scopeBadge.title)
+                    .lineLimit(1)
+                }
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(theme.accent)
               }
-              .padding(.horizontal, 10)
-              .padding(.vertical, 6)
-              .background(
-                RoundedRectangle(cornerRadius: 10)
-                  .fill(theme.mutedSurface)
-                  .overlay(
-                    RoundedRectangle(cornerRadius: 10)
-                      .stroke(theme.stroke, lineWidth: 1)
-                  )
-              )
-              .foregroundStyle(theme.accentGradient)
+              .buttonStyle(.plain)
+              .help(scopeBadge.help)
             }
-            .buttonStyle(.plain)
-            .help(scopeBadge.help)
           }
         }
 
-        Spacer()
+        Spacer(minLength: 16)
 
-        HStack(spacing: 12) {
+        HStack(spacing: 18) {
+          panelTab(title: "队列", mode: .queue)
+          panelTab(title: "歌单", mode: .playlists)
+        }
+
+        HStack(spacing: 8) {
           if panelMode == .queue {
-            // 清空按钮
-            Button(action: {
-              playlistManager.clearAllFiles()
-              audioPlayer.stopAndClearCurrent()
-            }) {
-              HStack(spacing: 6) {
-                Image(systemName: "trash")
-                  .font(.caption)
-                Text("清空")
-                  .font(.caption)
-                  .fontWeight(.medium)
-              }
-              .padding(.horizontal, 12)
-              .padding(.vertical, 6)
-              .background(
-                RoundedRectangle(cornerRadius: 12)
-                  .fill(theme.mutedSurface)
-                  .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                      .stroke(Color.red.opacity(0.35), lineWidth: 1)
-                  )
-              )
-              .foregroundColor(.red)
+            FileSelectionView(isLibraryEmpty: playlistManager.audioFiles.isEmpty) { urls in
+              playlistManager.enqueueAddFiles(urls)
             }
-            .buttonStyle(PlainButtonStyle())
-            .disabled(playlistManager.audioFiles.isEmpty)
           } else {
             Button(action: { createPlaylist() }) {
-              HStack(spacing: 6) {
-                Image(systemName: "plus")
-                  .font(.caption)
-                Text("新建歌单")
-                  .font(.caption)
-                  .fontWeight(.medium)
-              }
-              .padding(.horizontal, 12)
-              .padding(.vertical, 6)
-              .background(
-                RoundedRectangle(cornerRadius: 12)
-                  .fill(theme.mutedSurface)
-                  .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                      .stroke(theme.accentGradient, lineWidth: 1)
-                  )
-              )
-              .foregroundStyle(theme.accentGradient)
+              Label("新建", systemImage: "plus")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Color.white)
+                .padding(.horizontal, 11)
+                .padding(.vertical, 7)
+                .background(
+                  RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(theme.accent)
+                )
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(.plain)
           }
 
-          refreshButton
+          Button {
+            if panelMode == .queue {
+              requestScrollToNowPlayingInQueue()
+            } else {
+              playlistLocateRequestID += 1
+            }
+          } label: {
+            Image(systemName: "scope")
+              .font(.system(size: 13, weight: .medium))
+              .frame(width: 30, height: 30)
+              .contentShape(Rectangle())
+          }
+          .buttonStyle(.plain)
+          .disabled(
+            panelMode == .queue
+              ? nowPlayingIDInQueue() == nil
+              : audioPlayer.currentFile == nil
+          )
+          .help("定位正在播放")
+
+          Menu {
+            if panelMode == .queue {
+              Toggle("扫描子文件夹", isOn: $playlistManager.scanSubfolders)
+              Divider()
+            }
+
+            Button("完全刷新") {
+              Task { await playlistManager.refreshAllMetadata(audioPlayer: audioPlayer) }
+            }
+            .disabled(playlistManager.audioFiles.isEmpty)
+
+            if panelMode == .queue {
+              Divider()
+              Button("清空队列", role: .destructive) {
+                playlistManager.clearAllFiles()
+                audioPlayer.stopAndClearCurrent()
+              }
+              .disabled(playlistManager.audioFiles.isEmpty)
+            }
+          } label: {
+            Image(systemName: "ellipsis")
+              .font(.system(size: 14, weight: .semibold))
+              .frame(width: 30, height: 30)
+              .contentShape(Rectangle())
+          }
+          .menuStyle(.borderlessButton)
+          .menuIndicator(.hidden)
+          .help("更多操作")
         }
       }
-      .padding(.horizontal, 20)
+      .padding(.horizontal, 24)
+      .padding(.top, 22)
+      .padding(.bottom, 17)
       .contentShape(Rectangle())
       .onTapGesture {
         // 点击标题栏/操作按钮区域时，也取消搜索框聚焦
@@ -212,48 +215,16 @@ struct PlaylistView: View {
       }
 
       if panelMode == .queue {
-        // 搜索框
         SearchBarView(
           searchText: $playlistManager.searchText,
           onSearchChanged: { query in
             playlistManager.searchFiles(query)
           }, focusTarget: .queue
         )
-        .padding(.horizontal, 20)
+        .padding(.horizontal, 24)
+        .padding(.bottom, 14)
         // 搜索框以外区域：点击自动取消搜索框聚焦
-        VStack(alignment: .leading, spacing: 20) {
-          // 子文件夹扫描开关（移除右侧文件夹图标）
-          HStack {
-            Toggle("扫描子文件夹", isOn: $playlistManager.scanSubfolders)
-              .font(.subheadline)
-              .help("开启后会递归扫描所选文件夹中的所有子文件夹")
-            Spacer()
-            Button(action: { requestScrollToNowPlayingInQueue() }) {
-              HStack(spacing: 6) {
-                Image(systemName: "scope")
-                  .font(.caption)
-                Text("定位正在播放")
-                  .font(.caption)
-                  .fontWeight(.medium)
-              }
-              .padding(.horizontal, 12)
-              .padding(.vertical, 6)
-              .background(
-                RoundedRectangle(cornerRadius: 12)
-                  .fill(theme.mutedSurface)
-                  .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                      .stroke(theme.stroke, lineWidth: 1)
-                  )
-              )
-              .foregroundStyle(theme.accentGradient)
-            }
-            .buttonStyle(.plain)
-            .help("定位到正在播放的歌曲（会自动清空搜索）")
-            .disabled(nowPlayingIDInQueue() == nil)
-          }
-          .padding(.horizontal, 20)
-
+        VStack(alignment: .leading, spacing: 0) {
           // 搜索统计
           if !playlistManager.searchText.isEmpty {
             HStack {
@@ -264,7 +235,8 @@ struct PlaylistView: View {
               .foregroundColor(.secondary)
               Spacer()
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, 24)
+            .padding(.bottom, 10)
           }
 
           // 播放列表
@@ -275,7 +247,7 @@ struct PlaylistView: View {
           } else {
             ScrollViewReader { proxy in
               ScrollView {
-                LazyVStack(spacing: 4) {
+                LazyVStack(spacing: 0) {
                   ForEach(displayedQueueFiles) { file in
                     PlaylistItemView(
                   file: file,
@@ -339,8 +311,7 @@ struct PlaylistView: View {
                     .id(file.id)
                   }
                 }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
+                .padding(.horizontal, 12)
               }
               .background(Color.clear)
               .onChange(of: queueScrollTargetID) { target in
@@ -446,6 +417,26 @@ struct PlaylistView: View {
     }
   }
 
+  private func panelTab(title: String, mode: PanelMode) -> some View {
+    Button {
+      panelMode = mode
+    } label: {
+      VStack(spacing: 5) {
+        Text(title)
+          .font(.system(size: 12, weight: panelMode == mode ? .semibold : .medium))
+          .foregroundStyle(panelMode == mode ? Color.primary : theme.mutedText)
+
+        Rectangle()
+          .fill(panelMode == mode ? theme.accent : Color.clear)
+          .frame(height: 2)
+      }
+      .contentShape(Rectangle())
+      .fixedSize()
+    }
+    .buttonStyle(.plain)
+    .accessibilityAddTraits(panelMode == mode ? .isSelected : [])
+  }
+
   private func nowPlayingIDInQueue() -> String? {
     guard let url = currentHighlightedURL else { return nil }
     let id = PathKey.canonical(for: url)
@@ -506,36 +497,6 @@ struct PlaylistView: View {
         to: queueSourceFiles, weightScope: .queue)
       queueVisibleRevision &+= 1
     }
-  }
-
-  private var refreshButton: some View {
-    Button(action: {
-      Task {
-        await playlistManager.refreshAllMetadata(audioPlayer: audioPlayer)
-      }
-    }) {
-      HStack(spacing: 6) {
-        Image(systemName: "arrow.clockwise")
-          .font(.caption)
-        Text("完全刷新")
-          .font(.caption)
-          .fontWeight(.medium)
-      }
-      .padding(.horizontal, 12)
-      .padding(.vertical, 6)
-      .background(
-        RoundedRectangle(cornerRadius: 12)
-          .fill(theme.mutedSurface)
-          .overlay(
-            RoundedRectangle(cornerRadius: 12)
-              .stroke(theme.accentGradient, lineWidth: 1)
-          )
-      )
-      .foregroundStyle(theme.accentGradient)
-    }
-    .buttonStyle(PlainButtonStyle())
-    .help("完全刷新：重载元数据、歌词、封面（清空歌词/封面缓存；保留音量均衡缓存）")
-    .disabled(playlistManager.audioFiles.isEmpty)
   }
 
   @MainActor
@@ -693,16 +654,14 @@ struct SearchBarView: View {
       SearchSortButton(target: focusTarget, helpSuffix: "仅影响列表显示，不改变队列/歌单顺序。")
     }
     .padding(.horizontal, 12)
-    .padding(.vertical, 8)
+    .frame(height: 36)
     .background(
       ZStack {
-        RoundedRectangle(cornerRadius: 9, style: .continuous)
-          .fill(theme.mutedSurface)
-        RoundedRectangle(cornerRadius: 9, style: .continuous)
-          .stroke(theme.stroke, lineWidth: 1)
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+          .fill(theme.scheme == .dark ? Color.white.opacity(0.055) : Color.white.opacity(0.82))
         if isFocused {
-          RoundedRectangle(cornerRadius: 9, style: .continuous)
-            .stroke(theme.accent.opacity(0.62), lineWidth: 1.5)
+          RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .stroke(theme.accent.opacity(0.72), lineWidth: 1.5)
         }
       }
     )
@@ -759,91 +718,34 @@ struct PlaylistItemView: View {
   @State private var isHovered = false
   @Environment(\.colorScheme) private var colorScheme
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
-  private var iconStyle: AnyShapeStyle {
-    if isCurrentTrack { return AnyShapeStyle(theme.accent) }
-    if unplayableReason != nil { return AnyShapeStyle(Color.orange) }
-    return AnyShapeStyle(Color.primary)
-  }
-  private var titleStyle: AnyShapeStyle {
-    if isCurrentTrack { return AnyShapeStyle(theme.accent) }
-    if unplayableReason != nil { return AnyShapeStyle(Color.secondary) }
-    return AnyShapeStyle(Color.primary)
-  }
 
   var body: some View {
-    HStack(spacing: 10) {
-      // 播放点击区域（覆盖整行，避免只“选中”但点不到播放）
-      HStack(alignment: .center, spacing: 10) {
-        // 播放图标
-        ZStack {
-          let iconName: String = {
-            if isCurrentTrack { return "speaker.wave.2.fill" }
-            if unplayableReason != nil { return "exclamationmark.triangle.fill" }
-            return "play.circle.fill"
-          }()
-          Image(systemName: iconName)
-            .foregroundStyle(iconStyle)
-            .font(.system(size: 17, weight: .medium))
-            .frame(width: 24, height: 24)
-            .help(unplayableReason.map { "不可播放：\($0)" } ?? "")
-        }
-        .frame(width: 30, height: 30)
+    HStack(spacing: 0) {
+      Rectangle()
+        .fill(isCurrentTrack ? theme.accent : Color.clear)
+        .frame(width: 3, height: 34)
+        .padding(.trailing, 11)
 
-        // 歌曲信息
+      HStack(spacing: 11) {
+        Image(systemName: leadingSymbol)
+          .font(.system(size: 13, weight: .semibold))
+          .foregroundStyle(leadingColor)
+          .frame(width: 24, height: 24)
+          .help(unplayableReason.map { "不可播放：\($0)" } ?? "")
+
         VStack(alignment: .leading, spacing: 3) {
-          HStack(spacing: 8) {
+          HStack(spacing: 7) {
             Text(highlightedText(file.metadata.title, searchText: searchText))
-              .font(.system(size: 13, weight: .medium))
+              .font(.system(size: 13, weight: .semibold))
               .lineLimit(1)
-              .foregroundStyle(titleStyle)
-              .layoutPriority(1)
+              .foregroundStyle(unplayableReason == nil ? Color.primary : Color.secondary)
 
-            let badgeTextStyle: AnyShapeStyle =
-              isVolumeAnalyzed ? AnyShapeStyle(theme.accent) : AnyShapeStyle(theme.mutedText)
-            let badgeStrokeStyle: AnyShapeStyle =
-              isVolumeAnalyzed
-              ? AnyShapeStyle(theme.accent) : AnyShapeStyle(theme.mutedText.opacity(0.45))
-            Text("均")
-              .font(.system(size: 10, weight: .bold, design: .rounded))
-              .foregroundStyle(badgeTextStyle)
-              .frame(width: 18, height: 18)
-              .background(
-                Circle()
-                  .fill(
-                    isVolumeAnalyzed
-                      ? theme.accent.opacity(theme.scheme == .dark ? 0.20 : 0.15) : Color.clear
-                  )
-                  .overlay(
-                    Circle()
-                      .stroke(badgeStrokeStyle, lineWidth: 1)
-                      .opacity(isVolumeAnalyzed ? 0.85 : 1)
-                  )
-              )
-              .help(isVolumeAnalyzed ? "音量均衡：已分析" : "音量均衡：未分析")
-              .accessibilityLabel(isVolumeAnalyzed ? "音量均衡已分析" : "音量均衡未分析")
-
-            Spacer(minLength: 8)
-
-            HStack(alignment: .center, spacing: 8) {
-              if showsWeightControl, let weightLevel, let onWeightSelect {
-                WeightDotsView(level: weightLevel) { newLevel in
-                  onWeightSelect(newLevel)
-                }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
-                .background(
-                  RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.clear)
-                    .contentShape(Rectangle())
-                    .onTapGesture {}
-                )
-              }
-
-              Text(durationLabel)
-                .font(.system(size: 11, weight: .medium))
-                .monospacedDigit()
-                .foregroundColor(theme.mutedText.opacity(file.duration == nil ? 0.55 : 0.9))
-                .accessibilityLabel(file.duration == nil ? "时长加载中" : "时长 \(durationLabel)")
+            if isVolumeAnalyzed {
+              Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(theme.mutedText.opacity(0.72))
+                .help("音量均衡已分析")
+                .accessibilityLabel("音量均衡已分析")
             }
           }
 
@@ -856,72 +758,94 @@ struct PlaylistItemView: View {
           .help(file.url.lastPathComponent)
         }
 
-        Spacer(minLength: 0)
+        Spacer(minLength: 10)
+
+        if showsWeightControl, let weightLevel, let onWeightSelect {
+          Menu {
+            ForEach(PlaybackWeights.Level.allCases, id: \.rawValue) { level in
+              Button {
+                onWeightSelect(level)
+              } label: {
+                if level == weightLevel {
+                  Label(weightLabel(level), systemImage: "checkmark")
+                } else {
+                  Text(weightLabel(level))
+                }
+              }
+            }
+          } label: {
+            HStack(spacing: 4) {
+              Image(systemName: "dial.medium")
+              if weightLevel != .defaultLevel {
+                Text(String(format: "%.1f×", weightLevel.multiplier))
+                  .monospacedDigit()
+              }
+            }
+            .font(.system(size: 10, weight: .medium))
+            .foregroundStyle(weightLevel == .defaultLevel ? theme.mutedText : theme.accent)
+            .frame(minWidth: 24, minHeight: 24)
+            .contentShape(Rectangle())
+          }
+          .menuStyle(.borderlessButton)
+          .menuIndicator(.hidden)
+          .opacity(isHovered || weightLevel != .defaultLevel ? 1 : 0)
+          .help("随机权重")
+        }
+
+        Text(durationLabel)
+          .font(.system(size: 11, weight: .medium))
+          .monospacedDigit()
+          .foregroundColor(theme.mutedText.opacity(file.duration == nil ? 0.55 : 0.9))
+          .frame(width: 42, alignment: .trailing)
+          .accessibilityLabel(file.duration == nil ? "时长加载中" : "时长 \(durationLabel)")
       }
       .contentShape(Rectangle())
       .onTapGesture { playAction(file) }
-      // 让按钮的可点击区域覆盖整行（含顶部/底部留白），避免只“选中”但点不到播放
-      .padding(.leading, 10)
-      .padding(.vertical, 4)
       .frame(maxWidth: .infinity, alignment: .leading)
 
-      // 操作按钮组
-      HStack(spacing: 10) {
-        // 编辑按钮
+      HStack(spacing: 2) {
         Button(action: { editAction(file) }) {
           Image(systemName: "pencil")
             .foregroundColor(buttonColor(for: file))
-            .font(.system(size: 13))
+            .font(.system(size: 12, weight: .medium))
             .frame(width: 28, height: 28)
-            .background(
-              Circle()
-                .fill(isHovered ? theme.mutedSurface : Color.clear)
-            )
+            .contentShape(Rectangle())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(.plain)
         .disabled(!MetadataEditor.canShowEditButton(for: file.url))
         .help(helpText(for: file))
 
-        // 删除按钮
         Button(action: { deleteAction(file) }) {
           Image(systemName: "trash")
-            .foregroundColor(.red.opacity(isHovered ? 1 : 0.7))
-            .font(.system(size: 13))
+            .foregroundColor(.red.opacity(0.82))
+            .font(.system(size: 12, weight: .medium))
             .frame(width: 28, height: 28)
-            .background(
-              Circle()
-                .fill(isHovered ? Color.red.opacity(0.1) : Color.clear)
-            )
+            .contentShape(Rectangle())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(.plain)
+        .help("从列表移除")
       }
-      .padding(.trailing, 10)
-      .padding(.vertical, 4)
+      .padding(.leading, 4)
       .opacity(isHovered ? 1 : 0)
       .allowsHitTesting(isHovered)
-      .animation(.easeInOut(duration: 0.15), value: isHovered)
+      .animation(AppTheme.smoothTransition, value: isHovered)
     }
+    .padding(.horizontal, 8)
+    .frame(minHeight: 54)
     .background(
-      Group {
-        if isCurrentTrack {
-          RoundedRectangle(cornerRadius: 8, style: .continuous)
-            .fill(theme.rowBackground(isActive: true))
-        } else if isHovered {
-          RoundedRectangle(cornerRadius: 8, style: .continuous)
-            .fill(theme.mutedSurface)
-        } else {
-          RoundedRectangle(cornerRadius: 8, style: .continuous)
-            .fill(Color.clear)
-        }
-      }
-    )
-    .overlay(
       RoundedRectangle(cornerRadius: 8, style: .continuous)
-        .stroke(
-          isCurrentTrack ? theme.accent.opacity(0.22) : Color.clear,
-          lineWidth: 1
+        .fill(
+          isCurrentTrack
+            ? theme.accent.opacity(theme.scheme == .dark ? 0.12 : 0.075)
+            : (isHovered ? theme.mutedSurface : Color.clear)
         )
     )
+    .overlay(alignment: .bottom) {
+      Rectangle()
+        .fill(theme.stroke.opacity(isCurrentTrack || isHovered ? 0 : 0.48))
+        .frame(height: 1)
+        .padding(.leading, 46)
+    }
     .onHover { hovering in
       isHovered = hovering
     }
@@ -938,6 +862,22 @@ struct PlaylistItemView: View {
         deleteAction(file)
       }
     }
+  }
+
+  private var leadingSymbol: String {
+    if isCurrentTrack { return "waveform" }
+    if unplayableReason != nil { return "exclamationmark.triangle.fill" }
+    return isHovered ? "play.fill" : "music.note"
+  }
+
+  private var leadingColor: Color {
+    if isCurrentTrack { return theme.accent }
+    if unplayableReason != nil { return .orange }
+    return isHovered ? .primary : theme.mutedText
+  }
+
+  private func weightLabel(_ level: PlaybackWeights.Level) -> String {
+    "随机权重 \(String(format: "%.1f", level.multiplier))×"
   }
 
   private func buttonColor(for file: AudioFile) -> Color {
@@ -998,11 +938,9 @@ struct PlaylistItemView: View {
     if let range = text.range(of: searchText, options: .caseInsensitive) {
       let nsRange = NSRange(range, in: text)
       if let attributedRange = Range(nsRange, in: attributedString) {
-        // 搜索命中高亮：更亮的“荧光笔黄”，在暗色背景上也足够醒目
-        let highlightYellow = Color(red: 1.0, green: 0.90, blue: 0.15)
-        attributedString[attributedRange].backgroundColor = highlightYellow.opacity(
-          theme.scheme == .dark ? 0.92 : 0.78)
-        attributedString[attributedRange].foregroundColor = Color.black.opacity(0.95)
+        attributedString[attributedRange].backgroundColor = theme.accent.opacity(
+          theme.scheme == .dark ? 0.28 : 0.18)
+        attributedString[attributedRange].foregroundColor = Color.primary
       }
     }
 
@@ -1015,50 +953,24 @@ struct EmptyPlaylistView: View {
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
   var body: some View {
-    VStack(spacing: 24) {
-      ZStack {
-        Circle()
-          .fill(
-            LinearGradient(
-              gradient: Gradient(colors: [
-                theme.surface.opacity(1.0),
-                theme.surface.opacity(0.7),
-              ]),
-              startPoint: .topLeading,
-              endPoint: .bottomTrailing
-            )
-          )
-          .frame(width: 120, height: 120)
+    VStack(spacing: 14) {
+      Image(systemName: "music.note.list")
+        .font(.system(size: 32, weight: .light))
+        .foregroundStyle(theme.mutedText.opacity(0.72))
 
-        Image(systemName: "music.note.list")
-          .font(.system(size: 48))
-          .foregroundStyle(theme.accentGradient)
-          .opacity(0.9)
-      }
-
-      VStack(spacing: 12) {
+      VStack(spacing: 6) {
         Text("播放列表为空")
-          .font(.title2)
-          .fontWeight(.semibold)
+          .font(.system(size: 17, weight: .semibold))
           .foregroundColor(.primary)
 
-        Text("将音乐文件拖拽到左侧区域来添加歌曲")
-          .font(.body)
+        Text("点击“添加音乐”，或把文件拖进窗口")
+          .font(.system(size: 12))
           .foregroundColor(theme.mutedText)
           .multilineTextAlignment(.center)
-          .padding(.horizontal, 40)
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(
-      RoundedRectangle(cornerRadius: 16)
-        .fill(theme.mutedSurface)
-        .overlay(
-          RoundedRectangle(cornerRadius: 16)
-            .stroke(theme.stroke, lineWidth: 1)
-        )
-        .shadow(color: theme.subtleShadow, radius: 8, x: 0, y: 4)
-    )
+    .padding(32)
   }
 }
 
@@ -1081,14 +993,5 @@ struct RestoringPlaylistView: View {
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .padding(24)
-    .background(
-      RoundedRectangle(cornerRadius: 18)
-        .fill(theme.mutedSurface)
-        .overlay(
-          RoundedRectangle(cornerRadius: 18)
-            .stroke(theme.stroke, lineWidth: 1)
-        )
-    )
-    .padding(.horizontal, 20)
   }
 }

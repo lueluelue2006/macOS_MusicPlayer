@@ -7,9 +7,13 @@ import Foundation
 /// - Keep memory usage low (small strings only; no lyrics/artwork cached here).
 /// - Ensure correctness via invalidation: (mtime + size) mismatch => treat as cache miss and refresh.
 actor MetadataCache {
-    static let shared = MetadataCache()
+    static let shared = MetadataCache(cacheFileURLOverride: isolatedTestCacheURL())
 
-    private init() {}
+    private let cacheFileURLOverride: URL?
+
+    init(cacheFileURLOverride: URL? = nil) {
+        self.cacheFileURLOverride = cacheFileURLOverride
+    }
 
     private let cacheFileName = "metadata-cache.json"
     private let formatVersion = 1
@@ -178,7 +182,9 @@ actor MetadataCache {
         guard let url = cacheFileURL() else { return }
         let payload = CacheFile(version: formatVersion, entries: entries)
         do {
-            let data = try JSONEncoder().encode(payload)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let data = try encoder.encode(payload)
             try data.write(to: url, options: .atomic)
         } catch {
             // Best-effort only.
@@ -186,6 +192,8 @@ actor MetadataCache {
     }
 
     private func cacheFileURL() -> URL? {
+        if let cacheFileURLOverride { return cacheFileURLOverride }
+
         let fm = FileManager.default
         guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
         let dir = base.appendingPathComponent("MusicPlayer", isDirectory: true)
@@ -197,6 +205,22 @@ actor MetadataCache {
             }
         }
         return dir.appendingPathComponent(cacheFileName, isDirectory: false)
+    }
+
+    nonisolated private static func isolatedTestCacheURL() -> URL? {
+        let process = ProcessInfo.processInfo
+        let environment = process.environment
+        let isRegressionRun = environment["MUSICPLAYER_RUN_REGRESSION_TESTS"] == "1"
+        let isTestProcess =
+            environment["XCTestConfigurationFilePath"] != nil
+            || process.processName.localizedCaseInsensitiveContains("test")
+            || process.processName.localizedCaseInsensitiveContains("xctest")
+        guard isRegressionRun || isTestProcess else { return nil }
+
+        return FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-metadata-cache-\(process.processIdentifier).json",
+            isDirectory: false
+        )
     }
 
     private func fileSignature(for url: URL, snapshot: FileValidationSnapshot?) -> FileSignature? {

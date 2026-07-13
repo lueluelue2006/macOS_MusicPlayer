@@ -1,92 +1,115 @@
-# MusicPlayer Design System
+# MusicPlayer 4.2 Design System
 
-## Product Character
+## Mode
 
-MusicPlayer is a calm, native macOS listening workspace. Album artwork and the
-current song carry the emotion; application chrome stays neutral, precise, and
-quiet. The interface must remain responsive on an 8 GB Mac with a large local
-library.
+Greenfield. The 4.1 visual direction is retired rather than incrementally
+polished.
 
-## Reference Direction
+## Design Direction
 
-- Apple Human Interface Guidelines define platform hierarchy, semantic color,
-  system typography, keyboard behavior, and resizable-window expectations.
-- IINA contributes one principle: media content leads and playback controls
-  occupy one compact, coherent layer.
-- The previous MusicPlayer UI contributes the existing functional density, but
-  not its rainbow gradients, glow effects, stacked glass cards, or per-row
-  shadows.
+**Concept — Listening Room:** a tactile, album-first listening stage beside a
+quiet, highly scannable music library. The current record supplies the emotion;
+the queue supplies precision.
 
-## Visual Language
+**Keywords:** album-first, editorial, tactile, native, calm, dense, high-contrast.
 
-- **Visual anchor:** the active album artwork.
-- **Material:** a quiet record workspace with one structural player pane and a
-  flat, highly scannable library pane.
-- **Color:** neutral semantic surfaces plus the user's macOS accent color.
-- **Depth:** spacing and separators first; one soft artwork shadow is allowed.
-- **Icons:** SF Symbols only. Icons clarify actions and state; they are not
-  decoration.
-- **Avoid:** multicolor chrome, neon glow, decorative gradients, nested blur,
-  equal-weight cards, and perpetual animation.
+**Avoid:** blank placeholder art, giant import banners, pill-shaped control
+clusters, visible weight controls on every row, stacked cards, rainbow status
+colors, decorative glass, border-heavy regions, and perpetual animation.
 
-## Tokens
+## Composition
 
-- Use `AppTheme` semantic roles instead of raw RGB values in feature views.
-- System font is the only UI typeface. Use semibold sparingly for the current
-  song, section titles, and primary actions.
-- Base spacing rhythm: 4, 8, 12, 16, 20, 24 points.
-- Control radius: 8–10 points. Grouped surface radius: 12 points. Artwork
-  radius: 16 points.
-- Borders are one pixel and low contrast. Shadows belong to artwork or a
-  floating transient surface, never to every list row.
+- Wide windows use one strong asymmetric composition: a 410–500 point dark
+  listening stage and a flexible appearance-aware library.
+- The listening stage remains graphite in both system appearances. This gives
+  light mode a visual anchor instead of turning the whole window into a pale
+  form, while dark mode remains continuous and quiet.
+- Album artwork is the dominant object. When metadata has no artwork, render a
+  designed record sleeve using the track title rather than an empty gray box.
+- Import, refresh, clear, scan, normalization, playback rate, and random weight
+  are supporting tools. They must not compete with artwork, title, transport,
+  search, or the queue.
+- In low-height windows, the listening stage scrolls, but artwork, track title,
+  progress, and transport appear before every advanced control and lyrics.
 
-## Layout
+## System Decisions
 
-- Wide windows use a 360–430 point player pane and a flexible queue pane.
-- Narrow windows switch to a vertical layout only when two readable panes no
-  longer fit.
-- The first read is artwork and song, the second is transport, and the third is
-  the queue. Import, playback options, lyrics, and analysis settings are
-  supporting actions.
-- Keep lazy row creation and stable audio-file identity for long libraries.
+### Color
 
-## Components
+- Brand accent: a single restrained coral red used for play state, selection,
+  focus, and primary actions.
+- Listening stage: one solid deep graphite plane with no decorative gradient.
+- Library light appearance: warm near-white with charcoal labels.
+- Library dark appearance: neutral graphite with cool-white labels.
+- Warning and destructive colors remain semantic system colors.
+- Random-weight colors are visible only while editing a weight or when a track
+  has a non-default override.
 
-- The primary play/pause button is the only solid accent control in the player.
-- Previous and next are quiet icon controls with immediate hover and press
-  feedback.
-- Search uses a compact semantic surface and a visible focus stroke.
-- Queue rows are flat, two-line, and shadow-free. Active and hover states use
-  low-opacity semantic fills.
-- Destructive actions use the system destructive color and must never become a
-  visually dominant default action.
+### Typography
 
-## Motion and Interaction
+- Use the macOS system font only.
+- Now-playing title: 24–28 pt semibold with tight leading.
+- Library title: 26 pt bold; track title: 13 pt semibold; secondary metadata:
+  11–12 pt regular.
+- Use uppercase micro-labels sparingly for orientation, with modest tracking.
+- Durations use monospaced digits.
 
-- Feedback starts immediately and settles in about 180–280 ms.
-- Springs are critically damped; momentum-free controls do not bounce.
-- No decorative loops or continuously moving borders.
-- Preserve native `Button`, `Toggle`, `Picker`, `TextField`, `Slider`, and
-  scroll-container semantics for keyboard and accessibility behavior.
-- Reduced Motion removes nonessential scale or movement while preserving state
-  feedback.
+### Spacing and Shape
 
-## Performance Budget
+- Spacing scale: 4, 8, 12, 16, 24, 32 points.
+- Artwork radius: 20 points. Search radius: 10 points. Row hover radius: 8
+  points. Avoid capsules except for genuinely compact status.
+- Queue rows are flat and separated through rhythm and a faint divider. The
+  active row uses a narrow accent rail and a low-opacity fill, never a border.
+- Only artwork receives a large shadow. Routine regions and rows do not.
 
-- No more than one large material or translucent structural layer per pane.
-- List rows must not use blur, large shadows, file I/O, path normalization, or
-  sorting in `body`.
-- Artwork decoding stays off the main thread and remains capped at the existing
-  600-pixel thumbnail size.
-- Large-list loading uses bounded concurrency. Derived search/sort/cache views
-  are recomputed only when their source state changes.
-- Do not add third-party UI, animation, image, or state-management dependencies.
+### Motion
 
-## Review Checklist
+- Hover/color response: 140–180 ms.
+- Layout or content transition: critically damped spring around 240–300 ms.
+- Press feedback is immediate and small. No bounce without gesture momentum.
+- Respect Reduce Motion and never run decorative animation continuously.
 
-- Light and dark appearance share the same product identity.
-- The current song and play control are visible without scrolling at the normal
-  desktop window size.
-- A 1,000-track queue scrolls without per-row effects or unstable identity.
-- Search, sort, locate-now-playing, temporary playback, lyrics seeking, metadata
-  editing, and queue/playlist scope semantics remain intact.
+## Key Components
+
+- **Now Playing:** orientation header, 280–320 point artwork/sleeve, left-aligned
+  title metadata, progress, one coherent transport row, then quiet utilities.
+- **Transport:** shuffle, previous, play/pause, next, repeat. Only play/pause is
+  solid; active modes use the single accent without text pills.
+- **Queue toolbar:** title/count and text tabs on the left; one import action and
+  quiet icon tools on the right. Destructive and infrequent actions live in an
+  overflow menu.
+- **Search:** one native-looking search surface with a visible focus state.
+- **Track row:** glyph/equalizer, two lines of metadata, optional analyzed state,
+  duration, and hover/context actions. Default random weight is visually silent.
+- **Lyrics:** absent when no lyrics exist; otherwise a flat continuation of the
+  listening stage, not another card.
+
+## SwiftUI and Performance Rules
+
+- Keep SwiftUI, AppKit, AVFoundation, CoreAudio, and SF Symbols; add no UI or
+  animation dependency.
+- Preserve lazy row creation and stable path-based identity.
+- No blur, file I/O, sorting, path normalization, large shadow, or artwork
+  decoding inside queue rows.
+- Keep current-artwork ImageIO downsampling and the bounded playlist workers.
+- Use native `Button`, `Menu`, `Slider`, `Toggle`, `TextField`, and scroll
+  semantics so keyboard and accessibility behavior survive the redesign.
+- The root owns lifecycle, notifications, alerts, sheets, drops, and updates;
+  visual containers do not duplicate service ownership.
+
+## Self-Critique
+
+1. A permanently dark listening stage can feel detached in light mode. Connect
+   the two panes through shared typography, the coral state color, and one clean
+   divider—not extra glass or gradients.
+2. Artwork-free libraries are common, so the fallback sleeve must be a real
+   composition. A gray note placeholder would collapse the entire direction.
+3. Hiding advanced functions can damage discoverability. Keep them in stable
+   menus with clear labels, help text, context menus, and existing shortcuts.
+4. The compact player can become another stack of tiny controls. Preserve large
+   artwork, one dominant play button, and generous separation between core and
+   utility controls.
+5. Screenshot quality is not enough: verify light/dark, narrow/wide, long title,
+   no artwork, hover actions, keyboard focus, 279-track scrolling, and Reduced
+   Motion before delivery.

@@ -66,17 +66,17 @@ struct PlaylistsPanelView: View {
   }
 
   var body: some View {
-    HStack(spacing: 16) {
+    HStack(spacing: 18) {
       playlistsSidebar
-        .frame(width: 190)
+        .frame(width: 180)
 
       Divider()
         .opacity(0.35)
 
       playlistDetail
     }
-    .padding(.horizontal, 20)
-    .padding(.bottom, 12)
+    .padding(.horizontal, 24)
+    .padding(.bottom, 16)
     .sheet(isPresented: $showAddFromQueueSheet) {
       addFromQueueSheet
     }
@@ -116,9 +116,9 @@ struct PlaylistsPanelView: View {
   private var playlistsSidebar: some View {
     VStack(alignment: .leading, spacing: 12) {
       HStack {
-        Text("我的歌单")
-          .font(.headline)
-          .foregroundColor(.primary)
+        Text("歌单")
+          .font(.system(size: 11, weight: .semibold))
+          .foregroundColor(theme.mutedText)
         Spacer()
       }
 
@@ -132,22 +132,14 @@ struct PlaylistsPanelView: View {
             .foregroundColor(theme.mutedText.opacity(0.9))
             .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(12)
-        .background(
-          RoundedRectangle(cornerRadius: 12)
-            .fill(theme.mutedSurface)
-            .overlay(
-              RoundedRectangle(cornerRadius: 12)
-                .stroke(theme.stroke, lineWidth: 1)
-            )
-        )
+        .padding(.vertical, 8)
         Spacer()
       } else {
         List(selection: sidebarSelectedPlaylistID) {
           ForEach(playlistsStore.playlists) { playlist in
             HStack(spacing: 10) {
               Image(systemName: "music.note.list")
-                .foregroundStyle(theme.accentGradient)
+                .foregroundStyle(theme.accent)
               VStack(alignment: .leading, spacing: 2) {
                 Text(playlist.name)
                   .lineLimit(1)
@@ -264,7 +256,7 @@ struct PlaylistsPanelView: View {
                 .id(file.id)
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
-                .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 2, trailing: 0))
+                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
               }
               .listStyle(PlainListStyle())
               .scrollContentBackground(.hidden)
@@ -319,8 +311,7 @@ struct PlaylistsPanelView: View {
     HStack(spacing: 12) {
       VStack(alignment: .leading, spacing: 4) {
         Text(playlist.name)
-          .font(.title3)
-          .fontWeight(.bold)
+          .font(.system(size: 20, weight: .bold))
           .foregroundColor(.primary)
           .lineLimit(1)
         Text("\(playlist.tracks.count) 首")
@@ -330,16 +321,25 @@ struct PlaylistsPanelView: View {
 
       Spacer()
 
-      VStack(alignment: .trailing, spacing: 10) {
-        HStack(spacing: 10) {
-          Button("从队列添加") {
-            openAddFromQueueSheet(targetPlaylistID: playlist.id)
-          }
-          .buttonStyle(.borderedProminent)
-          .disabled(playlistManager.audioFiles.isEmpty)
-          .help(playlistManager.audioFiles.isEmpty ? "队列为空：先在“队列”里导入一些歌曲" : "")
+      Button {
+        openAddFromQueueSheet(targetPlaylistID: playlist.id)
+      } label: {
+        Label("从队列添加", systemImage: "plus")
+          .font(.system(size: 12, weight: .semibold))
+          .foregroundStyle(Color.white)
+          .padding(.horizontal, 11)
+          .padding(.vertical, 7)
+          .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+              .fill(theme.accent)
+          )
+      }
+      .buttonStyle(.plain)
+      .disabled(playlistManager.audioFiles.isEmpty)
+      .help(playlistManager.audioFiles.isEmpty ? "队列为空：先在“队列”里导入一些歌曲" : "")
 
-          let canAddNowPlaying = (audioPlayer.currentFile != nil)
+      Menu {
+        if audioPlayer.currentFile != nil {
           Button("添加正在播放") {
             if let url = audioPlayer.currentFile?.url {
               playlistsStore.addTracks([url], to: playlist.id)
@@ -348,47 +348,39 @@ struct PlaylistsPanelView: View {
               postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
             }
           }
-          .buttonStyle(.borderedProminent)
-          // Keep layout stable, but hide the whole control (including the chrome)
-          // when there's nothing to add, so it doesn't show an empty grey pill.
-          .opacity(canAddNowPlaying ? 1 : 0)
-          .allowsHitTesting(canAddNowPlaying)
-          .accessibilityHidden(!canAddNowPlaying)
-          .help(canAddNowPlaying ? "将正在播放的歌曲加入该歌单" : "")
         }
 
-        HStack(spacing: 10) {
-          let nowPlayingID = nowPlayingIDInPlaylist(playlist)
-          if nowPlayingID != nil {
-            Button {
-              requestScrollToNowPlayingInPlaylist(playlist)
-            } label: {
-              Label("定位正在播放", systemImage: "scope")
-            }
-            .buttonStyle(.borderedProminent)
-            .help("定位到正在播放的歌曲（会自动清空搜索）")
+        if nowPlayingIDInPlaylist(playlist) != nil {
+          Button("定位正在播放") {
+            requestScrollToNowPlayingInPlaylist(playlist)
           }
-
-          Button {
-            let result = weights.syncPlaylistOverridesToQueue(from: playlist.id)
-            if result.total == 0 {
-              postToast(title: "歌单没有设置随机权重", subtitle: "先在歌单里点一下 6 个方块设置权重", kind: "info")
-              return
-            }
-            if result.changed == 0 {
-              postToast(title: "队列权重已是最新", subtitle: "无需同步（\(result.total) 条权重一致）", kind: "info")
-              return
-            }
-            postToast(
-              title: "已同步权重到队列", subtitle: "应用了 \(result.changed)/\(result.total) 条权重",
-              kind: "success")
-          } label: {
-            Label("同步权重给队列", systemImage: "arrow.triangle.2.circlepath")
-          }
-          .buttonStyle(.borderedProminent)
-          .help("将本歌单的随机权重同步到队列（只同步非默认权重，不会清空队列里其他歌曲的权重）")
         }
+
+        Divider()
+
+        Button("同步随机权重给队列") {
+          let result = weights.syncPlaylistOverridesToQueue(from: playlist.id)
+          if result.total == 0 {
+            postToast(title: "歌单没有设置随机权重", subtitle: "先在歌曲行的随机权重菜单中设置", kind: "info")
+            return
+          }
+          if result.changed == 0 {
+            postToast(title: "队列权重已是最新", subtitle: "无需同步（\(result.total) 条权重一致）", kind: "info")
+            return
+          }
+          postToast(
+            title: "已同步权重到队列", subtitle: "应用了 \(result.changed)/\(result.total) 条权重",
+            kind: "success")
+        }
+      } label: {
+        Image(systemName: "ellipsis")
+          .font(.system(size: 14, weight: .semibold))
+          .frame(width: 30, height: 30)
+          .contentShape(Rectangle())
       }
+      .menuStyle(.borderlessButton)
+      .menuIndicator(.hidden)
+      .help("歌单操作")
     }
     .padding(.top, 4)
   }

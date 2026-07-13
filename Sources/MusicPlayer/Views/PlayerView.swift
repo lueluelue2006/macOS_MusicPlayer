@@ -9,17 +9,24 @@ struct PlayerView: View {
 
   var body: some View {
     ScrollView {
-      VStack(spacing: 14) {
-        FileSelectionView(showFlowingBorder: playlistManager.audioFiles.isEmpty) { urls in
-          playlistManager.enqueueAddFiles(urls)
+      VStack(spacing: 0) {
+        HStack(spacing: 12) {
+          Label("正在播放", systemImage: "waveform")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(theme.stageSecondaryText)
+
+          Spacer(minLength: 12)
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 16)
+        .padding(.horizontal, 24)
+        .padding(.top, 20)
+        .padding(.bottom, 18)
+
         if playlistManager.isAddingFiles {
           VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
               ProgressView()
                 .controlSize(.small)
+                .tint(theme.accent)
 
               VStack(alignment: .leading, spacing: 2) {
                 Text(
@@ -27,12 +34,12 @@ struct PlayerView: View {
                 )
                 .font(.caption)
                 .fontWeight(.semibold)
-                .foregroundColor(.primary)
+                .foregroundColor(theme.stagePrimaryText)
 
                 if !playlistManager.addFilesDetail.isEmpty {
                   Text(playlistManager.addFilesDetail)
                     .font(.caption2)
-                    .foregroundColor(.secondary)
+                    .foregroundColor(theme.stageSecondaryText)
                     .lineLimit(1)
                 }
               }
@@ -43,6 +50,7 @@ struct PlayerView: View {
                 playlistManager.cancelAddFiles()
               }
               .font(.caption)
+              .buttonStyle(.borderless)
             }
 
             if playlistManager.addFilesProgressTotal > 0 {
@@ -56,56 +64,62 @@ struct PlayerView: View {
                 "\(playlistManager.addFilesProgressCurrent)/\(playlistManager.addFilesProgressTotal)"
               )
               .font(.caption2)
-              .foregroundColor(.secondary)
+              .foregroundColor(theme.stageSecondaryText)
             } else if playlistManager.addFilesProgressCurrent > 0 {
               Text("已发现 \(playlistManager.addFilesProgressCurrent) 首")
                 .font(.caption2)
-                .foregroundColor(.secondary)
+                .foregroundColor(theme.stageSecondaryText)
             }
           }
-          .padding(.horizontal, 14)
-          .padding(.vertical, 10)
+          .padding(12)
           .background(
-            RoundedRectangle(cornerRadius: 14)
-              .fill(theme.mutedSurface)
-              .overlay(
-                RoundedRectangle(cornerRadius: 14)
-                  .stroke(theme.accent.opacity(0.22), lineWidth: 1)
-              )
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+              .fill(Color.white.opacity(0.06))
           )
-          .padding(.horizontal, 20)
+          .padding(.horizontal, 24)
+          .padding(.bottom, 16)
         }
-        HStack(spacing: 7) {
-          Image(
-            systemName: audioPlayer.isInternalSpeakerOutput ? "laptopcomputer" : "hifispeaker.fill"
-          )
-          .font(.caption)
-          .foregroundColor(theme.mutedText)
-          Text(audioPlayer.currentOutputDeviceName)
-            .font(.caption)
-            .fontWeight(.medium)
-            .foregroundColor(
-              audioPlayer.isInternalSpeakerOutput ? theme.mutedText : theme.accent
-            )
-          Spacer()
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 20)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("当前音频输出设备：\(audioPlayer.currentOutputDeviceName)")
 
         CurrentTrackView(audioPlayer: audioPlayer, playlistManager: playlistManager)
 
         PlaybackControlsView(audioPlayer: audioPlayer, playlistManager: playlistManager)
-          .padding(.horizontal, 20)
+          .padding(.horizontal, 28)
+          .padding(.top, 20)
 
         AudioControlsView(audioPlayer: audioPlayer)
-          .padding(.horizontal, 20)
+          .padding(.horizontal, 28)
+          .padding(.top, 20)
 
-        LyricsContainerView(audioPlayer: audioPlayer)
-          .padding(.horizontal, 20)
+        if audioPlayer.lyricsTimeline != nil {
+          Rectangle()
+            .fill(Color.white.opacity(0.08))
+            .frame(height: 1)
+            .padding(.horizontal, 28)
+            .padding(.top, 24)
 
-        Spacer(minLength: 20)
+          LyricsContainerView(audioPlayer: audioPlayer)
+            .padding(.horizontal, 24)
+            .padding(.top, 18)
+        }
+
+        HStack(spacing: 7) {
+          Image(
+            systemName: audioPlayer.isInternalSpeakerOutput ? "laptopcomputer" : "hifispeaker.fill"
+          )
+          .font(.system(size: 11, weight: .medium))
+
+          Text(audioPlayer.currentOutputDeviceName)
+            .font(.system(size: 11, weight: .medium))
+            .lineLimit(1)
+
+          Spacer(minLength: 0)
+        }
+        .foregroundStyle(theme.stageTertiaryText)
+        .padding(.horizontal, 28)
+        .padding(.top, 22)
+        .padding(.bottom, 24)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("当前音频输出设备：\(audioPlayer.currentOutputDeviceName)")
       }
     }
     .contentShape(Rectangle())
@@ -118,7 +132,7 @@ struct PlayerView: View {
 }
 
 struct FileSelectionView: View {
-  let showFlowingBorder: Bool
+  let isLibraryEmpty: Bool
   let onFilesSelected: ([URL]) -> Void
   @State private var hovering = false
   @Environment(\.colorScheme) private var colorScheme
@@ -126,32 +140,20 @@ struct FileSelectionView: View {
 
   var body: some View {
     Button(action: selectFiles) {
-      HStack(spacing: 9) {
+      HStack(spacing: 7) {
         Image(systemName: "folder.badge.plus")
-          .font(.system(size: 14, weight: .semibold))
-          .foregroundStyle(theme.accent)
-        Text("添加音乐")
-          .font(.system(size: 13, weight: .semibold))
-          .foregroundStyle(.primary)
-
-        Spacer(minLength: 0)
-
-        Image(systemName: "chevron.right")
-          .font(.system(size: 10, weight: .semibold))
-          .foregroundStyle(theme.mutedText)
+          .font(.system(size: 12, weight: .semibold))
+        Text(isLibraryEmpty ? "添加音乐" : "导入")
+          .font(.system(size: 12, weight: .semibold))
       }
-      .frame(maxWidth: .infinity)
-      .padding(.vertical, 10)
-      .padding(.horizontal, 12)
+      .foregroundStyle(Color.white)
+      .padding(.vertical, 7)
+      .padding(.horizontal, 11)
       .background(
-        RoundedRectangle(cornerRadius: 10, style: .continuous)
-          .fill(hovering ? theme.elevatedSurface : theme.mutedSurface)
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+          .fill(hovering ? theme.accent.opacity(0.86) : theme.accent)
       )
-      .overlay(
-        RoundedRectangle(cornerRadius: 10, style: .continuous)
-          .stroke(showFlowingBorder ? theme.accent.opacity(0.46) : theme.stroke, lineWidth: 1)
-      )
-      .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+      .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
       .animation(AppTheme.smoothTransition, value: hovering)
     }
     .buttonStyle(PlainButtonStyle())
@@ -177,204 +179,160 @@ struct CurrentTrackView: View {
   @ObservedObject var audioPlayer: AudioPlayer
   @ObservedObject var playlistManager: PlaylistManager
   @ObservedObject private var weights = PlaybackWeights.shared
-  @State private var showEphemeralTip: Bool = false
-  @State private var showRatePicker: Bool = false
   @Environment(\.colorScheme) private var colorScheme
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
   var body: some View {
-    VStack(spacing: 16) {
+    VStack(alignment: .leading, spacing: 0) {
       if let currentFile = audioPlayer.currentFile {
-        let coverContainerSize: CGFloat = 276
-        let artworkSize: CGFloat = coverContainerSize
-
-        AlbumArtworkView(image: audioPlayer.artworkImage)
-          .frame(width: artworkSize, height: artworkSize)
-          .frame(width: coverContainerSize, height: coverContainerSize)
-          .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        AlbumArtworkView(
+          image: audioPlayer.artworkImage,
+          title: currentFile.metadata.title,
+          artist: currentFile.metadata.artist
+        )
+          .frame(width: 300, height: 300)
+          .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
           .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-              .stroke(Color.white.opacity(colorScheme == .dark ? 0.13 : 0.48), lineWidth: 0.75)
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+              .stroke(Color.white.opacity(0.10), lineWidth: 0.75)
           )
-          .shadow(color: theme.subtleShadow, radius: 16, x: 0, y: 8)
+          .shadow(color: Color.black.opacity(0.42), radius: 18, x: 0, y: 10)
+          .frame(maxWidth: .infinity)
 
-        // 临时播放标注：提示关闭或再次临时打开会丢失当前进度
         if audioPlayer.persistPlaybackState == false {
           HStack(spacing: 8) {
             Image(systemName: "bolt.fill")
               .font(.caption)
-            Text("临时播放 · 关闭或再次临时打开将丢失进度")
+            Text("临时播放")
               .font(.caption)
               .fontWeight(.semibold)
+            Text("关闭窗口后不会保存进度")
+              .font(.caption)
+              .foregroundStyle(theme.stageSecondaryText)
           }
-          .padding(.horizontal, 10)
-          .padding(.vertical, 6)
-          .background(Capsule().fill(Color.orange.opacity(0.15)))
-          .foregroundColor(Color.orange)
+          .foregroundColor(Color.orange.opacity(0.92))
+          .padding(.top, 16)
           .help("通过 Finder/Dock 打开的临时播放：关闭应用或再次以临时方式打开其他歌曲都会丢失当前进度")
         }
 
-        // 进入临时播放时的临时提示条（数秒自动消失）
-        if showEphemeralTip {
-          HStack(spacing: 8) {
-            Image(systemName: "info.circle")
-              .font(.caption)
-            Text("临时播放：关闭应用或再次临时打开其他歌曲将丢失当前进度")
-              .font(.caption)
-          }
-          .padding(.horizontal, 12)
-          .padding(.vertical, 8)
-          .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.12)))
-          .foregroundColor(Color.orange)
-          .transition(.opacity)
-        }
-
-        // 歌曲信息
-        VStack(spacing: 5) {
+        VStack(alignment: .leading, spacing: 5) {
           Text(currentFile.metadata.title)
-            .font(.system(size: 22, weight: .semibold))
+            .font(.system(size: 26, weight: .semibold))
             .lineLimit(2)
-            .multilineTextAlignment(.center)
-            .foregroundColor(.primary)
+            .multilineTextAlignment(.leading)
+            .foregroundColor(theme.stagePrimaryText)
 
           Text(currentFile.metadata.artist)
-            .font(.system(size: 14, weight: .medium))
-            .foregroundColor(.secondary)
+            .font(.system(size: 15, weight: .medium))
+            .foregroundColor(theme.stageSecondaryText)
             .lineLimit(1)
 
           Text(currentFile.metadata.album)
             .font(.system(size: 12))
-            .foregroundColor(theme.mutedText)
+            .foregroundColor(theme.stageTertiaryText)
             .lineLimit(1)
         }
-        .padding(.horizontal, 24)
+        .padding(.top, 20)
 
-        // 进度条
         ProgressSliderView(
           playbackClock: audioPlayer.playbackClock,
           onSeek: { audioPlayer.seek(to: $0) }
         )
-        .padding(.horizontal, 24)
+        .padding(.top, 17)
 
-        // 倍速选择（也可由 CLI 设置；重启默认恢复 1.0×）
-        let isNormalRate = abs(audioPlayer.playbackRate - 1.0) < 0.001
-        HStack {
-          Button {
-            let clickCount = NSApp.currentEvent?.clickCount ?? 1
-            if clickCount >= 2 {
-              audioPlayer.setPlaybackRate(1.0)
-              showRatePicker = false
-            } else {
-              showRatePicker.toggle()
-            }
-          } label: {
-            HStack(spacing: 6) {
-              Text(String(format: "倍速 %.2f×", audioPlayer.playbackRate))
-                .font(.caption)
-                .fontWeight(.semibold)
-                .foregroundColor(isNormalRate ? theme.mutedText : theme.accent)
-              Image(systemName: "chevron.down")
-                .font(.caption2)
-                .foregroundColor(theme.mutedText)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(Capsule().fill(theme.surface.opacity(0.6)))
-            .overlay(Capsule().stroke(theme.stroke, lineWidth: 1))
-          }
-          .buttonStyle(.plain)
-          .help("单击选择倍速；双击重置为 1.00×（重启恢复 1.0×）")
-          .popover(isPresented: $showRatePicker, arrowEdge: .bottom) {
-            VStack(alignment: .leading, spacing: 10) {
-              Text("倍速")
-                .font(.headline)
-
-              let rates: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
-              ForEach(rates, id: \.self) { rate in
-                Button {
-                  audioPlayer.setPlaybackRate(rate)
-                  showRatePicker = false
-                } label: {
-                  if abs(audioPlayer.playbackRate - rate) < 0.001 {
-                    Label(String(format: "%.2f×", rate), systemImage: "checkmark")
-                  } else {
-                    Text(String(format: "%.2f×", rate))
-                  }
+        HStack(spacing: 18) {
+          Menu {
+            let rates: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+            ForEach(rates, id: \.self) { rate in
+              Button {
+                audioPlayer.setPlaybackRate(rate)
+              } label: {
+                if abs(audioPlayer.playbackRate - rate) < 0.001 {
+                  Label(String(format: "%.2f×", rate), systemImage: "checkmark")
+                } else {
+                  Text(String(format: "%.2f×", rate))
                 }
               }
             }
-            .padding(12)
-            .frame(minWidth: 160)
+            Divider()
+            Button("重置为 1.00×") { audioPlayer.setPlaybackRate(1.0) }
+          } label: {
+            Label(String(format: "%.2f×", audioPlayer.playbackRate), systemImage: "speedometer")
+              .font(.system(size: 11, weight: .medium))
           }
+          .buttonStyle(.plain)
+          .help("播放速度")
+
+          Menu {
+            ForEach(PlaybackWeights.Level.allCases, id: \.rawValue) { level in
+              Button {
+                weights.setLevel(level, for: currentFile.url, scope: weightScope())
+              } label: {
+                if weights.level(for: currentFile.url, scope: weightScope()) == level {
+                  Label(weightLabel(level), systemImage: "checkmark")
+                } else {
+                  Text(weightLabel(level))
+                }
+              }
+            }
+          } label: {
+            Label(
+              weightLabel(weights.level(for: currentFile.url, scope: weightScope())),
+              systemImage: "dial.medium"
+            )
+            .font(.system(size: 11, weight: .medium))
+          }
+          .buttonStyle(.plain)
+          .help("随机权重（当前范围：\(weightScopeLabel())）")
+
+          Button {
+            playRandomTrack()
+          } label: {
+            Image(systemName: "die.face.5")
+              .font(.system(size: 12, weight: .medium))
+              .frame(width: 22, height: 22)
+              .contentShape(Rectangle())
+          }
+          .buttonStyle(.plain)
+          .disabled(
+            playlistManager.playbackScopePlayableCount() < 2
+              || audioPlayer.persistPlaybackState == false
+          )
+          .help(audioPlayer.persistPlaybackState == false ? "临时播放模式下不可切歌" : "随机选一首")
 
           Spacer()
 
-          WeightDotsView(level: weights.level(for: currentFile.url, scope: weightScope())) {
-            newLevel in
-            weights.setLevel(newLevel, for: currentFile.url, scope: weightScope())
+          if audioPlayer.lyricsTimeline != nil {
+            Label("歌词已载入", systemImage: "text.quote")
+              .font(.system(size: 11, weight: .medium))
           }
-          .padding(.vertical, 2)
-          .help("随机权重（当前范围：\(weightScopeLabel())）")
         }
-        .padding(.horizontal, 24)
-
-        // 歌词来源标签（如果有歌词）
-        if let timeline = audioPlayer.lyricsTimeline {
-          HStack(spacing: 12) {
-            Text(sourceLabel(for: timeline.source))
-              .font(.caption)
-              .foregroundColor(theme.mutedText)
-              .padding(.horizontal, 10)
-              .padding(.vertical, 6)
-              .background(
-                Capsule().fill(theme.surface.opacity(0.6))
-              )
-
-            Spacer()
-          }
-          .padding(.horizontal, 24)
-        }
+        .foregroundStyle(theme.stageTertiaryText)
+        .padding(.top, 12)
 
       } else {
-        VStack(spacing: 18) {
-          RoundedRectangle(cornerRadius: 16, style: .continuous)
-            .fill(theme.mutedSurface)
-            .overlay(
-              RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(theme.stroke, lineWidth: 1)
-            )
-            .overlay(
-              Image(systemName: "music.note")
-                .font(.system(size: 44, weight: .light))
-                .foregroundStyle(theme.mutedText)
-            )
-            .frame(width: 230, height: 230)
+        VStack(alignment: .leading, spacing: 18) {
+          AlbumArtworkView(image: nil, title: "MusicPlayer", artist: "本地音乐")
+            .frame(width: 300, height: 300)
+            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .shadow(color: Color.black.opacity(0.38), radius: 18, x: 0, y: 10)
 
-          VStack(spacing: 8) {
+          VStack(alignment: .leading, spacing: 6) {
             Text("等待播放")
-              .font(.system(size: 20, weight: .semibold))
-              .foregroundColor(.primary)
+              .font(.system(size: 26, weight: .semibold))
+              .foregroundColor(theme.stagePrimaryText)
 
-            Text("选择音乐文件开始聆听")
+            Text("添加音乐，开始你的本地唱片架")
               .font(.system(size: 14))
-              .foregroundColor(theme.mutedText)
+              .foregroundColor(theme.stageSecondaryText)
           }
         }
-        .frame(height: 290)
+        .frame(maxWidth: .infinity, alignment: .center)
       }
     }
-    .padding(.horizontal, 14)
-    .padding(.vertical, 8)
-    .onChange(of: audioPlayer.currentFile?.url) { _ in
-      if audioPlayer.persistPlaybackState == false {
-        showEphemeralTip = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
-          withAnimation { showEphemeralTip = false }
-        }
-      } else {
-        showEphemeralTip = false
-      }
-    }
+    .frame(maxWidth: 320)
+    .padding(.horizontal, 24)
+    .frame(maxWidth: .infinity)
   }
 
   private func weightScope() -> PlaybackWeights.Scope {
@@ -395,6 +353,17 @@ struct CurrentTrackView: View {
     }
   }
 
+  private func weightLabel(_ level: PlaybackWeights.Level) -> String {
+    "随机 \(String(format: "%.1f", level.multiplier))×"
+  }
+
+  private func playRandomTrack() {
+    guard audioPlayer.persistPlaybackState else { return }
+    if let randomFile = playlistManager.getRandomFileExcludingCurrent() {
+      audioPlayer.play(randomFile)
+    }
+  }
+
 }
 
 // MARK: - Lyrics Views
@@ -408,30 +377,23 @@ struct LyricsContainerView: View {
     VStack(alignment: .leading, spacing: 12) {
       HStack {
         Label("歌词", systemImage: "text.quote")
-          .font(.headline)
+          .font(.system(size: 13, weight: .semibold))
+          .foregroundStyle(theme.stageSecondaryText)
         Spacer()
-        // 仅在存在歌词时间轴时提供“显示/隐藏”开关
-        if audioPlayer.lyricsTimeline != nil {
-          Toggle(
-            isOn: Binding(get: { audioPlayer.showLyrics }, set: { audioPlayer.showLyrics = $0 })
-          ) {
-            Text(audioPlayer.showLyrics ? "显示" : "隐藏")
-              .font(.caption)
-              .foregroundColor(.secondary)
-          }
-          .toggleStyle(SwitchToggleStyle())
+        Button {
+          audioPlayer.showLyrics.toggle()
+        } label: {
+          Image(systemName: audioPlayer.showLyrics ? "eye" : "eye.slash")
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(theme.stageSecondaryText)
+            .frame(width: 26, height: 26)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .help(audioPlayer.showLyrics ? "隐藏歌词" : "显示歌词")
       }
-      .padding(.horizontal, 8)
 
-      // 无歌词：不显示歌词面板，仅展示“暂无歌词”，且不拦截滚动/悬停
-      if audioPlayer.lyricsTimeline == nil {
-        Text("暂无歌词")
-          .font(.subheadline)
-          .foregroundColor(.secondary)
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .padding(.horizontal, 8)
-      } else if audioPlayer.showLyrics {
+      if audioPlayer.showLyrics {
         Group {
           if let timeline = audioPlayer.lyricsTimeline {
             if timeline.isSynced {
@@ -446,16 +408,6 @@ struct LyricsContainerView: View {
           }
         }
         .frame(maxWidth: .infinity)
-        .padding(12)
-        .background(
-          RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .fill(theme.mutedSurface)
-            .overlay(
-              RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(theme.stroke, lineWidth: 1)
-            )
-        )
-        // 歌词面板展示区域
       }
     }
   }
@@ -512,16 +464,35 @@ struct SyncedLyricsView: View {
             autoFollowEnabled = true
             isUserScrolling = false
           } label: {
-            Label("定位当前句", systemImage: "location.viewfinder")
+            Label("当前句", systemImage: "location.viewfinder")
+              .font(.system(size: 11, weight: .semibold))
+              .foregroundStyle(theme.accent)
+              .frame(height: 26)
+              .contentShape(Rectangle())
           }
-          .buttonStyle(.bordered)
+          .buttonStyle(.plain)
 
-          Toggle(isOn: $autoFollowEnabled) {
-            Text("自动跟随")
-              .font(.caption)
-              .foregroundColor(.secondary)
+          Button {
+            autoFollowEnabled.toggle()
+            if autoFollowEnabled {
+              isUserScrolling = false
+              if let activeLineID {
+                proxy.scrollTo(activeLineID, anchor: .center)
+              }
+            }
+          } label: {
+            Label(
+              "自动跟随",
+              systemImage: autoFollowEnabled ? "location.fill" : "location.slash"
+            )
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(
+              autoFollowEnabled ? theme.stageSecondaryText : theme.stageTertiaryText
+            )
+            .frame(height: 26)
+            .contentShape(Rectangle())
           }
-          .toggleStyle(.switch)
+          .buttonStyle(.plain)
 
           Spacer()
 
@@ -611,19 +582,10 @@ struct SyncedLyricsView: View {
   }
 }
 
-private func sourceLabel(for source: LyricsSource) -> String {
-  switch source {
-  case .embeddedUnsynced: return "来源: 内嵌(静态)"
-  case .embeddedSynced: return "来源: 内嵌(动态)"
-  case .sidecarLRC(let url): return "来源: LRC (\(url.lastPathComponent))"
-  case .manual: return "来源: 手动"
-  }
-}
-
 struct AlbumArtworkView: View {
   let image: NSImage?
-  @Environment(\.colorScheme) private var colorScheme
-  private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+  let title: String
+  let artist: String
 
   var body: some View {
     Group {
@@ -631,17 +593,53 @@ struct AlbumArtworkView: View {
         Image(nsImage: image)
           .resizable()
           .aspectRatio(contentMode: .fill)
-          .clipShape(RoundedRectangle(cornerRadius: 16))
       } else {
-        RoundedRectangle(cornerRadius: 16)
-          .fill(theme.mutedSurface)
-          .overlay(
-            Image(systemName: "music.note")
-              .font(.system(size: 40, weight: .light))
-              .foregroundStyle(theme.mutedText)
-          )
+        GeometryReader { proxy in
+          let side = min(proxy.size.width, proxy.size.height)
+          ZStack(alignment: .topLeading) {
+            Color(red: 0.94, green: 0.36, blue: 0.31)
+
+            Circle()
+              .fill(Color.black.opacity(0.88))
+              .frame(width: side * 0.80, height: side * 0.80)
+              .overlay {
+                ZStack {
+                  ForEach(1..<7, id: \.self) { ring in
+                    Circle()
+                      .stroke(Color.white.opacity(0.055), lineWidth: 1)
+                      .padding(CGFloat(ring) * side * 0.035)
+                  }
+                  Circle()
+                    .fill(Color(red: 0.98, green: 0.71, blue: 0.35))
+                    .frame(width: side * 0.19, height: side * 0.19)
+                  Circle()
+                    .fill(Color.black.opacity(0.85))
+                    .frame(width: side * 0.035, height: side * 0.035)
+                }
+              }
+              .offset(x: side * 0.41, y: side * 0.31)
+
+            VStack(alignment: .leading, spacing: 3) {
+              Text(String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1)))
+                .font(.system(size: side * 0.30, weight: .black, design: .rounded))
+                .tracking(-3)
+                .foregroundStyle(Color.black.opacity(0.88))
+                .lineLimit(1)
+
+              Text(artist.isEmpty ? "LOCAL RECORDS" : artist.uppercased())
+                .font(.system(size: max(9, side * 0.035), weight: .bold))
+                .tracking(1.1)
+                .foregroundStyle(Color.black.opacity(0.68))
+                .lineLimit(1)
+            }
+            .padding(side * 0.08)
+            .frame(width: side * 0.63, alignment: .leading)
+          }
+        }
       }
     }
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel(image == nil ? "\(title) 的唱片封面占位图" : "\(title) 的专辑封面")
   }
 }
 
@@ -666,6 +664,7 @@ struct ProgressSliderView: View {
         }
       )
       .controlSize(.small)
+      .tint(theme.accent)
       .accessibilityLabel("播放进度")
       .accessibilityValue(formatTime(isEditing ? sliderValue : playbackClock.currentTime))
 
