@@ -3,9 +3,9 @@ import SwiftUI
 
 /// Semantic visual tokens for the album-first MusicPlayer interface.
 ///
-/// The listening stage is intentionally dark in both appearances; the library
-/// follows the system appearance. Album artwork is the only large decorative
-/// object, so routine chrome remains flat and inexpensive to render.
+/// The listening stage and library share one red-black room in both system
+/// appearances. Album artwork is the only large decorative object, so routine
+/// chrome remains flat and inexpensive to render.
 struct AppTheme {
   let scheme: ColorScheme
 
@@ -29,10 +29,15 @@ struct AppTheme {
 
   // MARK: - Structural backgrounds
 
-  var libraryBackground: Color {
-    scheme == .dark
-      ? Color(red: 0.075, green: 0.078, blue: 0.088)
-      : Color(red: 0.965, green: 0.962, blue: 0.958)
+  var libraryBackground: LinearGradient {
+    LinearGradient(
+      colors: [
+        Color(red: 0.105, green: 0.040, blue: 0.052),
+        Color(red: 0.058, green: 0.052, blue: 0.061),
+      ],
+      startPoint: .topLeading,
+      endPoint: .bottomTrailing
+    )
   }
 
   var nowPlayingBackground: Color {
@@ -41,11 +46,10 @@ struct AppTheme {
 
   /// Compatibility aliases used by secondary windows.
   var backgroundGradient: LinearGradient {
-    LinearGradient(
-      colors: [libraryBackground, libraryBackground],
-      startPoint: .top,
-      endPoint: .bottom
-    )
+    let color = scheme == .dark
+      ? Color(red: 0.075, green: 0.078, blue: 0.088)
+      : Color(red: 0.965, green: 0.962, blue: 0.958)
+    return LinearGradient(colors: [color, color], startPoint: .top, endPoint: .bottom)
   }
 
   var panelBackground: LinearGradient {
@@ -76,7 +80,7 @@ struct AppTheme {
   }
 
   var paneDivider: Color {
-    scheme == .dark ? Color.white.opacity(0.075) : Color.black.opacity(0.10)
+    accent.opacity(0.18)
   }
 
   var glowStroke: Color { accent.opacity(0.42) }

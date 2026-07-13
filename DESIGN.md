@@ -1,4 +1,4 @@
-# MusicPlayer 4.2 Design System
+# MusicPlayer 4.2.1 Design System
 
 ## Mode
 
@@ -20,10 +20,10 @@ colors, decorative glass, border-heavy regions, and perpetual animation.
 ## Composition
 
 - Wide windows use one strong asymmetric composition: a 410–500 point dark
-  listening stage and a flexible appearance-aware library.
-- The listening stage remains graphite in both system appearances. This gives
-  light mode a visual anchor instead of turning the whole window into a pale
-  form, while dark mode remains continuous and quiet.
+  listening stage and a flexible red-black library.
+- Both panes remain dark in every system appearance. A restrained wine-red cast
+  on the library connects it to the coral playback state without turning rows
+  into decorative cards.
 - Album artwork is the dominant object. When metadata has no artwork, render a
   designed record sleeve using the track title rather than an empty gray box.
 - Import, refresh, clear, scan, normalization, playback rate, and random weight
@@ -39,8 +39,8 @@ colors, decorative glass, border-heavy regions, and perpetual animation.
 - Brand accent: a single restrained coral red used for play state, selection,
   focus, and primary actions.
 - Listening stage: one solid deep graphite plane with no decorative gradient.
-- Library light appearance: warm near-white with charcoal labels.
-- Library dark appearance: neutral graphite with cool-white labels.
+- Library plane: a low-saturation wine-to-graphite gradient with cool-white
+  labels in both system appearances.
 - Warning and destructive colors remain semantic system colors.
 - Random-weight colors are visible only while editing a weight or when a track
   has a non-default override.
@@ -100,9 +100,9 @@ colors, decorative glass, border-heavy regions, and perpetual animation.
 
 ## Self-Critique
 
-1. A permanently dark listening stage can feel detached in light mode. Connect
-   the two panes through shared typography, the coral state color, and one clean
-   divider—not extra glass or gradients.
+1. A fully dark window can lose structure. Separate the listening stage and
+   library through a small temperature shift, shared typography, the coral state
+   color, and one clean divider—not extra glass or stacked surfaces.
 2. Artwork-free libraries are common, so the fallback sleeve must be a real
    composition. A gray note placeholder would collapse the entire direction.
 3. Hiding advanced functions can damage discoverability. Keep them in stable

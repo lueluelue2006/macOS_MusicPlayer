@@ -42,6 +42,7 @@ struct ContentView: View {
                         .frame(height: 1)
 
                     PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
+                        .environment(\.colorScheme, .dark)
                         .frame(minHeight: 200)
                         .background(theme.libraryBackground)
                 }
@@ -57,6 +58,7 @@ struct ContentView: View {
                         .frame(width: 1)
 
                     PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
+                        .environment(\.colorScheme, .dark)
                         .frame(minWidth: 480)
                         .background(theme.libraryBackground)
                 }
