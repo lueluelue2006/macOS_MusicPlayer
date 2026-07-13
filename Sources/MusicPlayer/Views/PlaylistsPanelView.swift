@@ -6,6 +6,7 @@ struct PlaylistsPanelView: View {
   @ObservedObject var playlistManager: PlaylistManager
   @ObservedObject var playlistsStore: PlaylistsStore
 
+  let locateNowPlayingRequestID: Int
   let onRequestEditMetadata: (AudioFile) -> Void
 
   @ObservedObject private var weights = PlaybackWeights.shared
@@ -14,12 +15,14 @@ struct PlaylistsPanelView: View {
   @State private var trackSearchText: String = ""
   @State private var loadedTracks: [AudioFile] = []
   @State private var visibleTracks: [AudioFile] = []
+  @State private var visibleTracksRevision: UInt64 = 0
   @State private var trackUnplayableReasons: [String: String] = [:]
   @State private var isLoadingTracks: Bool = false
   @State private var loadTask: Task<Void, Never>?
   @State private var playlistScrollTargetID: String?
   @State private var playlistScrollTask: Task<Void, Never>?
   @State private var playlistTableView: NSTableView?
+  @State private var handledLocateNowPlayingRequestID: Int = 0
 
   // Add-from-queue multi-select sheet
   @State private var showAddFromQueueSheet: Bool = false
@@ -81,6 +84,7 @@ struct PlaylistsPanelView: View {
       playlistsStore.loadIfNeeded()
       reloadSelectedPlaylist()
       refreshVisibleTracks()
+      handlePendingLocateNowPlayingRequest()
     }
     .onChange(of: playlistsStore.selectedPlaylistID) { _ in
       reloadSelectedPlaylist()
@@ -94,7 +98,7 @@ struct PlaylistsPanelView: View {
     .onChange(of: weights.revision) { _ in
       refreshVisibleTracks()
     }
-    .onReceive(sortState.objectWillChange) { _ in
+    .onChange(of: sortState.revision) { _ in
       refreshVisibleTracks()
     }
     .onReceive(NotificationCenter.default.publisher(for: .requestDismissAllSheets)) { _ in
@@ -103,6 +107,9 @@ struct PlaylistsPanelView: View {
     .onReceive(NotificationCenter.default.publisher(for: .requestLocateNowPlayingInPlaylist)) { _ in
       guard let playlist = selectedPlaylist else { return }
       requestScrollToNowPlayingInPlaylist(playlist)
+    }
+    .onChange(of: locateNowPlayingRequestID) { _ in
+      handlePendingLocateNowPlayingRequest()
     }
   }
 
@@ -248,7 +255,10 @@ struct PlaylistsPanelView: View {
                     }
                     onRequestEditMetadata(fileToEdit)
                   },
-                  weightScope: .playlist(playlist.id),
+                  weightLevel: weights.level(for: file.url, scope: .playlist(playlist.id)),
+                  onWeightSelect: { newLevel in
+                    weights.setLevel(newLevel, for: file.url, scope: .playlist(playlist.id))
+                  },
                   showsWeightControl: true
                 )
                 .id(file.id)
@@ -274,7 +284,7 @@ struct PlaylistsPanelView: View {
             guard let target else { return }
             performPlaylistScrollSequence(targetID: target, proxy: proxy)
           }
-          .onChange(of: loadedTracks.map(\.id)) { _ in
+          .onChange(of: visibleTracksRevision) { _ in
             guard let target = playlistScrollTargetID else { return }
             performPlaylistScrollSequence(targetID: target, proxy: proxy)
           }
@@ -362,7 +372,7 @@ struct PlaylistsPanelView: View {
           Button {
             let result = weights.syncPlaylistOverridesToQueue(from: playlist.id)
             if result.total == 0 {
-              postToast(title: "歌单没有设置随机权重", subtitle: "先在歌单里点一下 5 个方块设置权重", kind: "info")
+              postToast(title: "歌单没有设置随机权重", subtitle: "先在歌单里点一下 6 个方块设置权重", kind: "info")
               return
             }
             if result.changed == 0 {
@@ -521,7 +531,11 @@ struct PlaylistsPanelView: View {
     guard let playlist = selectedPlaylist else { return }
     let playlistID = playlist.id
     let paths = playlist.tracks.map(\.path)
-    guard !paths.isEmpty else { return }
+    guard !paths.isEmpty else {
+      playlistManager.updatePlaybackScopePlaylistTracksIfActive(
+        playlistID, trackURLsInOrder: [])
+      return
+    }
 
     isLoadingTracks = true
 
@@ -612,6 +626,7 @@ struct PlaylistsPanelView: View {
       let finalTracks = results.compactMap { $0 }
       let finalReasons = reasons
       await MainActor.run {
+        guard self.selectedPlaylist?.id == playlistID else { return }
         if Task.isCancelled { return }
         self.loadedTracks = finalTracks
         self.trackUnplayableReasons = finalReasons
@@ -658,10 +673,22 @@ struct PlaylistsPanelView: View {
 
     guard let playlist = selectedPlaylist else {
       visibleTracks = base
+      visibleTracksRevision &+= 1
       return
     }
     visibleTracks = sortState.option(for: .playlists).applying(
       to: base, weightScope: .playlist(playlist.id))
+    visibleTracksRevision &+= 1
+  }
+
+  @MainActor
+  private func handlePendingLocateNowPlayingRequest() {
+    guard locateNowPlayingRequestID != 0,
+      locateNowPlayingRequestID != handledLocateNowPlayingRequestID,
+      let playlist = selectedPlaylist
+    else { return }
+    handledLocateNowPlayingRequestID = locateNowPlayingRequestID
+    requestScrollToNowPlayingInPlaylist(playlist)
   }
 
   // MARK: - Add from queue sheet

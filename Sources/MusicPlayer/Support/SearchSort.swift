@@ -49,6 +49,7 @@ final class SearchSortState: ObservableObject {
 
     private let defaultsKey = "searchSort.options.v1"
     @Published private var optionsByTarget: [String: SearchSortOption] = [:]
+    @Published private(set) var revision: Int = 0
 
     private init() {
         load()
@@ -61,6 +62,7 @@ final class SearchSortState: ObservableObject {
     func setOption(_ option: SearchSortOption, for target: SearchFocusTarget) {
         optionsByTarget[target.rawValue] = option
         persist()
+        revision += 1
     }
 
     private func load() {

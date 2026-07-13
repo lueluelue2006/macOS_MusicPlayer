@@ -50,7 +50,8 @@ final class PlaylistManager: ObservableObject {
         let currentIndex: Int
     }
     private let playlistFileName = "playlist.json"
-    private let isRunningRegressionTests = ProcessInfo.processInfo.environment["MUSICPLAYER_RUN_REGRESSION_TESTS"] == "1"
+    private let playlistFileURLOverride: URL?
+    private let isRunningRegressionTests: Bool
     private let playlistIOQueue = DispatchQueue(label: "playlist.persistence", qos: .utility)
     private let playlistIOQueueKey = DispatchSpecificKey<Void>()
     private let metadataGate = ConcurrencyGate(maxConcurrent: 4) // 限制元数据加载并发
@@ -69,7 +70,10 @@ final class PlaylistManager: ObservableObject {
     @MainActor private var pendingDurationURLKeys: Set<String> = []
     @MainActor private var pendingDurationIndex: Int = 0
 
-    init() {
+    init(playlistFileURLOverride: URL? = nil, disablePersistence: Bool = false) {
+        self.playlistFileURLOverride = playlistFileURLOverride
+        self.isRunningRegressionTests = disablePersistence
+            || ProcessInfo.processInfo.environment["MUSICPLAYER_RUN_REGRESSION_TESTS"] == "1"
         playlistIOQueue.setSpecific(key: playlistIOQueueKey, value: ())
         loadScanSubfoldersPreference()
 
@@ -110,6 +114,10 @@ final class PlaylistManager: ObservableObject {
     /// keeping the existing shuffle queue as stable as possible.
     func updatePlaybackScopePlaylistTracksIfActive(_ playlistID: UserPlaylist.ID, trackURLsInOrder: [URL]) {
         guard playbackScope == .playlist(playlistID) else { return }
+        guard !trackURLsInOrder.isEmpty else {
+            setPlaybackScopeQueue()
+            return
+        }
 
         let oldKeys = playbackPlaylistTrackKeys
         let newKeys = trackURLsInOrder.map { pathKey($0) }
@@ -854,6 +862,14 @@ final class PlaylistManager: ObservableObject {
         resetShuffleQueue()
         savePlaylist() // 保存播放列表
     }
+
+    func nextFileAfterRemovingQueueItem(atDeletedIndex deletedIndex: Int) -> AudioFile? {
+        guard !audioFiles.isEmpty else { return nil }
+        let nextIndex = audioFiles.indices.contains(deletedIndex) ? deletedIndex : 0
+        currentIndex = nextIndex
+        savePlaylist()
+        return audioFiles[nextIndex]
+    }
     
     @MainActor
     func clearAllFiles() {
@@ -1064,7 +1080,7 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func getRandomFileInQueue() -> AudioFile? {
-        createShuffleQueue()
+        createShuffleQueue(startFromRandom: true)
         if !shuffleQueue.isEmpty {
             currentIndex = shuffleQueue[0]
             shuffleIndex = 1
@@ -1256,10 +1272,23 @@ final class PlaylistManager: ObservableObject {
     }
 
     // 洗牌算法
-    private func createShuffleQueue() {
+    private func createShuffleQueue(startFromRandom: Bool = false) {
         let playable = audioFiles.indices.filter { !isUnplayableIndex($0) }
-        shuffleQueue = weightedShuffleIndices(playable, scope: .queue)
-        shuffleIndex = 0
+        guard !playable.isEmpty else {
+            shuffleQueue.removeAll(keepingCapacity: true)
+            shuffleIndex = 0
+            return
+        }
+
+        if startFromRandom || !playable.contains(currentIndex) || playable.count == 1 {
+            shuffleQueue = weightedShuffleIndices(playable, scope: .queue)
+            shuffleIndex = 0
+            return
+        }
+
+        let rest = weightedShuffleIndices(playable.filter { $0 != currentIndex }, scope: .queue)
+        shuffleQueue = [currentIndex] + rest
+        shuffleIndex = 1
     }
 
     private func createPlaylistShuffleQueue(startFromRandom: Bool = false) {
@@ -1721,7 +1750,7 @@ final class PlaylistManager: ObservableObject {
         await MainActor.run {
             self.audioFiles = restoredFilesSnapshot
             self.invalidateQueueIndexCache()
-            self.currentIndex = 0
+            self.currentIndex = min(max(saved.currentIndex, 0), restoredFilesSnapshot.count - 1)
             self.updateFilteredFiles()
             self.resetShuffleQueue()
             self.enqueueDurationPrefetch(for: durationPrefetchURLs)
@@ -1791,6 +1820,14 @@ final class PlaylistManager: ObservableObject {
         }
     }
 
+    /// Waits for restore follow-up work so tests can clean temporary cache entries
+    /// deterministically before the test process exits.
+    func waitForBackgroundRestoreWorkForTesting() async {
+        await restoredMetadataHydrationTask?.value
+        let durationTask = await MainActor.run { durationPrefetchTask }
+        await durationTask?.value
+    }
+
     private func loadSavedPlaylistSnapshot() -> SavedPlaylist? {
         // 优先从磁盘读取
         if let disk = loadSavedPlaylistFromDisk() {
@@ -1855,6 +1892,19 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func playlistFileURL() -> URL? {
+        if let playlistFileURLOverride {
+            let dir = playlistFileURLOverride.deletingLastPathComponent()
+            if !FileManager.default.fileExists(atPath: dir.path) {
+                do {
+                    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                } catch {
+                    debugLog("创建测试播放列表目录失败: \(error)")
+                    return nil
+                }
+            }
+            return playlistFileURLOverride
+        }
+
         let fm = FileManager.default
         guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             return nil

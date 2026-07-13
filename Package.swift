@@ -33,6 +33,10 @@ let package = Package(
         .executableTarget(
             name: "MusicPlayerCLI",
             dependencies: ["MusicPlayerIPC"]
+        ),
+        .testTarget(
+            name: "MusicPlayerTests",
+            dependencies: ["MusicPlayer"]
         )
     ]
 )

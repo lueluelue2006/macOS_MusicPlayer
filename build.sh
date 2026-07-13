@@ -7,6 +7,10 @@ set -e
 
 echo "🎵 开始构建 macOS 音乐播放器..."
 
+# 以脚本所在目录为工作目录，避免外部 cwd 影响相对路径清理和产物位置
+SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
 VERSION="$(tr -d '[:space:]' < VERSION)"
 if [[ -z "$VERSION" ]]; then
     echo "❌ 错误: VERSION 文件为空"
@@ -35,11 +39,13 @@ rm -rf MusicPlayer.app
 echo "🔨 构建项目..."
 BUILD_JOBS="${SWIFT_BUILD_JOBS:-1}"
 echo "   使用 ${BUILD_JOBS} 个并发编译任务（可通过 SWIFT_BUILD_JOBS 覆盖）"
-if swift build -c release --jobs "${BUILD_JOBS}"; then
+SWIFT_BUILD_ARGS=(-c release --jobs "${BUILD_JOBS}")
+
+if swift build "${SWIFT_BUILD_ARGS[@]}"; then
   echo "✅ SwiftPM 构建成功"
 else
   echo "⚠️  SwiftPM 构建失败，尝试使用 --disable-sandbox 重新构建…"
-  swift build --disable-sandbox -c release --jobs "${BUILD_JOBS}"
+  swift build --disable-sandbox "${SWIFT_BUILD_ARGS[@]}"
 fi
 
 # 创建应用包结构
@@ -48,7 +54,8 @@ mkdir -p MusicPlayer.app/Contents/MacOS
 mkdir -p MusicPlayer.app/Contents/Resources
 
 # 复制可执行文件
-cp .build/release/MusicPlayer MusicPlayer.app/Contents/MacOS/
+cp ".build/release/MusicPlayer" "MusicPlayer.app/Contents/MacOS/"
+cp ".build/release/musicplayerctl" "MusicPlayer.app/Contents/MacOS/"
 
 # 复制应用图标
 if [ -f "AppIcon.icns" ]; then
@@ -139,6 +146,7 @@ EOF
 
 # 设置可执行权限
 chmod +x MusicPlayer.app/Contents/MacOS/MusicPlayer
+chmod +x MusicPlayer.app/Contents/MacOS/musicplayerctl
 
 # 尝试进行临时(adhoc)签名以提升通知注册可靠性
 echo "🔏 对应用进行临时签名(adhoc)…"

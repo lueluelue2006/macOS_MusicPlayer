@@ -460,7 +460,7 @@ final class IPCServer {
                 if let currentURL, currentURL == urlToRemove {
                     audioPlayer.handleCurrentTrackRemoved(
                         remainingFiles: playlistManager.audioFiles,
-                        playNext: { self.playlistManager.nextFile(isShuffling: false) },
+                        playNext: { self.playlistManager.nextFileAfterRemovingQueueItem(atDeletedIndex: idx) },
                         playRandom: { self.playlistManager.getRandomFile() }
                     )
                 }
@@ -526,6 +526,16 @@ final class IPCServer {
                 guard idx >= 0, idx < playlistManager.audioFiles.count else { return nil }
                 return playlistManager.audioFiles[idx].url
             }
+            let deletedCurrentIndex: Int? = currentURL.flatMap { current in
+                indicesToRemove.first { idx in
+                    idx >= 0 &&
+                    idx < playlistManager.audioFiles.count &&
+                    playlistManager.audioFiles[idx].url == current
+                }
+            }
+            let adjustedDeletedCurrentIndex = deletedCurrentIndex.map { deletedIndex in
+                deletedIndex - indicesToRemove.filter { $0 < deletedIndex }.count
+            }
 
             for idx in indicesToRemove.sorted(by: >) {
                 if idx >= 0, idx < playlistManager.audioFiles.count {
@@ -536,7 +546,11 @@ final class IPCServer {
             if let currentURL, urlsToRemove.contains(currentURL) {
                 audioPlayer.handleCurrentTrackRemoved(
                     remainingFiles: playlistManager.audioFiles,
-                    playNext: { self.playlistManager.nextFile(isShuffling: false) },
+                    playNext: {
+                        self.playlistManager.nextFileAfterRemovingQueueItem(
+                            atDeletedIndex: adjustedDeletedCurrentIndex ?? 0
+                        )
+                    },
                     playRandom: { self.playlistManager.getRandomFile() }
                 )
             }
@@ -1507,9 +1521,13 @@ final class IPCServer {
     private func parseWeightLevel(_ raw: String) -> PlaybackWeights.Level? {
         let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if let numeric = Int(normalized) {
-            return PlaybackWeights.Level(rawValue: max(0, min(4, numeric)))
+            return PlaybackWeights.Level(rawValue: max(
+                PlaybackWeights.Level.minimumStoredRawValue,
+                min(PlaybackWeights.Level.maximumStoredRawValue, numeric)
+            ))
         }
         switch normalized {
+        case "white", "w", "low", "half", "0.5", "0.5x": return .white
         case "green", "g": return .green
         case "blue", "b": return .blue
         case "purple", "p": return .purple

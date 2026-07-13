@@ -20,7 +20,7 @@ struct WeightDotsView: View {
                         .frame(width: 10, height: 10)
                         .overlay(
                             RoundedRectangle(cornerRadius: 2, style: .continuous)
-                                .stroke(theme.stroke.opacity(isSelected ? 0.78 : 0.55), lineWidth: 1.0)
+                                .stroke(strokeColor(for: l, isSelected: isSelected), lineWidth: l == .white && isSelected ? 1.2 : 1.0)
                         )
                         .shadow(color: isSelected ? color(for: l).opacity(0.28) : .clear, radius: 4, x: 0, y: 0)
                         // Bigger hitbox, but keep layout tight.
@@ -42,12 +42,20 @@ struct WeightDotsView: View {
 
     private func color(for level: PlaybackWeights.Level) -> Color {
         switch level {
+        case .white: return colorScheme == .dark ? Color.white : Color(white: 0.86)
         case .green: return Color.green
         case .blue: return Color.blue
         case .purple: return Color.purple
         case .gold: return Color.yellow
         case .red: return Color.red
         }
+    }
+
+    private func strokeColor(for level: PlaybackWeights.Level, isSelected: Bool) -> Color {
+        if level == .white && isSelected {
+            return colorScheme == .dark ? Color.white.opacity(0.9) : Color.gray.opacity(0.9)
+        }
+        return theme.stroke.opacity(isSelected ? 0.78 : 0.55)
     }
 
     private func helpText(for level: PlaybackWeights.Level) -> String {

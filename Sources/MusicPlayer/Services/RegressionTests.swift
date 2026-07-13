@@ -5,6 +5,23 @@ enum RegressionTests {
     private static let runFlagKey = "MUSICPLAYER_RUN_REGRESSION_TESTS"
     private static let exitFlagKey = "MUSICPLAYER_EXIT_AFTER_REGRESSION_TESTS"
 
+    private final class ThreadSafeFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+
+        func set() {
+            lock.lock()
+            value = true
+            lock.unlock()
+        }
+
+        func get() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
     static func runIfEnabled() async {
         let env = ProcessInfo.processInfo.environment
         guard env[runFlagKey] == "1" else { return }
@@ -16,7 +33,8 @@ enum RegressionTests {
         }
     }
 
-    static func runAll() async {
+    @discardableResult
+    static func runAll() async -> Bool {
         print("\n🧪 Starting Regression Tests...")
         print(String(repeating: "=", count: 58))
 
@@ -27,7 +45,12 @@ enum RegressionTests {
             ("PathKey migration incremental trigger", testPathKeyMigrationIncrementalTrigger),
             ("Ephemeral playback persist-state isolation", testEphemeralPlaybackPersistStateIsolation),
             ("Playback scope restore from playlist", testPlaybackScopeRestoreFromPlaylist),
-            ("Queue index rejects negative values", testQueueIndexRejectsNegativeValues)
+            ("Queue restore keeps saved index", testQueueRestoreKeepsSavedIndex),
+            ("Playlist manager rejects negative indices", testPlaylistManagerRejectsNegativeIndices),
+            ("Queue shuffle does not repeat direct selection", testQueueShuffleDoesNotRepeatDirectSelection),
+            ("Restore probe failure does not auto-advance", testRestoreProbeFailureDoesNotAutoAdvance),
+            ("Delete-current sequential fallback keeps next item", testDeleteCurrentSequentialFallbackKeepsNextItem),
+            ("Playback weight white tier preserves green default", testPlaybackWeightWhiteTierPreservesGreenDefault)
         ]
 
         for (name, test) in tests {
@@ -48,6 +71,7 @@ enum RegressionTests {
         } else {
             print("⚠️ Regression failures detected")
         }
+        return failed == 0
     }
 
     private static func testPathKeyMigrationIncrementalTrigger() async -> Bool {
@@ -186,7 +210,7 @@ enum RegressionTests {
                 return instance
             }
 
-            let manager = PlaylistManager()
+            let manager = PlaylistManager(disablePersistence: true)
             defaults.set("playlist", forKey: kindKey)
             defaults.set(playlist.id.uuidString, forKey: playlistIDKey)
 
@@ -199,6 +223,10 @@ enum RegressionTests {
                 manager.audioFiles.contains(where: { PathKey.canonical(for: $0.url) == PathKey.canonical(for: trackURL) })
             }
 
+            await manager.waitForBackgroundRestoreWorkForTesting()
+            await MetadataCache.shared.remove(for: trackURL)
+            await DurationCache.shared.remove(for: trackURL)
+            try? await Task.sleep(nanoseconds: 700_000_000)
             return scopeIsPlaylist && queueContainsTrack
         } catch {
             print("   playback scope test error: \(error)")
@@ -206,12 +234,152 @@ enum RegressionTests {
         }
     }
 
-    private static func testQueueIndexRejectsNegativeValues() async -> Bool {
-        await MainActor.run {
-            let manager = PlaylistManager()
-            guard manager.selectFile(at: -1) == nil else { return false }
-            manager.removeFile(at: -1)
-            return manager.audioFiles.isEmpty
+    private static func testQueueRestoreKeepsSavedIndex() async -> Bool {
+        let fm = FileManager.default
+        let tempRoot = fm.temporaryDirectory.appendingPathComponent("musicplayer-regression-queue-index-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: tempRoot) }
+
+        do {
+            try fm.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+            let urls = try (0..<3).map { idx -> URL in
+                let url = tempRoot.appendingPathComponent("track-\(idx).mp3", isDirectory: false)
+                try Data("x".utf8).write(to: url)
+                return url
+            }
+            let playlistURL = tempRoot.appendingPathComponent("playlist.json", isDirectory: false)
+            let payload: [String: Any] = [
+                "paths": urls.map(\.path),
+                "currentIndex": 2
+            ]
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+            try data.write(to: playlistURL, options: .atomic)
+
+            let manager = PlaylistManager(
+                playlistFileURLOverride: playlistURL,
+                disablePersistence: true
+            )
+            await manager.loadSavedPlaylist()
+            await manager.waitForBackgroundRestoreWorkForTesting()
+            let passed = await MainActor.run {
+                manager.audioFiles.count == 3 && manager.currentIndex == 2
+            }
+            for url in urls {
+                await MetadataCache.shared.remove(for: url)
+                await DurationCache.shared.remove(for: url)
+            }
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            return passed
+        } catch {
+            print("   queue restore index test error: \(error)")
+            return false
         }
+    }
+
+    private static func testPlaylistManagerRejectsNegativeIndices() async -> Bool {
+        let manager = PlaylistManager(disablePersistence: true)
+        let url = URL(fileURLWithPath: "/tmp/musicplayer-regression-negative-\(UUID().uuidString).mp3")
+        let file = AudioFile(
+            url: url,
+            metadata: AudioMetadata(title: "x", artist: "x", album: "x", year: nil, genre: nil, artwork: nil)
+        )
+
+        manager.audioFiles = [file]
+        let selected = manager.selectFile(at: -1)
+        manager.removeFile(at: -1)
+
+        return selected == nil && manager.audioFiles.count == 1 && manager.currentIndex == 0
+    }
+
+    private static func testQueueShuffleDoesNotRepeatDirectSelection() async -> Bool {
+        let manager = PlaylistManager(disablePersistence: true)
+        let files = (0..<4).map { idx in
+            AudioFile(
+                url: URL(fileURLWithPath: "/tmp/musicplayer-regression-shuffle-\(idx)-\(UUID().uuidString).mp3"),
+                metadata: AudioMetadata(title: "\(idx)", artist: "x", album: "x", year: nil, genre: nil, artwork: nil)
+            )
+        }
+        manager.audioFiles = files
+        manager.currentIndex = 1
+
+        guard let next = manager.peekNextFile(isShuffling: true) else { return false }
+        return next.url != files[1].url
+    }
+
+    private static func testRestoreProbeFailureDoesNotAutoAdvance() async -> Bool {
+        let player = await MainActor.run { AudioPlayer() }
+        let missingURL = URL(fileURLWithPath: "/tmp/musicplayer-regression-restore-missing-\(UUID().uuidString).mp3")
+        let file = AudioFile(
+            url: missingURL,
+            metadata: AudioMetadata(title: "missing", artist: "x", album: "x", year: nil, genre: nil, artwork: nil)
+        )
+
+        let flag = ThreadSafeFlag()
+        let observer = NotificationCenter.default.addObserver(
+            forName: .audioPlayerDidFinish,
+            object: nil,
+            queue: .main
+        ) { _ in
+            flag.set()
+        }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+            Task { @MainActor in
+                player.stopAndClearCurrent(clearLastPlayed: false)
+            }
+        }
+
+        await MainActor.run {
+            player.play(file, autostart: false, bypassConfirm: true)
+        }
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        return !flag.get()
+    }
+
+    private static func testDeleteCurrentSequentialFallbackKeepsNextItem() async -> Bool {
+        let manager = PlaylistManager(disablePersistence: true)
+        let files = (0..<3).map { idx in
+            AudioFile(
+                url: URL(fileURLWithPath: "/tmp/musicplayer-regression-delete-\(idx)-\(UUID().uuidString).mp3"),
+                metadata: AudioMetadata(title: "\(idx)", artist: "x", album: "x", year: nil, genre: nil, artwork: nil)
+            )
+        }
+        manager.audioFiles = files
+        manager.currentIndex = 0
+        manager.removeFile(at: 0)
+
+        guard let next = manager.nextFileAfterRemovingQueueItem(atDeletedIndex: 0) else {
+            return false
+        }
+        return next.url == files[1].url && manager.currentIndex == 0
+    }
+
+    private static func testPlaybackWeightWhiteTierPreservesGreenDefault() async -> Bool {
+        let fm = FileManager.default
+        let tempRoot = fm.temporaryDirectory.appendingPathComponent("musicplayer-regression-weights-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: tempRoot) }
+
+        let weights = PlaybackWeights(cacheFileURLOverride: tempRoot.appendingPathComponent("playback-weights.json"))
+        let url = URL(fileURLWithPath: "/tmp/musicplayer-regression-weight-\(UUID().uuidString).mp3")
+        let playlistID = UUID()
+
+        guard PlaybackWeights.Level.allCases.prefix(2).elementsEqual([.white, .green]) else { return false }
+        guard weights.level(for: url, scope: .queue) == .green else { return false }
+        guard PlaybackWeights.Level.white.rawValue == -1,
+              PlaybackWeights.Level.green.rawValue == 0,
+              PlaybackWeights.Level.white.multiplier == 0.5,
+              PlaybackWeights.Level.green.multiplier == 1.0
+        else { return false }
+
+        weights.setLevel(.white, for: url, scope: .queue)
+        guard weights.level(for: url, scope: .queue) == .white else { return false }
+
+        weights.setLevel(.green, for: url, scope: .queue)
+        guard weights.level(for: url, scope: .queue) == .green else { return false }
+
+        weights.setLevel(.white, for: url, scope: .playlist(playlistID))
+        let sync = weights.syncPlaylistOverridesToQueue(from: playlistID)
+        return sync.total == 1 &&
+            sync.changed == 1 &&
+            weights.level(for: url, scope: .queue) == .white
     }
 }

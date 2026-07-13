@@ -9,6 +9,10 @@ final class PlaybackClock: ObservableObject {
     @Published var duration: TimeInterval = 0
 }
 
+private struct WeakAudioPlayerBox: @unchecked Sendable {
+    weak var player: AudioPlayer?
+}
+
 final class AudioPlayer: NSObject, ObservableObject {
     let playbackClock = PlaybackClock()
     @Published var currentFile: AudioFile?
@@ -536,7 +540,7 @@ final class AudioPlayer: NSObject, ObservableObject {
                             "message": reason
                         ]
                     )
-                    if !isLoop {
+                    if autostart && !isLoop {
                         NotificationCenter.default.post(name: .audioPlayerDidFinish, object: nil)
                     }
                 }
@@ -666,7 +670,7 @@ final class AudioPlayer: NSObject, ObservableObject {
                             "message": "加载超时(20s)：\(url.lastPathComponent)"
                         ]
                     )
-                    if !self.isLooping {
+                    if autostart && !self.isLooping {
                         NotificationCenter.default.post(name: .audioPlayerDidFinish, object: nil)
                     }
                 }
@@ -682,7 +686,7 @@ final class AudioPlayer: NSObject, ObservableObject {
                             "message": "播放失败：\(url.lastPathComponent)\n\(error.localizedDescription)"
                         ]
                     )
-                    if !self.isLooping {
+                    if autostart && !self.isLooping {
                         NotificationCenter.default.post(name: .audioPlayerDidFinish, object: nil)
                     }
                 }
@@ -1659,11 +1663,12 @@ extension AudioPlayer {
             self.volumePreanalysisCurrentFileName = ""
         }
 
-	        volumePreanalysisTask = Task.detached(priority: .utility) { [weak self] in
-	            guard let self else { return }
-	            let analysisQueue = (reason == .autoIdle) ? self.preanalysisQueue : self.normalizationQueue
-	            var completed = 0
-	            for url in targets {
+        volumePreanalysisTask = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let analysisQueue = (reason == .autoIdle) ? self.preanalysisQueue : self.normalizationQueue
+            let playerBox = WeakAudioPlayerBox(player: self)
+            var completed = 0
+            for url in targets {
                 if Task.isCancelled { break }
                 if self.currentVolumePreanalysisGeneration() != generation { break }
                 await MainActor.run {
@@ -1671,28 +1676,25 @@ extension AudioPlayer {
                     self.volumePreanalysisCurrentFileName = url.lastPathComponent
                 }
 
-	                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-	                    // Preserve the dedicated serial analysis queues without importing
-	                    // AudioPlayer's non-Sendable UI state into a @Sendable closure.
-	                    let workItem = DispatchWorkItem { [weak self] in
-	                        guard let self else {
-	                            continuation.resume()
-	                            return
-                        }
-                        if self.currentVolumePreanalysisGeneration() != generation {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    analysisQueue.async { [playerBox] in
+                        guard let player = playerBox.player else {
                             continuation.resume()
                             return
                         }
-                        _ = self.calculateNormalizedVolume(
+                        if player.currentVolumePreanalysisGeneration() != generation {
+                            continuation.resume()
+                            return
+                        }
+                        _ = player.calculateNormalizedVolume(
                             for: url,
-                            cancellationCheck: { [weak self] in
-                                guard let self else { return true }
-                                return self.currentVolumePreanalysisGeneration() != generation
+                            cancellationCheck: { [playerBox] in
+                                guard let player = playerBox.player else { return true }
+                                return player.currentVolumePreanalysisGeneration() != generation
                             }
-	                        )
-	                        continuation.resume()
-	                    }
-	                    analysisQueue.async(execute: workItem)
+                        )
+                        continuation.resume()
+                    }
                 }
 
                 if Task.isCancelled { break }
