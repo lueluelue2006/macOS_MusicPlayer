@@ -110,7 +110,7 @@ private struct TransportIconButton: View {
         .foregroundStyle(
           isActive
             ? theme.accent
-            : Color.white.opacity(isHovered ? 0.94 : 0.58)
+            : (isHovered ? theme.stagePrimaryText : theme.stageSecondaryText)
         )
         .frame(width: 34, height: 34)
         .contentShape(Rectangle())
@@ -161,7 +161,7 @@ struct AudioControlsView: View {
         .frame(width: 30, alignment: .trailing)
 
       Rectangle()
-        .fill(Color.white.opacity(0.10))
+        .fill(theme.stroke)
         .frame(width: 1, height: 20)
         .padding(.horizontal, 3)
 

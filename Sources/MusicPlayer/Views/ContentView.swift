@@ -33,7 +33,6 @@ struct ContentView: View {
             if geometry.size.width < 920 {
                 VStack(spacing: 0) {
                     PlayerView(audioPlayer: audioPlayer, playlistManager: playlistManager)
-                        .environment(\.colorScheme, .dark)
                         .frame(height: max(260, geometry.size.height * 0.48))
                         .background(theme.nowPlayingBackground)
 
@@ -42,14 +41,12 @@ struct ContentView: View {
                         .frame(height: 1)
 
                     PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
-                        .environment(\.colorScheme, .dark)
                         .frame(minHeight: 200)
                         .background(theme.libraryBackground)
                 }
             } else {
                 HStack(spacing: 0) {
                     PlayerView(audioPlayer: audioPlayer, playlistManager: playlistManager)
-                        .environment(\.colorScheme, .dark)
                         .frame(width: min(max(410, geometry.size.width * 0.30), 500))
                         .background(theme.nowPlayingBackground)
 
@@ -58,7 +55,6 @@ struct ContentView: View {
                         .frame(width: 1)
 
                     PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
-                        .environment(\.colorScheme, .dark)
                         .frame(minWidth: 480)
                         .background(theme.libraryBackground)
                 }

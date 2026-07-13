@@ -74,7 +74,7 @@ struct PlayerView: View {
           .padding(12)
           .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-              .fill(Color.white.opacity(0.06))
+              .fill(theme.surface)
           )
           .padding(.horizontal, 24)
           .padding(.bottom, 16)
@@ -92,7 +92,7 @@ struct PlayerView: View {
 
         if audioPlayer.lyricsTimeline != nil {
           Rectangle()
-            .fill(Color.white.opacity(0.08))
+            .fill(theme.stroke)
             .frame(height: 1)
             .padding(.horizontal, 28)
             .padding(.top, 24)
@@ -146,7 +146,7 @@ struct FileSelectionView: View {
         Text(isLibraryEmpty ? "添加音乐" : "导入")
           .font(.system(size: 12, weight: .semibold))
       }
-      .foregroundStyle(Color.white)
+      .foregroundStyle(theme.accentForeground)
       .padding(.vertical, 7)
       .padding(.horizontal, 11)
       .background(
@@ -194,7 +194,7 @@ struct CurrentTrackView: View {
           .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
           .overlay(
             RoundedRectangle(cornerRadius: 20, style: .continuous)
-              .stroke(Color.white.opacity(0.10), lineWidth: 0.75)
+              .stroke(theme.stroke, lineWidth: 0.75)
           )
           .shadow(color: Color.black.opacity(0.42), radius: 18, x: 0, y: 10)
           .frame(maxWidth: .infinity)

@@ -326,7 +326,7 @@ struct PlaylistsPanelView: View {
       } label: {
         Label("从队列添加", systemImage: "plus")
           .font(.system(size: 12, weight: .semibold))
-          .foregroundStyle(Color.white)
+          .foregroundStyle(theme.accentForeground)
           .padding(.horizontal, 11)
           .padding(.vertical, 7)
           .background(

@@ -144,7 +144,7 @@ struct PlaylistView: View {
             Button(action: { createPlaylist() }) {
               Label("新建", systemImage: "plus")
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Color.white)
+                .foregroundStyle(theme.accentForeground)
                 .padding(.horizontal, 11)
                 .padding(.vertical, 7)
                 .background(
@@ -590,9 +590,13 @@ struct PlaylistView: View {
       }
     )
 
-    let hostingController = NSHostingController(rootView: metadataEditView)
+    let themedMetadataEditView = metadataEditView.preferredColorScheme(colorScheme)
+    let hostingController = NSHostingController(rootView: themedMetadataEditView)
 
     window.title = "编辑元数据 - \(file.url.lastPathComponent)"
+    window.appearance = NSAppearance(
+      named: colorScheme == .dark ? .darkAqua : .aqua
+    )
     window.contentViewController = hostingController
     window.center()
     window.makeKeyAndOrderFront(nil)
@@ -658,7 +662,7 @@ struct SearchBarView: View {
     .background(
       ZStack {
         RoundedRectangle(cornerRadius: 10, style: .continuous)
-          .fill(theme.scheme == .dark ? Color.white.opacity(0.055) : Color.white.opacity(0.82))
+          .fill(theme.mutedSurface)
         if isFocused {
           RoundedRectangle(cornerRadius: 10, style: .continuous)
             .stroke(theme.accent.opacity(0.72), lineWidth: 1.5)

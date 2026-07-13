@@ -3,9 +3,9 @@ import SwiftUI
 
 /// Semantic visual tokens for the album-first MusicPlayer interface.
 ///
-/// The listening stage and library share one red-black room in both system
-/// appearances. Album artwork is the only large decorative object, so routine
-/// chrome remains flat and inexpensive to render.
+/// The listening stage and library share one visual room while adapting to the
+/// selected system appearance. Dark mode is red-black; light mode uses a matte
+/// warm-gray plane and dark labels for reflective displays.
 struct AppTheme {
   let scheme: ColorScheme
 
@@ -19,6 +19,11 @@ struct AppTheme {
     Color(red: 1.0, green: 0.58, blue: 0.31)
   }
 
+  /// High-contrast label color for text placed directly on the coral accent.
+  var accentForeground: Color {
+    Color(red: 0.13, green: 0.070, blue: 0.080)
+  }
+
   var accentGradient: LinearGradient {
     LinearGradient(
       colors: [accentSecondary, accent],
@@ -30,18 +35,22 @@ struct AppTheme {
   // MARK: - Structural backgrounds
 
   var libraryBackground: LinearGradient {
-    LinearGradient(
-      colors: [
+    let colors = scheme == .dark
+      ? [
         Color(red: 0.105, green: 0.040, blue: 0.052),
         Color(red: 0.058, green: 0.052, blue: 0.061),
-      ],
-      startPoint: .topLeading,
-      endPoint: .bottomTrailing
-    )
+      ]
+      : [
+        Color(red: 0.910, green: 0.875, blue: 0.860),
+        Color(red: 0.820, green: 0.820, blue: 0.830),
+      ]
+    return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
   }
 
   var nowPlayingBackground: Color {
-    Color(red: 0.065, green: 0.064, blue: 0.073)
+    scheme == .dark
+      ? Color(red: 0.065, green: 0.064, blue: 0.073)
+      : Color(red: 0.875, green: 0.840, blue: 0.825)
   }
 
   /// Compatibility aliases used by secondary windows.
@@ -80,7 +89,7 @@ struct AppTheme {
   }
 
   var paneDivider: Color {
-    accent.opacity(0.18)
+    accent.opacity(scheme == .dark ? 0.18 : 0.24)
   }
 
   var glowStroke: Color { accent.opacity(0.42) }
@@ -95,9 +104,17 @@ struct AppTheme {
 
   var mutedText: Color { Color(nsColor: .secondaryLabelColor) }
 
-  var stagePrimaryText: Color { Color.white.opacity(0.96) }
-  var stageSecondaryText: Color { Color.white.opacity(0.58) }
-  var stageTertiaryText: Color { Color.white.opacity(0.36) }
+  var stagePrimaryText: Color {
+    scheme == .dark ? Color.white.opacity(0.96) : Color(red: 0.13, green: 0.105, blue: 0.11)
+  }
+
+  var stageSecondaryText: Color {
+    scheme == .dark ? Color.white.opacity(0.66) : Color.black.opacity(0.68)
+  }
+
+  var stageTertiaryText: Color {
+    scheme == .dark ? Color.white.opacity(0.48) : Color.black.opacity(0.58)
+  }
 
   // MARK: - Interaction states
 
