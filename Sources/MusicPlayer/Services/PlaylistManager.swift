@@ -836,7 +836,7 @@ final class PlaylistManager: ObservableObject {
     }
     
     func removeFile(at index: Int) {
-        guard index < audioFiles.count else { return }
+        guard audioFiles.indices.contains(index) else { return }
         let removedURL = audioFiles[index].url
         audioFiles.remove(at: index)
         invalidateQueueIndexCache()
@@ -970,7 +970,7 @@ final class PlaylistManager: ObservableObject {
     }
     
     func selectFile(at index: Int) -> AudioFile? {
-        guard index < audioFiles.count else { return nil }
+        guard audioFiles.indices.contains(index) else { return nil }
         currentIndex = index
         savePlaylist() // 保存当前索引
         return audioFiles[index]

@@ -8,7 +8,6 @@ struct SearchSortButton: View {
     @State private var isPresented: Bool = false
 
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
     var body: some View {
@@ -54,20 +53,14 @@ struct SearchSortButton: View {
     @ViewBuilder
     private func activeBackground(phase: Double) -> some View {
         let clamped = max(0.0, min(1.0, phase))
-        let bgOpacity = 0.12 + 0.10 * clamped
-        let glowOpacity = 0.20 + 0.35 * clamped
-        let glowRadius = 6.0 + 7.0 * clamped
-        let scale = 0.98 + 0.04 * clamped
+        let bgOpacity = 0.10 + 0.05 * clamped
 
         RoundedRectangle(cornerRadius: 9, style: .continuous)
             .fill(theme.accent.opacity(bgOpacity))
             .overlay(
                 RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .stroke(theme.accentGradient, lineWidth: 1.2)
-                    .opacity(0.85)
+                    .stroke(theme.accent.opacity(0.32), lineWidth: 1)
             )
-            .shadow(color: theme.accentShadow.opacity(glowOpacity), radius: glowRadius, x: 0, y: 0)
-            .scaleEffect(scale)
             .allowsHitTesting(false)
     }
 }

@@ -1672,7 +1672,9 @@ extension AudioPlayer {
                 }
 
 	                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-	                    analysisQueue.async { [weak self] in
+	                    // Preserve the dedicated serial analysis queues without importing
+	                    // AudioPlayer's non-Sendable UI state into a @Sendable closure.
+	                    let workItem = DispatchWorkItem { [weak self] in
 	                        guard let self else {
 	                            continuation.resume()
 	                            return
@@ -1687,9 +1689,10 @@ extension AudioPlayer {
                                 guard let self else { return true }
                                 return self.currentVolumePreanalysisGeneration() != generation
                             }
-                        )
-                        continuation.resume()
-                    }
+	                        )
+	                        continuation.resume()
+	                    }
+	                    analysisQueue.async(execute: workItem)
                 }
 
                 if Task.isCancelled { break }

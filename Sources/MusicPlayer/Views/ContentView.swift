@@ -31,62 +31,33 @@ struct ContentView: View {
     private var layoutView: some View {
         GeometryReader { geometry in
             if geometry.size.width < 800 {
-                // 小屏幕：垂直布局
                 VStack(spacing: 0) {
-                    // 上方播放器面板
                     PlayerView(audioPlayer: audioPlayer, playlistManager: playlistManager)
-                        .frame(height: max(200, geometry.size.height * 0.4))
-                        .background(.ultraThinMaterial)
-                        .background(theme.panelBackground.opacity(0.6))
-                        .clipShape(RoundedRectangle(cornerRadius: 20))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 20)
-                                .stroke(theme.stroke, lineWidth: 0.5)
-                        )
-                        .shadow(color: theme.subtleShadow, radius: 16, x: 0, y: 8)
+                        .frame(height: max(300, geometry.size.height * 0.46))
+                        .background(theme.panelBackground)
 
-                    // 下方播放列表
+                    Divider()
+
                     PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
                         .frame(minHeight: 200)
-                        .background(.ultraThinMaterial)
-                        .background(theme.surface.opacity(0.3))
                 }
             } else {
-                // 大屏幕：水平布局
-                HStack(spacing: 20) {
-                    // 左侧播放器面板
+                HStack(spacing: 0) {
                     PlayerView(audioPlayer: audioPlayer, playlistManager: playlistManager)
-                        .frame(width: 440)
-                        .background(.ultraThinMaterial)
-                        .background(theme.panelBackground.opacity(0.6))
-                        .clipShape(RoundedRectangle(cornerRadius: 20))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 20)
-                                .stroke(theme.stroke, lineWidth: 0.5)
-                        )
-                        .shadow(color: theme.subtleShadow, radius: 16, x: 0, y: 8)
+                        .frame(width: min(max(360, geometry.size.width * 0.32), 430))
+                        .background(theme.panelBackground)
 
-                    // 右侧播放列表
+                    Divider()
+
                     PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
                         .frame(minWidth: 400)
-                        .background(.ultraThinMaterial)
-                        .background(theme.surface.opacity(0.3))
-                        .clipShape(RoundedRectangle(cornerRadius: 20))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 20)
-                                .stroke(theme.stroke, lineWidth: 0.5)
-                        )
                 }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 12)
             }
         }
     }
 
     var body: some View {
-        let base = AnyView(layoutView)
-
-        let withChrome = base
+        let withChrome = layoutView
             .background(theme.backgroundGradient)
             .onAppear {
                 // 启动时确保搜索框不自动聚焦

@@ -1,214 +1,134 @@
+import AppKit
 import SwiftUI
 
+/// A restrained, semantic theme for a native macOS music workspace.
+///
+/// Album artwork provides the expressive color. Chrome stays neutral so the
+/// interface remains legible in both appearances and cheap to render on
+/// lower-memory Macs.
 struct AppTheme {
-    let scheme: ColorScheme
+  let scheme: ColorScheme
 
-    // MARK: - 双模式配色（暗色极光 / 亮色暖霞）
+  // MARK: - Accent
 
-    /// 主强调色 - 暗色冰蓝 / 亮色玫瑰粉
-    var accent: Color {
-        scheme == .dark
-            ? Color(red: 0.35, green: 0.85, blue: 0.92)   // 冰蓝色
-            : Color(red: 0.93, green: 0.32, blue: 0.52)    // 玫瑰粉
+  var accent: Color {
+    Color(nsColor: .controlAccentColor)
+  }
+
+  var accentSecondary: Color {
+    Color(nsColor: .systemTeal)
+  }
+
+  /// Kept as a ShapeStyle-compatible gradient for existing call sites, but
+  /// intentionally monochromatic to avoid rainbow chrome.
+  var accentGradient: LinearGradient {
+    LinearGradient(
+      colors: [accent.opacity(0.88), accent],
+      startPoint: .topLeading,
+      endPoint: .bottomTrailing
+    )
+  }
+
+  // MARK: - Backgrounds
+
+  var backgroundGradient: LinearGradient {
+    let colors: [Color] =
+      scheme == .dark
+      ? [
+        Color(red: 0.055, green: 0.058, blue: 0.066),
+        Color(red: 0.070, green: 0.073, blue: 0.082),
+      ]
+      : [
+        Color(red: 0.955, green: 0.957, blue: 0.962),
+        Color(red: 0.925, green: 0.930, blue: 0.940),
+      ]
+    return LinearGradient(colors: colors, startPoint: .top, endPoint: .bottom)
+  }
+
+  var panelBackground: LinearGradient {
+    let colors: [Color] =
+      scheme == .dark
+      ? [
+        Color(red: 0.095, green: 0.098, blue: 0.108),
+        Color(red: 0.078, green: 0.081, blue: 0.090),
+      ]
+      : [
+        Color.white.opacity(0.90),
+        Color.white.opacity(0.72),
+      ]
+    return LinearGradient(colors: colors, startPoint: .top, endPoint: .bottom)
+  }
+
+  // MARK: - Surfaces
+
+  var surface: Color {
+    scheme == .dark ? Color.white.opacity(0.045) : Color.white.opacity(0.68)
+  }
+
+  var elevatedSurface: Color {
+    scheme == .dark ? Color.white.opacity(0.075) : Color.white.opacity(0.92)
+  }
+
+  var mutedSurface: Color {
+    scheme == .dark ? Color.white.opacity(0.055) : Color.black.opacity(0.045)
+  }
+
+  // MARK: - Borders and depth
+
+  var stroke: Color {
+    scheme == .dark ? Color.white.opacity(0.105) : Color.black.opacity(0.095)
+  }
+
+  var glowStroke: Color {
+    accent.opacity(scheme == .dark ? 0.46 : 0.38)
+  }
+
+  var subtleShadow: Color {
+    scheme == .dark ? Color.black.opacity(0.28) : Color.black.opacity(0.08)
+  }
+
+  var accentShadow: Color {
+    accent.opacity(scheme == .dark ? 0.15 : 0.10)
+  }
+
+  // MARK: - Text
+
+  var mutedText: Color {
+    Color(nsColor: .secondaryLabelColor)
+  }
+
+  // MARK: - Interaction states
+
+  func rowBackground(isActive: Bool) -> LinearGradient {
+    if isActive {
+      return LinearGradient(
+        colors: [accent.opacity(0.16), accent.opacity(0.09)],
+        startPoint: .leading,
+        endPoint: .trailing
+      )
     }
+    return LinearGradient(
+      colors: [surface, surface],
+      startPoint: .leading,
+      endPoint: .trailing
+    )
+  }
 
-    /// 次要强调色 - 暗色薄荷绿 / 亮色暖橙
-    var accentSecondary: Color {
-        scheme == .dark
-            ? Color(red: 0.30, green: 0.95, blue: 0.70)   // 薄荷绿
-            : Color(red: 1.0, green: 0.55, blue: 0.32)    // 暖橙
-    }
+  func dropZoneBorder(isActive: Bool) -> Color {
+    isActive ? accent : stroke
+  }
 
-    /// 第三强调色 - 暗色极光绿 / 亮色梦幻紫
-    var accentTertiary: Color {
-        scheme == .dark
-            ? Color(red: 0.55, green: 1.0, blue: 0.85)    // 极光绿
-            : Color(red: 0.58, green: 0.25, blue: 0.80)    // 梦幻紫
-    }
+  func dropZoneFill(isActive: Bool) -> Color {
+    isActive ? accent.opacity(0.10) : mutedSurface
+  }
 
-    /// 主渐变 - 暗色极光效果 / 亮色暖霞渐变
-    var accentGradient: LinearGradient {
-        if scheme == .dark {
-            return LinearGradient(
-                colors: [
-                    Color(red: 0.30, green: 0.95, blue: 0.70),  // 薄荷绿
-                    Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
-                    Color(red: 0.45, green: 0.75, blue: 0.95)   // 天青
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        } else {
-            return LinearGradient(
-                colors: [
-                    accentTertiary,
-                    accent,
-                    accentSecondary
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        }
-    }
+  // MARK: - Motion
 
-    /// 进度条渐变
-    var progressGradient: LinearGradient {
-        if scheme == .dark {
-            return LinearGradient(
-                colors: [
-                    Color(red: 0.30, green: 0.95, blue: 0.70),  // 薄荷绿
-                    Color(red: 0.35, green: 0.85, blue: 0.92),  // 冰蓝
-                    Color(red: 0.50, green: 0.75, blue: 0.98)   // 极光蓝
-                ],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-        } else {
-            return LinearGradient(
-                colors: [
-                    Color(red: 0.60, green: 0.28, blue: 0.82),  // 紫色
-                    Color(red: 0.93, green: 0.34, blue: 0.52),  // 品红
-                    Color(red: 1.0, green: 0.55, blue: 0.32)    // 珊瑚
-                ],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-        }
-    }
+  static var quickSpring: Animation {
+    .spring(response: 0.28, dampingFraction: 0.92, blendDuration: 0)
+  }
 
-    // MARK: - 背景系统
-
-    var backgroundGradient: LinearGradient {
-        if scheme == .dark {
-            return LinearGradient(
-                colors: [
-                    Color(red: 0.04, green: 0.08, blue: 0.12),  // 深夜蓝
-                    Color(red: 0.06, green: 0.10, blue: 0.14),  // 午夜色
-                    Color(red: 0.03, green: 0.06, blue: 0.10)   // 深海蓝
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        } else {
-            return LinearGradient(
-                colors: [
-                    Color(red: 0.97, green: 0.95, blue: 0.98),  // 淡紫白
-                    Color(red: 0.99, green: 0.96, blue: 0.95),  // 暖桃白
-                    Color(red: 0.98, green: 0.95, blue: 0.93)   // 暖杏白
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        }
-    }
-
-    var panelBackground: LinearGradient {
-        if scheme == .dark {
-            return LinearGradient(
-                colors: [
-                    Color(red: 0.08, green: 0.12, blue: 0.16),  // 极夜蓝
-                    Color(red: 0.06, green: 0.10, blue: 0.14)   // 深渊蓝
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        } else {
-            return LinearGradient(
-                colors: [
-                    Color(red: 1.0, green: 0.97, blue: 0.97),   // 暖玫白
-                    Color(red: 0.99, green: 0.96, blue: 0.95)   // 暖桃色
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        }
-    }
-
-    // MARK: - 表面和层级
-
-    var surface: Color {
-        scheme == .dark ? Color.white.opacity(0.06) : Color.white.opacity(0.92)
-    }
-
-    var elevatedSurface: Color {
-        scheme == .dark ? Color.white.opacity(0.10) : Color.white.opacity(0.85)
-    }
-
-    var mutedSurface: Color {
-        scheme == .dark ? Color.white.opacity(0.04) : Color.white.opacity(0.70)
-    }
-
-    // MARK: - 边框和阴影
-
-    var stroke: Color {
-        scheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.06)
-    }
-
-    /// 发光边框色
-    var glowStroke: Color {
-        scheme == .dark ? accent.opacity(0.35) : accent.opacity(0.30)
-    }
-
-    var subtleShadow: Color {
-        scheme == .dark ? Color.black.opacity(0.50) : Color.black.opacity(0.10)
-    }
-
-    /// 强调阴影 - 带颜色的阴影
-    var accentShadow: Color {
-        scheme == .dark ? accent.opacity(0.30) : accentSecondary.opacity(0.22)
-    }
-
-    // MARK: - 文字颜色
-
-    var mutedText: Color {
-        scheme == .dark ? Color.white.opacity(0.72) : Color.secondary
-    }
-
-    // MARK: - 交互状态
-
-    func rowBackground(isActive: Bool) -> LinearGradient {
-        if isActive {
-            return LinearGradient(
-                colors: [
-                    accent.opacity(0.25),
-                    accentSecondary.opacity(0.15)
-                ],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-        } else {
-            return LinearGradient(
-                colors: [
-                    surface,
-                    surface.opacity(0.85)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        }
-    }
-
-    func dropZoneBorder(isActive: Bool) -> Color {
-        isActive ? accent : (scheme == .dark ? Color.white.opacity(0.25) : Color.gray.opacity(0.4))
-    }
-
-    func dropZoneFill(isActive: Bool) -> Color {
-        if isActive {
-            return accent.opacity(0.15)
-        } else {
-            return scheme == .dark ? Color.white.opacity(0.03) : Color.gray.opacity(0.04)
-        }
-    }
-
-    // MARK: - 动画配置
-
-    /// 快速弹簧动画
-    static var quickSpring: Animation {
-        .spring(response: 0.25, dampingFraction: 0.75, blendDuration: 0)
-    }
-
-    /// 柔和过渡动画
-    static var smoothTransition: Animation {
-        .easeInOut(duration: 0.25)
-    }
+  static var smoothTransition: Animation {
+    .easeOut(duration: 0.18)
+  }
 }

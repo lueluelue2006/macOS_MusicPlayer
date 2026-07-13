@@ -26,7 +26,8 @@ enum RegressionTests {
         let tests: [(String, () async -> Bool)] = [
             ("PathKey migration incremental trigger", testPathKeyMigrationIncrementalTrigger),
             ("Ephemeral playback persist-state isolation", testEphemeralPlaybackPersistStateIsolation),
-            ("Playback scope restore from playlist", testPlaybackScopeRestoreFromPlaylist)
+            ("Playback scope restore from playlist", testPlaybackScopeRestoreFromPlaylist),
+            ("Queue index rejects negative values", testQueueIndexRejectsNegativeValues)
         ]
 
         for (name, test) in tests {
@@ -202,6 +203,15 @@ enum RegressionTests {
         } catch {
             print("   playback scope test error: \(error)")
             return false
+        }
+    }
+
+    private static func testQueueIndexRejectsNegativeValues() async -> Bool {
+        await MainActor.run {
+            let manager = PlaylistManager()
+            guard manager.selectFile(at: -1) == nil else { return false }
+            manager.removeFile(at: -1)
+            return manager.audioFiles.isEmpty
         }
     }
 }

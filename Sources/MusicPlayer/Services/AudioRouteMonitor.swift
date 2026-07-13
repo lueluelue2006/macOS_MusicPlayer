@@ -247,30 +247,21 @@ final class AudioRouteMonitor {
             mElement: kAudioObjectPropertyElementMain
         )
         guard AudioObjectHasProperty(deviceID, &nameAddr) else { return nil }
-        var translation = AudioValueTranslation(
-            mInputData: UnsafeMutableRawPointer.allocate(byteCount: MemoryLayout<UInt32>.size, alignment: MemoryLayout<UInt32>.alignment),
-            mInputDataSize: UInt32(MemoryLayout<UInt32>.size),
-            mOutputData: UnsafeMutableRawPointer.allocate(byteCount: MemoryLayout<CFString?>.size, alignment: MemoryLayout<CFString?>.alignment),
-            mOutputDataSize: UInt32(MemoryLayout<CFString?>.size)
-        )
-        defer {
-            translation.mInputData.deallocate()
-            translation.mOutputData.deallocate()
-        }
-        translation.mInputData.storeBytes(of: dsID, as: UInt32.self)
         var nameRef: CFString? = nil
-        translation.mOutputData.storeBytes(of: nameRef, as: CFString?.self)
-
-        size = UInt32(MemoryLayout<AudioValueTranslation>.size)
-        let status = AudioObjectGetPropertyData(deviceID, &nameAddr, 0, nil, &size, &translation)
-        if status != noErr {
-            return nil
+        let status = withUnsafeMutablePointer(to: &dsID) { inputPointer in
+            withUnsafeMutablePointer(to: &nameRef) { outputPointer in
+                var translation = AudioValueTranslation(
+                    mInputData: UnsafeMutableRawPointer(inputPointer),
+                    mInputDataSize: UInt32(MemoryLayout<UInt32>.size),
+                    mOutputData: UnsafeMutableRawPointer(outputPointer),
+                    mOutputDataSize: UInt32(MemoryLayout<CFString?>.size)
+                )
+                size = UInt32(MemoryLayout<AudioValueTranslation>.size)
+                return AudioObjectGetPropertyData(deviceID, &nameAddr, 0, nil, &size, &translation)
+            }
         }
-        nameRef = translation.mOutputData.load(as: CFString?.self)
-        if let cf = nameRef {
-            return cf as String
-        }
-        return nil
+        guard status == noErr, let nameRef else { return nil }
+        return nameRef as String
     }
 
     private func deviceName(for deviceID: AudioDeviceID) -> String? {

@@ -28,16 +28,18 @@ fi
 
 # 清理之前的构建
 echo "🧹 清理之前的构建..."
-rm -rf .build
+swift package clean
 rm -rf MusicPlayer.app
 
 # 构建项目
 echo "🔨 构建项目..."
-if swift build -c release; then
+BUILD_JOBS="${SWIFT_BUILD_JOBS:-1}"
+echo "   使用 ${BUILD_JOBS} 个并发编译任务（可通过 SWIFT_BUILD_JOBS 覆盖）"
+if swift build -c release --jobs "${BUILD_JOBS}"; then
   echo "✅ SwiftPM 构建成功"
 else
   echo "⚠️  SwiftPM 构建失败，尝试使用 --disable-sandbox 重新构建…"
-  swift build --disable-sandbox -c release
+  swift build --disable-sandbox -c release --jobs "${BUILD_JOBS}"
 fi
 
 # 创建应用包结构
