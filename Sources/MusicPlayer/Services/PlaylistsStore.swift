@@ -5,9 +5,11 @@ import Combine
 final class PlaylistsStore: ObservableObject {
     @Published private(set) var playlists: [UserPlaylist] = []
     @Published var selectedPlaylistID: UserPlaylist.ID?
+    @Published private(set) var isReady = false
 
     private let playlistsFileName = "user-playlists.json"
     private let formatVersion = 1
+    private let playlistsFileURLOverride: URL?
 
     private struct StoreFile: Codable {
         let version: Int
@@ -19,7 +21,8 @@ final class PlaylistsStore: ObservableObject {
     private let ioQueue = DispatchQueue(label: "playlists.persistence", qos: .utility)
     private let ioQueueKey = DispatchSpecificKey<Void>()
 
-    init() {
+    init(playlistsFileURLOverride: URL? = nil) {
+        self.playlistsFileURLOverride = playlistsFileURLOverride
         ioQueue.setSpecific(key: ioQueueKey, value: ())
     }
 
@@ -39,6 +42,7 @@ final class PlaylistsStore: ObservableObject {
     private func loadFromDisk() async {
         guard let url = playlistsFileURL() else {
             loadTask = nil
+            isReady = true
             return
         }
 
@@ -64,6 +68,7 @@ final class PlaylistsStore: ObservableObject {
         }
 
         loadTask = nil
+        isReady = true
     }
 
     func createPlaylist(name: String, trackURLs: [URL] = []) {
@@ -149,19 +154,61 @@ final class PlaylistsStore: ObservableObject {
         guard let url = playlistsFileURL() else { return }
         let payload = StoreFile(version: formatVersion, playlists: playlists)
         ioQueue.async { [payload] in
-            do {
-                let data = try JSONEncoder().encode(payload)
-                try data.write(to: url, options: .atomic)
-            } catch {
-                PersistenceLogger.log("保存歌单失败: \(error)")
-                DispatchQueue.main.async {
-                    PersistenceLogger.notifyUser(title: "歌单保存失败", subtitle: "请检查磁盘权限或空间")
-                }
+            Self.persist(payload, to: url)
+        }
+    }
+
+    /// Drains queued snapshots and persists the latest user-playlist state.
+    /// Called during orderly app termination so a just-created playlist cannot
+    /// be lost while its asynchronous write is still pending.
+    func flushPersistence() {
+        guard isLoaded, loadTask == nil else {
+            // Never snapshot the temporary empty state while the initial disk
+            // load is still waiting to apply on the main actor. Draining the IO
+            // queue is safe; writing here could replace an existing library.
+            if DispatchQueue.getSpecific(key: ioQueueKey) == nil {
+                ioQueue.sync {}
+            }
+            return
+        }
+        guard let url = playlistsFileURL() else { return }
+        let payload = StoreFile(version: formatVersion, playlists: playlists)
+        let operation = { Self.persist(payload, to: url) }
+        if DispatchQueue.getSpecific(key: ioQueueKey) != nil {
+            operation()
+        } else {
+            ioQueue.sync(execute: operation)
+        }
+    }
+
+    nonisolated private static func persist(_ payload: StoreFile, to url: URL) {
+        do {
+            let data = try JSONEncoder().encode(payload)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            PersistenceLogger.log("保存歌单失败: \(error)")
+            DispatchQueue.main.async {
+                PersistenceLogger.notifyUser(title: "歌单保存失败", subtitle: "请检查磁盘权限或空间")
             }
         }
     }
 
     private func playlistsFileURL() -> URL? {
+        if let playlistsFileURLOverride {
+            let directory = playlistsFileURLOverride.deletingLastPathComponent()
+            if !FileManager.default.fileExists(atPath: directory.path) {
+                do {
+                    try FileManager.default.createDirectory(
+                        at: directory,
+                        withIntermediateDirectories: true
+                    )
+                } catch {
+                    return nil
+                }
+            }
+            return playlistsFileURLOverride
+        }
+
         let fm = FileManager.default
         guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
         let dir = base.appendingPathComponent("MusicPlayer", isDirectory: true)
@@ -207,5 +254,6 @@ extension PlaylistsStore {
         selectedPlaylistID = selectedID ?? items.first?.id
         isLoaded = true
         loadTask = nil
+        isReady = true
     }
 }

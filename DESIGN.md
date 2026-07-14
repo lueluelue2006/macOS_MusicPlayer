@@ -1,4 +1,4 @@
-# MusicPlayer 4.3 Design System
+# MusicPlayer 4.3.1 Design System
 
 ## Mode
 
@@ -44,8 +44,8 @@ colors, decorative glass, border-heavy regions, and perpetual animation.
 - Light appearance: muted rose-gray player and warm-gray library with dark
   labels; avoid pure white to limit glare.
 - Warning and destructive colors remain semantic system colors.
-- Random-weight colors are visible only while editing a weight or when a track
-  has a non-default override.
+- Random-weight controls use muted text for the default and the existing accent
+  for an override; levels do not introduce additional semantic colors.
 
 ### Typography
 
@@ -87,7 +87,12 @@ colors, decorative glass, border-heavy regions, and perpetual animation.
   overflow menu.
 - **Search:** one native-looking search surface with a visible focus state.
 - **Track row:** glyph/equalizer, two lines of metadata, optional analyzed state,
-  duration, and hover/context actions. Default random weight is visually silent.
+  duration, and hover/context actions. The random-weight control stays hidden
+  until hover unless overridden; when shown, it always states both level and
+  multiplier.
+- **Random weight:** six levels numbered 0–5 map to 0.5×, 1.0×, 1.6×, 3.2×,
+  4.8×, and 6.4×. Level 2 (1.6×) is the default. Menus mark it as default and
+  use labels such as “档位 2 · 1.6×” instead of color alone.
 - **Lyrics:** absent when no lyrics exist; otherwise a flat continuation of the
   listening stage, not another card.
 

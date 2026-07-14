@@ -4,12 +4,18 @@ import AVFoundation
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private weak var audioPlayer: AudioPlayer?
     private weak var playlistManager: PlaylistManager?
+    private weak var playlistsStore: PlaylistsStore?
     private var keyEventMonitor: Any?
     private var activityEventMonitor: Any?
 
-    func configure(audioPlayer: AudioPlayer, playlistManager: PlaylistManager) {
+    func configure(
+        audioPlayer: AudioPlayer,
+        playlistManager: PlaylistManager,
+        playlistsStore: PlaylistsStore
+    ) {
         self.audioPlayer = audioPlayer
         self.playlistManager = playlistManager
+        self.playlistsStore = playlistsStore
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -114,6 +120,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         audioPlayer?.flushVolumeCachePersistence()
         audioPlayer?.flushImmersivePlaybackCachePersistence()
         playlistManager?.flushPlaylistPersistence()
+        playlistsStore?.flushPersistence()
+        PlaybackWeights.shared.flushPersistence()
         if let monitor = keyEventMonitor {
             NSEvent.removeMonitor(monitor)
             keyEventMonitor = nil

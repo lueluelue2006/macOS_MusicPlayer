@@ -181,7 +181,7 @@ struct MusicPlayerCommands: Commands {
                     Task { @MainActor in
                         let confirmed = DestructiveConfirmation.confirm(
                             title: "清空随机权重？",
-                            message: "将清空当前播放范围（队列/歌单）的“随机权重”设置。之后随机/洗牌将按默认权重(1.0×)。",
+                            message: "将清空当前播放范围（队列/歌单）的“随机权重”设置。之后随机/洗牌将按默认档位 2（1.6×）。",
                             confirmTitle: "清除",
                             cancelTitle: "不清除"
                         )
@@ -205,7 +205,7 @@ struct MusicPlayerCommands: Commands {
                     Task { @MainActor in
                         let confirmed = DestructiveConfirmation.confirm(
                             title: "清空全部随机权重？",
-                            message: "将清空队列与所有歌单的“随机权重”设置。操作不可撤销。",
+                            message: "将清空队列与所有歌单的“随机权重”设置，并恢复为默认档位 2（1.6×）。操作不可撤销。",
                             confirmTitle: "清除",
                             cancelTitle: "不清除"
                         )

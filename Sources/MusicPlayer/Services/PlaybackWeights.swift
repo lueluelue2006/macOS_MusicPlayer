@@ -2,10 +2,10 @@ import Foundation
 
 /// Persistent, lightweight per-track playback weight settings.
 ///
-    /// Design:
-    /// - Scoped: queue weights and per-playlist weights are isolated.
-    /// - Keyed by canonical file path (no bookmarks), with legacy lowercased key compatibility.
-    /// - Best-effort disk persistence (JSON, debounced).
+/// Design:
+/// - Scoped: queue weights and per-playlist weights are isolated.
+/// - Keyed by canonical file path (no bookmarks), with legacy lowercased key compatibility.
+/// - Best-effort disk persistence (JSON, debounced).
 final class PlaybackWeights: ObservableObject {
     static let shared = PlaybackWeights()
 
@@ -20,14 +20,14 @@ final class PlaybackWeights: ObservableObject {
     }
 
     enum Level: Int, CaseIterable, Sendable {
-        case white = -1
-        case green = 0
-        case blue = 1
-        case purple = 2
-        case gold = 3
-        case red = 4
+        case white = 0
+        case green = 1
+        case blue = 2
+        case purple = 3
+        case gold = 4
+        case red = 5
 
-        static let defaultLevel: Level = .green
+        static let defaultLevel: Level = .blue
         static let minimumStoredRawValue = Level.white.rawValue
         static let maximumStoredRawValue = Level.red.rawValue
 
@@ -46,9 +46,14 @@ final class PlaybackWeights: ObservableObject {
     @Published private(set) var revision: UInt64 = 0
 
     private let cacheFileName = "playback-weights.json"
-    private let formatVersion = 1
+    private let formatVersion = 2
     private let cacheFileURLOverride: URL?
     private let lock = NSLock()
+    private let persistenceLock = NSLock()
+    private let persistenceQueue = DispatchQueue(
+        label: "MusicPlayer.PlaybackWeights.Persistence",
+        qos: .utility
+    )
 
     private struct CacheFile: Codable {
         let version: Int
@@ -56,10 +61,16 @@ final class PlaybackWeights: ObservableObject {
         let playlistLevels: [String: [String: Int]]
     }
 
+    private struct CacheVersionEnvelope: Decodable {
+        let version: Int
+    }
+
     private var isLoaded = false
+    private var hasUnsupportedPersistedFormat = false
     private var queueLevels: [String: Int] = [:]
     private var playlistLevels: [String: [String: Int]] = [:] // playlistID.uuidString -> (pathKey -> level)
-    private var pendingSaveTask: Task<Void, Never>?
+    private var persistenceRevision: UInt64 = 0
+    private var pendingSaveWorkItem: DispatchWorkItem?
 
     init(cacheFileURLOverride: URL? = nil) {
         self.cacheFileURLOverride = cacheFileURLOverride
@@ -71,7 +82,7 @@ final class PlaybackWeights: ObservableObject {
         if let first = keys.first {
             return level(forLookupKeys: keys, canonicalKey: first, scope: scope)
         }
-        return .green
+        return .defaultLevel
     }
 
     func level(forKey key: String, scope: Scope) -> Level {
@@ -88,13 +99,11 @@ final class PlaybackWeights: ObservableObject {
                 return valueWithMigration(in: &queueLevels, lookupKeys: lookupKeys, canonicalKey: canonicalKey)
             case .playlist(let id):
                 let pid = id.uuidString
-                if playlistLevels[pid] == nil {
-                    playlistLevels[pid] = [:]
-                }
+                guard playlistLevels[pid] != nil else { return nil }
                 return valueWithMigration(in: &playlistLevels[pid]!, lookupKeys: lookupKeys, canonicalKey: canonicalKey)
             }
         }()
-        return Level(rawValue: raw ?? Level.defaultLevel.rawValue) ?? .green
+        return Level(rawValue: raw ?? Level.defaultLevel.rawValue) ?? .defaultLevel
     }
 
     func multiplier(for url: URL, scope: Scope) -> Double {
@@ -115,6 +124,7 @@ final class PlaybackWeights: ObservableObject {
         let clamped = normalizedStoredRaw(raw)
         var changed = false
         lock.lock()
+        changed = claimPreservedCacheForMutationLocked()
         switch scope {
         case .queue:
             if clamped == Level.defaultLevel.rawValue {
@@ -146,6 +156,7 @@ final class PlaybackWeights: ObservableObject {
         loadIfNeeded()
         var changed = false
         lock.lock()
+        changed = claimPreservedCacheForMutationLocked()
         switch scope {
         case .queue:
             if !queueLevels.isEmpty {
@@ -166,7 +177,9 @@ final class PlaybackWeights: ObservableObject {
     func clearAll() {
         loadIfNeeded()
         lock.lock()
-        let should = !queueLevels.isEmpty || !playlistLevels.isEmpty
+        let should = claimPreservedCacheForMutationLocked()
+            || !queueLevels.isEmpty
+            || !playlistLevels.isEmpty
         if should {
             queueLevels.removeAll()
             playlistLevels.removeAll()
@@ -179,7 +192,8 @@ final class PlaybackWeights: ObservableObject {
         loadIfNeeded()
         let pid = id.uuidString
         lock.lock()
-        let removed = (playlistLevels.removeValue(forKey: pid) != nil)
+        let removed = claimPreservedCacheForMutationLocked()
+            || playlistLevels.removeValue(forKey: pid) != nil
         lock.unlock()
         if removed { bumpAndSave() }
     }
@@ -190,6 +204,7 @@ final class PlaybackWeights: ObservableObject {
         let pid = id.uuidString
         var removed = false
         lock.lock()
+        removed = claimPreservedCacheForMutationLocked()
         if playlistLevels[pid] != nil, removeKeyVariants(key, from: &playlistLevels[pid]!) {
             removed = true
             if playlistLevels[pid]?.isEmpty == true { playlistLevels.removeValue(forKey: pid) }
@@ -202,16 +217,18 @@ final class PlaybackWeights: ObservableObject {
     ///
     /// Notes:
     /// - Only non-default levels are stored, so this copies *overrides* and will not wipe queue weights
-    ///   for tracks that are default (green) in the playlist.
+    ///   for tracks that are default (blue) in the playlist.
     /// - Returns how many overrides were present and how many actually changed in the queue scope.
     func syncPlaylistOverridesToQueue(from playlistID: UserPlaylist.ID) -> SyncResult {
         loadIfNeeded()
         let pid = playlistID.uuidString
 
         lock.lock()
+        let claimedPreservedCache = claimPreservedCacheForMutationLocked()
         let source = playlistLevels[pid] ?? [:]
         if source.isEmpty {
             lock.unlock()
+            if claimedPreservedCache { bumpAndSave() }
             return SyncResult(total: 0, changed: 0)
         }
 
@@ -226,11 +243,14 @@ final class PlaybackWeights: ObservableObject {
         }
         lock.unlock()
 
-        if changed > 0 { bumpAndSave() }
+        if claimedPreservedCache || changed > 0 { bumpAndSave() }
         return SyncResult(total: source.count, changed: changed)
     }
 
     private func bumpAndSave() {
+        lock.lock()
+        hasUnsupportedPersistedFormat = false
+        lock.unlock()
         revision &+= 1
         NotificationCenter.default.post(name: .playbackWeightsDidChange, object: nil)
         scheduleSave()
@@ -242,14 +262,40 @@ final class PlaybackWeights: ObservableObject {
         guard !isLoaded else { return }
         isLoaded = true
 
-        guard let url = cacheFileURL(), let data = try? Data(contentsOf: url) else { return }
-        guard let decoded = try? JSONDecoder().decode(CacheFile.self, from: data), decoded.version == formatVersion else { return }
+        guard let url = cacheFileURL() else { return }
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        guard let data = try? Data(contentsOf: url),
+              let envelope = try? JSONDecoder().decode(CacheVersionEnvelope.self, from: data),
+              envelope.version == 1 || envelope.version == formatVersion,
+              let decoded = try? JSONDecoder().decode(CacheFile.self, from: data) else {
+            preserveExistingCache()
+            return
+        }
 
-        let normalizedQueue = normalizeLevelMap(decoded.queueLevels)
-        var normalizedPlaylists: [String: [String: Int]] = [:]
-        normalizedPlaylists.reserveCapacity(decoded.playlistLevels.count)
-        for (pid, levels) in decoded.playlistLevels {
-            normalizedPlaylists[pid] = normalizeLevelMap(levels)
+        let normalizedQueue: [String: Int]
+        let normalizedPlaylists: [String: [String: Int]]
+        let needsPersistence: Bool
+        switch decoded.version {
+        case 1:
+            normalizedQueue = normalizeLevelMap(
+                decoded.queueLevels,
+                transform: migrateV1RawValue
+            )
+            normalizedPlaylists = normalizePlaylistLevelMaps(
+                decoded.playlistLevels,
+                transform: migrateV1RawValue
+            )
+            needsPersistence = true
+        case formatVersion:
+            normalizedQueue = normalizeLevelMap(decoded.queueLevels)
+            normalizedPlaylists = normalizePlaylistLevelMaps(decoded.playlistLevels)
+            needsPersistence = normalizedQueue != decoded.queueLevels
+                || normalizedPlaylists != decoded.playlistLevels
+        default:
+            // A newer or otherwise unknown envelope may contain semantics this
+            // build cannot safely interpret. Leave it untouched and use defaults.
+            preserveExistingCache()
+            return
         }
 
         lock.lock()
@@ -257,21 +303,63 @@ final class PlaybackWeights: ObservableObject {
         playlistLevels = normalizedPlaylists
         lock.unlock()
 
-        if normalizedQueue != decoded.queueLevels || normalizedPlaylists != decoded.playlistLevels {
-            scheduleSave()
+        if needsPersistence {
+            flushPersistence()
         }
     }
 
     private func scheduleSave() {
-        pendingSaveTask?.cancel()
-        pendingSaveTask = Task.detached(priority: .utility) { [weak self] in
-            guard let self else { return }
-            do {
-                try await Task.sleep(nanoseconds: 500_000_000) // 0.5s debounce
-            } catch {
-                return
-            }
-            self.saveNow()
+        let workItem: DispatchWorkItem
+        let previousWorkItem: DispatchWorkItem?
+
+        persistenceLock.lock()
+        persistenceRevision &+= 1
+        let revision = persistenceRevision
+        previousWorkItem = pendingSaveWorkItem
+        workItem = DispatchWorkItem { [weak self] in
+            self?.saveIfCurrent(revision)
+        }
+        pendingSaveWorkItem = workItem
+        persistenceLock.unlock()
+
+        previousWorkItem?.cancel()
+        persistenceQueue.asyncAfter(deadline: .now() + 0.5, execute: workItem)
+    }
+
+    private func saveIfCurrent(_ revision: UInt64) {
+        persistenceLock.lock()
+        let isCurrent = persistenceRevision == revision
+        if isCurrent {
+            pendingSaveWorkItem = nil
+        }
+        persistenceLock.unlock()
+
+        guard isCurrent else { return }
+        saveNow()
+    }
+
+    private func invalidateScheduledSave() {
+        persistenceLock.lock()
+        persistenceRevision &+= 1
+        let pending = pendingSaveWorkItem
+        pendingSaveWorkItem = nil
+        persistenceLock.unlock()
+        pending?.cancel()
+    }
+
+    /// Reliably persists the latest in-memory snapshot before returning.
+    ///
+    /// Invalidating the debounce generation prevents an already-cancelled work
+    /// item from writing again after this synchronous flush completes.
+    func flushPersistence() {
+        loadIfNeeded()
+        lock.lock()
+        let shouldPreserveExistingFile = hasUnsupportedPersistedFormat
+        lock.unlock()
+        guard !shouldPreserveExistingFile else { return }
+        invalidateScheduledSave()
+        persistenceQueue.sync { [self] in
+            saveNow()
         }
     }
 
@@ -319,13 +407,32 @@ final class PlaybackWeights: ObservableObject {
         return dir.appendingPathComponent(cacheFileName, isDirectory: false)
     }
 
-    private func normalizeLevelMap(_ raw: [String: Int]) -> [String: Int] {
+    private func normalizePlaylistLevelMaps(
+        _ raw: [String: [String: Int]],
+        transform: (Int) -> Int = { $0 }
+    ) -> [String: [String: Int]] {
+        guard !raw.isEmpty else { return [:] }
+        var normalized: [String: [String: Int]] = [:]
+        normalized.reserveCapacity(raw.count)
+        for (playlistID, levels) in raw {
+            let normalizedLevels = normalizeLevelMap(levels, transform: transform)
+            if !normalizedLevels.isEmpty {
+                normalized[playlistID] = normalizedLevels
+            }
+        }
+        return normalized
+    }
+
+    private func normalizeLevelMap(
+        _ raw: [String: Int],
+        transform: (Int) -> Int = { $0 }
+    ) -> [String: Int] {
         guard !raw.isEmpty else { return [:] }
         var normalized: [String: Int] = [:]
         normalized.reserveCapacity(raw.count)
         for (path, level) in raw {
             let key = PathKey.canonical(path: path)
-            let clamped = normalizedStoredRaw(level)
+            let clamped = normalizedStoredRaw(transform(level))
             if clamped != Level.defaultLevel.rawValue {
                 normalized[key] = clamped
             }
@@ -333,8 +440,31 @@ final class PlaybackWeights: ObservableObject {
         return normalized
     }
 
+    private func migrateV1RawValue(_ raw: Int) -> Int {
+        let legacyRaw = max(-1, min(4, raw))
+        return legacyRaw + 1
+    }
+
     private func normalizedStoredRaw(_ raw: Int) -> Int {
         max(Level.minimumStoredRawValue, min(Level.maximumStoredRawValue, raw))
+    }
+
+    private func preserveExistingCache() {
+        lock.lock()
+        hasUnsupportedPersistedFormat = true
+        lock.unlock()
+    }
+
+    /// A user-visible mutation intentionally takes ownership of a cache that
+    /// this build could not decode. This keeps commands truthful: a reported
+    /// clear/default/removal cannot silently reappear in a newer build later.
+    /// Ordinary reads and shutdown flushes never claim or overwrite that file.
+    private func claimPreservedCacheForMutationLocked() -> Bool {
+        guard hasUnsupportedPersistedFormat else { return false }
+        hasUnsupportedPersistedFormat = false
+        queueLevels.removeAll()
+        playlistLevels.removeAll()
+        return true
     }
 
     nonisolated static func key(for url: URL) -> String {

@@ -122,7 +122,17 @@ struct PlaylistsPanelView: View {
         Spacer()
       }
 
-      if playlistsStore.playlists.isEmpty {
+      if !playlistsStore.isReady {
+        VStack(alignment: .leading, spacing: 10) {
+          ProgressView()
+            .controlSize(.small)
+          Text("正在加载歌单…")
+            .font(.caption)
+            .foregroundColor(theme.mutedText)
+        }
+        .padding(.vertical, 8)
+        Spacer()
+      } else if playlistsStore.playlists.isEmpty {
         VStack(alignment: .leading, spacing: 10) {
           Text("还没有歌单")
             .font(.subheadline)

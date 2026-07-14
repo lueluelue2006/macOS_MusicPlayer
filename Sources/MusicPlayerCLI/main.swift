@@ -52,6 +52,7 @@ private func printUsage() {
         notes:
           - This CLI talks to the running MusicPlayer via DistributedNotificationCenter.
           - If you see "no reply", make sure MusicPlayer is running.
+          - Weight levels are 0...5; level 2 is the default and level 0 is 0.5x.
         """
     )
 }

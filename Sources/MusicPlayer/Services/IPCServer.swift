@@ -1194,7 +1194,7 @@ final class IPCServer {
         guard let scope = parseWeightScope(arguments: request.arguments) else {
             return IPCReply(id: request.id, ok: false, message: "invalid scope/playlistID")
         }
-        guard let rawLevel = request.arguments?["level"], let level = parseWeightLevel(rawLevel) else {
+        guard let rawLevel = request.arguments?["level"], let level = Self.parseWeightLevel(rawLevel) else {
             return IPCReply(id: request.id, ok: false, message: "missing/invalid level")
         }
         guard let url = resolveTrackURL(arguments: request.arguments) else {
@@ -1545,13 +1545,10 @@ final class IPCServer {
         }
     }
 
-    private func parseWeightLevel(_ raw: String) -> PlaybackWeights.Level? {
+    static func parseWeightLevel(_ raw: String) -> PlaybackWeights.Level? {
         let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if let numeric = Int(normalized) {
-            return PlaybackWeights.Level(rawValue: max(
-                PlaybackWeights.Level.minimumStoredRawValue,
-                min(PlaybackWeights.Level.maximumStoredRawValue, numeric)
-            ))
+            return PlaybackWeights.Level(rawValue: numeric)
         }
         switch normalized {
         case "white", "w", "low", "half", "0.5", "0.5x": return .white

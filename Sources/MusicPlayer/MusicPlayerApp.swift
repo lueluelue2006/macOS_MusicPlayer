@@ -107,7 +107,11 @@ struct MusicPlayerApp: App {
 	        self.audioRouteMonitor = audioRouteMonitor
 
         // 连接 AppDelegate，使其可以接管 Finder/Dock 打开的临时文件
-        appDelegate.configure(audioPlayer: audioPlayer, playlistManager: playlistManager)
+        appDelegate.configure(
+            audioPlayer: audioPlayer,
+            playlistManager: playlistManager,
+            playlistsStore: playlistsStore
+        )
 
         // Run format detection tests in background to avoid blocking app startup/IPC.
         #if DEBUG

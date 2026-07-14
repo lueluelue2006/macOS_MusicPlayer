@@ -153,6 +153,8 @@ struct PlaylistView: View {
                 )
             }
             .buttonStyle(.plain)
+            .disabled(!playlistsStore.isReady)
+            .help(playlistsStore.isReady ? "新建歌单" : "正在加载歌单…")
           }
 
           Button {
@@ -312,7 +314,8 @@ struct PlaylistView: View {
                   onWeightSelect: { newLevel in
                     weights.setLevel(newLevel, for: file.url, scope: .queue)
                   },
-                  showsWeightControl: true
+                  showsWeightControl: true,
+                  weightScopeLabel: "队列"
                     )
                     .id(file.id)
                   }
@@ -725,6 +728,7 @@ struct PlaylistItemView: View {
   let weightLevel: PlaybackWeights.Level?
   let onWeightSelect: ((PlaybackWeights.Level) -> Void)?
   let showsWeightControl: Bool
+  var weightScopeLabel: String = "歌单"
   @State private var isHovered = false
   @Environment(\.colorScheme) private var colorScheme
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
@@ -786,10 +790,9 @@ struct PlaylistItemView: View {
           } label: {
             HStack(spacing: 4) {
               Image(systemName: "dial.medium")
-              if weightLevel != .defaultLevel {
-                Text(String(format: "%.1f×", weightLevel.multiplier))
-                  .monospacedDigit()
-              }
+              Text(weightValueLabel(weightLevel))
+                .monospacedDigit()
+                .lineLimit(1)
             }
             .font(.system(size: 10, weight: .medium))
             .foregroundStyle(weightLevel == .defaultLevel ? theme.mutedText : theme.accent)
@@ -799,7 +802,9 @@ struct PlaylistItemView: View {
           .menuStyle(.borderlessButton)
           .menuIndicator(.hidden)
           .opacity(isHovered || weightLevel != .defaultLevel ? 1 : 0)
-          .help("随机权重")
+          .help("随机权重：\(weightLabel(weightLevel))（范围：\(weightScopeLabel)）")
+          .accessibilityLabel("随机权重")
+          .accessibilityValue("\(weightLabel(weightLevel))，范围：\(weightScopeLabel)")
         }
 
         Text(durationLabel)
@@ -860,13 +865,31 @@ struct PlaylistItemView: View {
       isHovered = hovering
     }
     .contextMenu {
+      if showsWeightControl, let weightLevel, let onWeightSelect {
+        Menu("随机权重") {
+          ForEach(PlaybackWeights.Level.allCases, id: \.rawValue) { level in
+            Button {
+              onWeightSelect(level)
+            } label: {
+              if level == weightLevel {
+                Label(weightLabel(level), systemImage: "checkmark")
+              } else {
+                Text(weightLabel(level))
+              }
+            }
+          }
+        }
+
+        Divider()
+      }
+
       if MetadataEditor.canShowEditButton(for: file.url) {
         Button("编辑元数据…") {
           editAction(file)
         }
-      }
 
-      Divider()
+        Divider()
+      }
 
       Button("从列表移除", role: .destructive) {
         deleteAction(file)
@@ -887,7 +910,12 @@ struct PlaylistItemView: View {
   }
 
   private func weightLabel(_ level: PlaybackWeights.Level) -> String {
-    "随机权重 \(String(format: "%.1f", level.multiplier))×"
+    let value = weightValueLabel(level)
+    return level == .defaultLevel ? "\(value)（默认）" : value
+  }
+
+  private func weightValueLabel(_ level: PlaybackWeights.Level) -> String {
+    "档位 \(level.rawValue) · \(String(format: "%.1f", level.multiplier))×"
   }
 
   private func buttonColor(for file: AudioFile) -> Color {

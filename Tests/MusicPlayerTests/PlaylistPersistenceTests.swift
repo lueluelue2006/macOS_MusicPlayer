@@ -8,6 +8,11 @@ final class PlaylistPersistenceTests: XCTestCase {
         let currentIndex: Int
     }
 
+    private struct SavedUserPlaylists: Codable {
+        let version: Int
+        let playlists: [UserPlaylist]
+    }
+
     private func makeAudioFile(at url: URL, title: String) -> AudioFile {
         AudioFile(
             url: url,
@@ -88,6 +93,66 @@ final class PlaylistPersistenceTests: XCTestCase {
         let snapshot = try readSnapshot(at: playlistURL)
         XCTAssertEqual(snapshot.currentIndex, 2)
         XCTAssertEqual(snapshot.paths, manager.audioFiles.map { $0.url.path })
+    }
+
+    func testUserPlaylistFlushPersistsLatestQueuedSnapshot() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-user-playlists-flush-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let storeURL = directory.appendingPathComponent("user-playlists.json")
+        let store = PlaylistsStore(playlistsFileURLOverride: storeURL)
+        await store.ensureLoaded()
+        store.createPlaylist(name: "artist")
+        let playlistID = try XCTUnwrap(store.playlists.first?.id)
+        let trackURLs = [
+            directory.appendingPathComponent("one.mp3"),
+            directory.appendingPathComponent("two.mp3"),
+        ]
+        store.addTracks(trackURLs, to: playlistID)
+
+        store.flushPersistence()
+
+        let saved = try JSONDecoder().decode(
+            SavedUserPlaylists.self,
+            from: Data(contentsOf: storeURL)
+        )
+        XCTAssertEqual(saved.version, 1)
+        XCTAssertEqual(saved.playlists.count, 1)
+        XCTAssertEqual(saved.playlists[0].id, playlistID)
+        XCTAssertEqual(saved.playlists[0].tracks.map(\.path), trackURLs.map(\.path))
+    }
+
+    func testUserPlaylistFlushDoesNotOverwritePendingInitialLoad() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-user-playlists-pending-load-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let storeURL = directory.appendingPathComponent("user-playlists.json")
+        let existing = UserPlaylist(
+            name: "existing",
+            tracks: [.init(path: directory.appendingPathComponent("kept.mp3").path)]
+        )
+        let originalData = try JSONEncoder().encode(
+            SavedUserPlaylists(version: 1, playlists: [existing])
+        )
+        try originalData.write(to: storeURL, options: .atomic)
+
+        let store = PlaylistsStore(playlistsFileURLOverride: storeURL)
+        store.loadIfNeeded()
+        XCTAssertFalse(store.isReady)
+        store.flushPersistence()
+        XCTAssertEqual(try Data(contentsOf: storeURL), originalData)
+
+        await store.ensureLoaded()
+        XCTAssertTrue(store.isReady)
+        XCTAssertEqual(store.playlists, [existing])
     }
 
     private func waitUntil(

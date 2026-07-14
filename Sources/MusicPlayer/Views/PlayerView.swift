@@ -279,13 +279,19 @@ struct CurrentTrackView: View {
             }
           } label: {
             Label(
-              weightLabel(weights.level(for: currentFile.url, scope: weightScope())),
+              weightValueLabel(weights.level(for: currentFile.url, scope: weightScope())),
               systemImage: "dial.medium"
             )
             .font(.system(size: 11, weight: .medium))
           }
           .buttonStyle(.plain)
-          .help("随机权重（当前范围：\(weightScopeLabel())）")
+          .help(
+            "随机权重：\(weightLabel(weights.level(for: currentFile.url, scope: weightScope())))（范围：\(weightScopeLabel())）"
+          )
+          .accessibilityLabel("随机权重")
+          .accessibilityValue(
+            "\(weightLabel(weights.level(for: currentFile.url, scope: weightScope())))，范围：\(weightScopeLabel())"
+          )
 
           Button {
             playRandomTrack()
@@ -356,7 +362,12 @@ struct CurrentTrackView: View {
   }
 
   private func weightLabel(_ level: PlaybackWeights.Level) -> String {
-    "随机 \(String(format: "%.1f", level.multiplier))×"
+    let value = weightValueLabel(level)
+    return level == .defaultLevel ? "\(value)（默认）" : value
+  }
+
+  private func weightValueLabel(_ level: PlaybackWeights.Level) -> String {
+    "档位 \(level.rawValue) · \(String(format: "%.1f", level.multiplier))×"
   }
 
   private func playRandomTrack() {
