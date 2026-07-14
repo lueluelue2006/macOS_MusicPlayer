@@ -1,4 +1,4 @@
-# MusicPlayer 4.3.7 Design System
+# MusicPlayer 4.3.8 Design System
 
 ## Mode
 
@@ -99,7 +99,10 @@ regions, and perpetual animation.
   (1.0×) is the default. Context menus use human ordinals such as “第 2 档 ·
   1.0×”; the CLI/API retains raw levels 0–5.
 - **Lyrics:** absent when no lyrics exist; otherwise a flat continuation of the
-  listening stage, not another card.
+  listening stage, not another card. In synced lyrics, interactive accent red
+  exclusively means auto-follow is enabled, muted gray means disabled, and
+  “locate current line” remains a neutral action rather than pretending to be a
+  selected state.
 
 ## SwiftUI and Performance Rules
 

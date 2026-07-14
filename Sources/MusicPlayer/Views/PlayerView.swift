@@ -450,39 +450,53 @@ struct SyncedLyricsView: View {
             isUserScrolling = false
           } label: {
             Label("当前句", systemImage: "location.viewfinder")
-              .font(.system(size: 11, weight: .semibold))
-              .foregroundStyle(theme.accent)
+              .font(.system(size: 11, weight: .medium))
+              // This is a one-shot locate action, not an enabled state.
+              .foregroundStyle(theme.stageSecondaryText)
               .frame(height: 26)
               .contentShape(Rectangle())
           }
           .buttonStyle(.plain)
+          .help("定位当前歌词并恢复自动跟随")
+          .accessibilityLabel("定位当前句")
+          .accessibilityHint("滚动到当前歌词并开启自动跟随")
 
-          Button {
-            autoFollowEnabled.toggle()
-            if autoFollowEnabled {
-              isUserScrolling = false
-              if let activeLineID {
-                proxy.scrollTo(activeLineID, anchor: .center)
+          Toggle(
+            isOn: Binding(
+              get: { autoFollowEnabled },
+              set: { isEnabled in
+                autoFollowEnabled = isEnabled
+                if isEnabled {
+                  isUserScrolling = false
+                  if let activeLineID {
+                    proxy.scrollTo(activeLineID, anchor: .center)
+                  }
+                }
               }
-            }
-          } label: {
+            )
+          ) {
             Label(
               "自动跟随",
               systemImage: autoFollowEnabled ? "location.fill" : "location.slash"
             )
-            .font(.system(size: 11, weight: .medium))
+            .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(
-              autoFollowEnabled ? theme.stageSecondaryText : theme.stageTertiaryText
+              autoFollowEnabled ? theme.interactiveAccent : theme.stageTertiaryText
             )
             .frame(height: 26)
             .contentShape(Rectangle())
           }
+          .toggleStyle(.button)
           .buttonStyle(.plain)
+          .help(autoFollowEnabled ? "自动跟随已开启；点按关闭" : "自动跟随已关闭；点按开启")
+          .accessibilityLabel("自动跟随歌词")
+          .accessibilityValue(autoFollowEnabled ? "已开启" : "已关闭")
+          .accessibilityHint(autoFollowEnabled ? "按一下关闭自动跟随" : "按一下开启并定位当前句")
 
           Spacer()
 
-          if isUserScrolling && !autoFollowEnabled {
-            Text("已暂停自动跟随")
+          if !autoFollowEnabled {
+            Text("自动跟随已关闭")
               .font(.caption)
               .foregroundColor(.secondary)
           }
