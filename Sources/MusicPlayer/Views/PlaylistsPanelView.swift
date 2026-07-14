@@ -17,6 +17,7 @@ struct PlaylistsPanelView: View {
   @State private var visibleTracks: [AudioFile] = []
   @State private var visibleTracksRevision: UInt64 = 0
   @State private var trackUnplayableReasons: [String: String] = [:]
+  @State private var playlistDuration: TimeInterval?
   @State private var isLoadingTracks: Bool = false
   @State private var loadTask: Task<Void, Never>?
   @State private var playlistScrollTargetID: String?
@@ -37,24 +38,6 @@ struct PlaylistsPanelView: View {
     playlistsStore.playlist(for: playlistsStore.selectedPlaylistID)
   }
 
-  private var sidebarSelectedPlaylistID: Binding<UserPlaylist.ID?> {
-    Binding(
-      get: { playlistsStore.selectedPlaylistID },
-      set: { newValue in
-        // macOS SwiftUI: clicking List's empty area can clear selection (set nil).
-        // For playlists, that's a poor UX: it jumps to the "请选择一个歌单" placeholder.
-        // Treat empty-area clicks as no-op as long as we still have playlists.
-        guard let newValue else {
-          if playlistsStore.playlists.isEmpty {
-            playlistsStore.selectedPlaylistID = nil
-          }
-          return
-        }
-        playlistsStore.selectedPlaylistID = newValue
-      }
-    )
-  }
-
   private var currentHighlightedURL: URL? {
     if audioPlayer.persistPlaybackState,
       playlistManager.currentIndex >= 0,
@@ -66,12 +49,13 @@ struct PlaylistsPanelView: View {
   }
 
   var body: some View {
-    HStack(spacing: 18) {
+    HStack(spacing: 22) {
       playlistsSidebar
-        .frame(width: 180)
+        .frame(width: 188)
 
-      Divider()
-        .opacity(0.35)
+      Rectangle()
+        .fill(theme.paneDivider)
+        .frame(width: 1)
 
       playlistDetail
     }
@@ -117,12 +101,7 @@ struct PlaylistsPanelView: View {
 
   private var playlistsSidebar: some View {
     VStack(alignment: .leading, spacing: 12) {
-      HStack {
-        Text("歌单")
-          .font(.system(size: 11, weight: .semibold))
-          .foregroundColor(theme.mutedText)
-        Spacer()
-      }
+      EditorialSectionLabel(index: "A", title: "歌单目录")
 
       if !playlistsStore.isReady {
         VStack(alignment: .leading, spacing: 10) {
@@ -147,32 +126,59 @@ struct PlaylistsPanelView: View {
         .padding(.vertical, 8)
         Spacer()
       } else {
-        List(selection: sidebarSelectedPlaylistID) {
-          ForEach(playlistsStore.playlists) { playlist in
-            HStack(spacing: 10) {
-              Image(systemName: "music.note.list")
-                .foregroundStyle(theme.accent)
-              VStack(alignment: .leading, spacing: 2) {
-                Text(playlist.name)
-                  .lineLimit(1)
-                Text("\(playlist.tracks.count) 首")
-                  .font(.caption2)
-                  .foregroundColor(theme.mutedText)
+        List {
+          ForEach(playlistsStore.playlists.indices, id: \.self) { index in
+            let playlist = playlistsStore.playlists[index]
+            let isSelected = playlistsStore.selectedPlaylistID == playlist.id
+            Button {
+              playlistsStore.selectedPlaylistID = playlist.id
+            } label: {
+              HStack(spacing: 9) {
+                Rectangle()
+                  .fill(isSelected ? theme.accent : Color.clear)
+                  .frame(width: 2, height: 30)
+
+                Text(String(format: "%02d", index + 1))
+                  .font(.system(size: 10, weight: .semibold, design: .rounded))
+                  .monospacedDigit()
+                  .foregroundStyle(isSelected ? theme.accent : theme.stageTertiaryText)
+                  .frame(width: 22, alignment: .leading)
+
+                VStack(alignment: .leading, spacing: 2) {
+                  Text(playlist.name)
+                    .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+                    .foregroundStyle(theme.stagePrimaryText)
+                    .lineLimit(1)
+                  Text("\(playlist.tracks.count) 首")
+                    .font(.system(size: 10))
+                    .foregroundColor(theme.stageTertiaryText)
+                }
+                Spacer(minLength: 0)
+                if audioPlayer.playbackTargetURL != nil,
+                  audioPlayer.persistPlaybackState,
+                  playlistManager.playbackScope == .playlist(playlist.id)
+                {
+                  ActivePlaybackScopeIndicator(
+                    systemName: audioPlayer.isLooping
+                      ? "repeat" : "shuffle",
+                    isPlaying: audioPlayer.isPlaying
+                  )
+                  .help("正在以该歌单作为播放范围")
+                }
               }
-              Spacer(minLength: 0)
-              if audioPlayer.playbackTargetURL != nil,
-                audioPlayer.persistPlaybackState,
-                playlistManager.playbackScope == .playlist(playlist.id)
-              {
-                ActivePlaybackScopeIndicator(
-                  systemName: audioPlayer.isLooping
-                    ? "repeat" : "shuffle",
-                  isPlaying: audioPlayer.isPlaying
-                )
-                .help("正在以该歌单作为播放范围")
-              }
+              .padding(.horizontal, 6)
+              .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+              .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                  .fill(isSelected ? theme.selectedSurface : Color.clear)
+              )
+              .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
-            .tag(playlist.id)
+            .buttonStyle(.plain)
+            .accessibilityAddTraits(isSelected ? .isSelected : [])
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+            .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
             .contextMenu {
               Button("重命名…") {
                 renamePlaylist(playlist)
@@ -212,6 +218,10 @@ struct PlaylistsPanelView: View {
           }
         }
 
+        if !isLoadingTracks && !visibleTracks.isEmpty {
+          TrackListColumnHeader()
+        }
+
         ScrollViewReader { proxy in
           Group {
             if isLoadingTracks {
@@ -233,8 +243,11 @@ struct PlaylistsPanelView: View {
               }
               .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-              List(visibleTracks) { file in
-                PlaylistItemView(
+              List {
+                ForEach(visibleTracks.indices, id: \.self) { index in
+                  let file = visibleTracks[index]
+                  PlaylistItemView(
+                  trackNumber: index + 1,
                   file: file,
                   isCurrentTrack: currentHighlightedURL == file.url,
                   isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
@@ -264,10 +277,11 @@ struct PlaylistsPanelView: View {
                     weights.setLevel(newLevel, for: file.url, scope: .playlist(playlist.id))
                   }
                 )
-                .id(file.id)
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                  .id(file.id)
+                  .listRowBackground(Color.clear)
+                  .listRowSeparator(.hidden)
+                  .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                }
               }
               .listStyle(PlainListStyle())
               .scrollContentBackground(.hidden)
@@ -319,30 +333,71 @@ struct PlaylistsPanelView: View {
   }
 
   private func header(for playlist: UserPlaylist) -> some View {
-    HStack(spacing: 12) {
-      VStack(alignment: .leading, spacing: 4) {
+    HStack(spacing: 14) {
+      PlaylistMonogramView(
+        name: playlist.name,
+        isActive: playlistManager.playbackScope == .playlist(playlist.id)
+          && audioPlayer.playbackTargetURL != nil
+      )
+      .frame(width: 64, height: 64)
+
+      VStack(alignment: .leading, spacing: 5) {
         Text(playlist.name)
-          .font(.system(size: 20, weight: .bold))
-          .foregroundColor(.primary)
+          .font(AppTheme.musicDisplayFont(size: 24, weight: .bold))
+          .foregroundColor(theme.stagePrimaryText)
           .lineLimit(1)
-        Text("\(playlist.tracks.count) 首")
-          .font(.caption)
-          .foregroundColor(theme.mutedText)
+
+        HStack(spacing: 7) {
+          Text("\(playlist.tracks.count) 首")
+          if let playlistDuration {
+            Text("·")
+            Text(Self.formatCollectionDuration(playlistDuration))
+          }
+        }
+        .font(.system(size: 11, weight: .medium))
+        .foregroundColor(theme.stageTertiaryText)
       }
 
-      Spacer()
+      Spacer(minLength: 12)
+
+      Button {
+        guard
+          let firstPlayable = loadedTracks.first(where: {
+            trackUnplayableReasons[pathKey($0.url)] == nil
+          })
+        else { return }
+        playTrackInPlaylist(firstPlayable, playlist: playlist)
+      } label: {
+        Label("播放", systemImage: "play.fill")
+          .font(.system(size: 12, weight: .semibold))
+          .foregroundStyle(theme.accentForeground)
+          .padding(.horizontal, 13)
+          .padding(.vertical, 8)
+          .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+              .fill(theme.accent)
+          )
+      }
+      .buttonStyle(.plain)
+      .disabled(loadedTracks.isEmpty)
+      .opacity(loadedTracks.isEmpty ? 0.45 : 1)
+      .help("从歌单第一首开始播放")
 
       Button {
         openAddFromQueueSheet(targetPlaylistID: playlist.id)
       } label: {
         Label("从队列添加", systemImage: "plus")
           .font(.system(size: 12, weight: .semibold))
-          .foregroundStyle(theme.accentForeground)
+          .foregroundStyle(theme.stagePrimaryText)
           .padding(.horizontal, 11)
-          .padding(.vertical, 7)
+          .padding(.vertical, 8)
           .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-              .fill(theme.accent)
+              .fill(theme.surface)
+              .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                  .stroke(theme.stroke, lineWidth: 1)
+              }
           )
       }
       .buttonStyle(.plain)
@@ -393,7 +448,16 @@ struct PlaylistsPanelView: View {
       .menuIndicator(.hidden)
       .help("歌单操作")
     }
-    .padding(.top, 4)
+    .padding(.top, 6)
+    .padding(.bottom, 2)
+  }
+
+  private static func formatCollectionDuration(_ duration: TimeInterval) -> String {
+    let totalMinutes = max(1, Int(duration / 60))
+    if totalMinutes >= 60 {
+      return "\(totalMinutes / 60) 小时 \(totalMinutes % 60) 分钟"
+    }
+    return "\(totalMinutes) 分钟"
   }
 
   private func nowPlayingIDInPlaylist(_ playlist: UserPlaylist) -> String? {
@@ -522,6 +586,7 @@ struct PlaylistsPanelView: View {
     loadedTracks = []
     visibleTracks = []
     trackUnplayableReasons = [:]
+    playlistDuration = nil
     isLoadingTracks = false
 
     guard let playlist = selectedPlaylist else { return }
@@ -621,11 +686,14 @@ struct PlaylistsPanelView: View {
 
       let finalTracks = results.compactMap { $0 }
       let finalReasons = reasons
+      let knownDurations = finalTracks.compactMap(\.duration).filter { $0.isFinite && $0 > 0 }
+      let finalDuration = knownDurations.isEmpty ? nil : knownDurations.reduce(0, +)
       await MainActor.run {
         guard self.selectedPlaylist?.id == playlistID else { return }
         if Task.isCancelled { return }
         self.loadedTracks = finalTracks
         self.trackUnplayableReasons = finalReasons
+        self.playlistDuration = finalDuration
         self.isLoadingTracks = false
 
         let playableURLs =

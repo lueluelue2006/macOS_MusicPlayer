@@ -4,22 +4,18 @@ import SwiftUI
 struct PlayerView: View {
   @ObservedObject var audioPlayer: AudioPlayer
   @ObservedObject var playlistManager: PlaylistManager
+  @ObservedObject private var playbackWeights = PlaybackWeights.shared
+  @State private var nextUpFile: AudioFile?
   @Environment(\.colorScheme) private var colorScheme
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
   var body: some View {
     ScrollView {
       VStack(spacing: 0) {
-        HStack(spacing: 12) {
-          Label("正在播放", systemImage: "waveform")
-            .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(theme.stageSecondaryText)
-
-          Spacer(minLength: 12)
-        }
+        EditorialSectionLabel(index: "01", title: "正在播放")
         .padding(.horizontal, 24)
         .padding(.top, 20)
-        .padding(.bottom, 18)
+        .padding(.bottom, 16)
 
         if playlistManager.isAddingFiles {
           VStack(alignment: .leading, spacing: 8) {
@@ -90,6 +86,12 @@ struct PlayerView: View {
           .padding(.horizontal, 28)
           .padding(.top, 20)
 
+        if let nextUpFile {
+          NextUpPreviewView(file: nextUpFile)
+            .padding(.horizontal, 28)
+            .padding(.top, 24)
+        }
+
         if audioPlayer.lyricsTimeline != nil {
           Rectangle()
             .fill(theme.stroke)
@@ -116,18 +118,53 @@ struct PlayerView: View {
         }
         .foregroundStyle(theme.stageTertiaryText)
         .padding(.horizontal, 28)
-        .padding(.top, 22)
+        .padding(.top, 20)
         .padding(.bottom, 24)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("当前音频输出设备：\(audioPlayer.currentOutputDeviceName)")
       }
     }
     .contentShape(Rectangle())
+    .onAppear {
+      refreshNextUpFile()
+    }
+    .onReceive(audioPlayer.$currentFile) { _ in
+      refreshNextUpFile()
+    }
+    .onReceive(playlistManager.$audioFiles) { _ in
+      refreshNextUpFile()
+    }
+    .onChange(of: playlistManager.currentIndex) { _ in
+      refreshNextUpFile()
+    }
+    .onChange(of: playlistManager.playbackScope) { _ in
+      refreshNextUpFile()
+    }
+    .onChange(of: audioPlayer.playbackMode) { _ in
+      refreshNextUpFile()
+    }
+    .onChange(of: playbackWeights.revision) { _ in
+      refreshNextUpFile()
+    }
     .onTapGesture {
       // 在播放器区域任意位置点击时，取消搜索框聚焦
       NotificationCenter.default.post(name: .blurSearchField, object: nil)
     }
     // 移除基于悬停禁用外层滚动的逻辑，恢复更直觉的滚动行为
+  }
+
+  private func refreshNextUpFile() {
+    guard audioPlayer.persistPlaybackState, let current = audioPlayer.currentFile else {
+      nextUpFile = nil
+      return
+    }
+
+    if audioPlayer.playbackMode == .repeatOne {
+      nextUpFile = current
+      return
+    }
+
+    nextUpFile = playlistManager.peekNextFile(isShuffling: true)
   }
 }
 
@@ -185,18 +222,12 @@ struct CurrentTrackView: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       if let currentFile = audioPlayer.currentFile {
-        AlbumArtworkView(
+        RecordSleeveHero(
           image: audioPlayer.artworkImage,
           title: currentFile.metadata.title,
           artist: currentFile.metadata.artist
         )
-          .frame(width: 300, height: 300)
-          .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-          .overlay(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-              .stroke(theme.stroke, lineWidth: 0.75)
-          )
-          .shadow(color: Color.black.opacity(0.42), radius: 18, x: 0, y: 10)
+          .frame(width: 314, height: 310)
           .frame(maxWidth: .infinity)
 
         if audioPlayer.persistPlaybackState == false {
@@ -217,7 +248,7 @@ struct CurrentTrackView: View {
 
         VStack(alignment: .leading, spacing: 5) {
           Text(currentFile.metadata.title)
-            .font(.system(size: 26, weight: .semibold))
+            .font(AppTheme.musicDisplayFont(size: 28, weight: .semibold))
             .lineLimit(2)
             .multilineTextAlignment(.leading)
             .foregroundColor(theme.stagePrimaryText)
@@ -227,12 +258,20 @@ struct CurrentTrackView: View {
             .foregroundColor(theme.stageSecondaryText)
             .lineLimit(1)
 
-          Text(currentFile.metadata.album)
+          Text(
+            [currentFile.metadata.album, currentFile.metadata.year]
+              .compactMap { value -> String? in
+                guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else { return nil }
+                return value
+              }
+              .joined(separator: " · ")
+          )
             .font(.system(size: 12))
             .foregroundColor(theme.stageTertiaryText)
             .lineLimit(1)
         }
-        .padding(.top, 20)
+        .padding(.top, 22)
 
         ProgressSliderView(
           playbackClock: audioPlayer.playbackClock,
@@ -290,25 +329,18 @@ struct CurrentTrackView: View {
           .help(audioPlayer.persistPlaybackState == false ? "临时播放模式下不可切歌" : "随机选一首")
 
           Spacer()
-
-          if audioPlayer.lyricsTimeline != nil {
-            Label("歌词已载入", systemImage: "text.quote")
-              .font(.system(size: 11, weight: .medium))
-          }
         }
         .foregroundStyle(theme.stageTertiaryText)
         .padding(.top, 12)
 
       } else {
         VStack(alignment: .leading, spacing: 18) {
-          AlbumArtworkView(image: nil, title: "MusicPlayer", artist: "本地音乐")
-            .frame(width: 300, height: 300)
-            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-            .shadow(color: Color.black.opacity(0.38), radius: 18, x: 0, y: 10)
+          RecordSleeveHero(image: nil, title: "MusicPlayer", artist: "本地音乐")
+            .frame(width: 314, height: 310)
 
           VStack(alignment: .leading, spacing: 6) {
             Text("等待播放")
-              .font(.system(size: 26, weight: .semibold))
+              .font(AppTheme.musicDisplayFont(size: 28, weight: .semibold))
               .foregroundColor(theme.stagePrimaryText)
 
             Text("添加音乐，开始你的本地唱片架")
@@ -319,7 +351,7 @@ struct CurrentTrackView: View {
         .frame(maxWidth: .infinity, alignment: .center)
       }
     }
-    .frame(maxWidth: 320)
+    .frame(maxWidth: 334)
     .padding(.horizontal, 24)
     .frame(maxWidth: .infinity)
   }
@@ -400,6 +432,8 @@ struct LyricsContainerView: View {
 
 struct StaticLyricsView: View {
   let timeline: LyricsTimeline
+  @Environment(\.colorScheme) private var colorScheme
+  private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
   var body: some View {
     ScrollView {
@@ -407,8 +441,8 @@ struct StaticLyricsView: View {
       LazyVStack(alignment: .center, spacing: 0) {
         ForEach(timeline.lines) { line in
           Text(line.text.isEmpty ? " " : line.text)
-            .font(.body)
-            .foregroundColor(.primary)
+            .font(.system(size: 13, weight: .regular))
+            .foregroundColor(theme.stagePrimaryText)
             .frame(maxWidth: .infinity, alignment: .center)
             .padding(.vertical, 4)
             .contentShape(Rectangle())
@@ -510,9 +544,12 @@ struct SyncedLyricsView: View {
             ForEach(timeline.lines) { line in
               let isActive = (activeLineID == line.id)
               Text(line.text.isEmpty ? " " : line.text)
-                .font(isActive ? .title3.bold() : .body)
-                .foregroundColor(isActive ? theme.accent : .primary)
-                .opacity(isActive ? 1.0 : 0.75)
+                .font(
+                  isActive
+                    ? AppTheme.musicDisplayFont(size: 18, weight: .semibold)
+                    : .system(size: 13, weight: .regular)
+                )
+                .foregroundColor(isActive ? theme.accent : theme.stageSecondaryText)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 5)
                 .contentShape(Rectangle())
@@ -578,6 +615,63 @@ struct SyncedLyricsView: View {
       return nil
     }
     return timeline.lines[idx].id
+  }
+}
+
+private struct RecordSleeveHero: View {
+  let image: NSImage?
+  let title: String
+  let artist: String
+
+  @Environment(\.colorScheme) private var colorScheme
+  private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+
+  var body: some View {
+    ZStack {
+      RoundedRectangle(cornerRadius: 14, style: .continuous)
+        .fill(theme.panelSurface)
+        .frame(width: 286, height: 286)
+        .overlay {
+          RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .stroke(theme.stroke, lineWidth: 1)
+        }
+        .rotationEffect(.degrees(1.2))
+        .offset(x: 7, y: -5)
+
+      if image != nil {
+        ZStack {
+          Circle()
+            .fill(Color.black.opacity(colorScheme == .dark ? 0.92 : 0.88))
+
+          ForEach(1..<8, id: \.self) { ring in
+            Circle()
+              .stroke(Color.white.opacity(0.05), lineWidth: 1)
+              .padding(CGFloat(ring) * 12)
+          }
+
+          Circle()
+            .fill(theme.accent)
+            .frame(width: 58, height: 58)
+
+          Circle()
+            .fill(Color.black.opacity(0.82))
+            .frame(width: 10, height: 10)
+        }
+        .frame(width: 252, height: 252)
+        .offset(x: 28, y: 3)
+      }
+
+      AlbumArtworkView(image: image, title: title, artist: artist)
+        .frame(width: 286, height: 286)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+          RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .stroke(theme.stroke, lineWidth: 1)
+        }
+        .offset(x: -7, y: 4)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .shadow(color: theme.subtleShadow, radius: 16, x: 0, y: 9)
   }
 }
 

@@ -11,7 +11,7 @@ struct WeightBlocksView: View {
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
   var body: some View {
-    HStack(spacing: 0) {
+    HStack(spacing: 1) {
       ForEach(PlaybackWeights.Level.allCases, id: \.rawValue) { candidate in
         let isSelected = candidate == level
 
@@ -20,7 +20,7 @@ struct WeightBlocksView: View {
         } label: {
           RoundedRectangle(cornerRadius: 2, style: .continuous)
             .fill(fillColor(for: candidate, isSelected: isSelected))
-            .frame(width: 10, height: 10)
+            .frame(width: 11, height: 11)
             .overlay {
               RoundedRectangle(cornerRadius: 2, style: .continuous)
                 .stroke(
@@ -28,10 +28,6 @@ struct WeightBlocksView: View {
                   lineWidth: candidate == .white && isSelected ? 1.2 : 1
                 )
             }
-            .shadow(
-              color: isSelected ? levelColor(for: candidate).opacity(0.28) : .clear,
-              radius: 4
-            )
             .frame(width: 18, height: 24)
             .contentShape(Rectangle())
         }
@@ -65,7 +61,7 @@ struct WeightBlocksView: View {
 
   private func fillColor(for level: PlaybackWeights.Level, isSelected: Bool) -> Color {
     guard isSelected else {
-      return theme.stagePrimaryText.opacity(colorScheme == .dark ? 0.22 : 0.24)
+      return theme.mutedSurface
     }
     return levelColor(for: level).opacity(level == .white ? 0.96 : 0.92)
   }
@@ -76,7 +72,7 @@ struct WeightBlocksView: View {
     }
     return isSelected
       ? theme.stagePrimaryText.opacity(colorScheme == .dark ? 0.70 : 0.72)
-      : theme.stagePrimaryText.opacity(colorScheme == .dark ? 0.52 : 0.62)
+      : theme.controlStroke
   }
 
   private func helpText(for level: PlaybackWeights.Level, isSelected: Bool) -> String {

@@ -30,7 +30,7 @@ struct ContentView: View {
 
     private var layoutView: some View {
         GeometryReader { geometry in
-            if geometry.size.width < 920 {
+            if geometry.size.width < 980 {
                 VStack(spacing: 0) {
                     PlayerView(audioPlayer: audioPlayer, playlistManager: playlistManager)
                         .frame(height: max(260, geometry.size.height * 0.48))
@@ -47,7 +47,7 @@ struct ContentView: View {
             } else {
                 HStack(spacing: 0) {
                     PlayerView(audioPlayer: audioPlayer, playlistManager: playlistManager)
-                        .frame(width: min(max(410, geometry.size.width * 0.30), 500))
+                        .frame(width: min(max(430, geometry.size.width * 0.34), 540))
                         .background(theme.nowPlayingBackground)
 
                     Rectangle()
@@ -433,7 +433,7 @@ private struct ToastBanner: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
                     .font(.system(size: 15, weight: .semibold))
-                    .foregroundColor(.primary)
+                    .foregroundColor(theme.stagePrimaryText)
                     .lineLimit(2)
 
                 if let subtitle, !subtitle.isEmpty {
@@ -468,15 +468,15 @@ private struct ToastBanner: View {
     private var indicatorStyle: AnyShapeStyle {
         switch kind {
         case .update:
-            return AnyShapeStyle(theme.accentGradient)
+            return AnyShapeStyle(theme.accent)
         case .success:
-            return AnyShapeStyle(theme.accent.opacity(0.9))
+            return AnyShapeStyle(theme.success)
         case .error:
-            return AnyShapeStyle(Color.red.opacity(0.85))
+            return AnyShapeStyle(theme.destructive)
         case .warning:
-            return AnyShapeStyle(Color.orange.opacity(0.85))
+            return AnyShapeStyle(theme.warning)
         case .info:
-            return AnyShapeStyle(theme.accentSecondary.opacity(0.85))
+            return AnyShapeStyle(theme.info)
         }
     }
 
@@ -490,13 +490,10 @@ private struct ToastBanner: View {
     }
 
     private var backgroundFill: Color {
-        if colorScheme == .dark {
-            return Color.black.opacity(0.72)
-        }
-        return Color.white.opacity(0.92)
+        theme.elevatedSurface
     }
 
     private var borderColor: Color {
-        colorScheme == .dark ? Color.white.opacity(0.18) : Color.black.opacity(0.10)
+        theme.stroke
     }
 }

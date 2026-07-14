@@ -98,8 +98,8 @@ struct PlaylistView: View {
       HStack(alignment: .center, spacing: 18) {
         VStack(alignment: .leading, spacing: 5) {
           Text(panelMode == .queue ? "播放队列" : "我的歌单")
-            .font(.system(size: 26, weight: .bold))
-            .tracking(-0.5)
+            .font(AppTheme.musicDisplayFont(size: 30, weight: .bold))
+            .foregroundStyle(theme.stagePrimaryText)
 
           HStack(spacing: 10) {
             Text(panelMode == .queue ? "\(playlistManager.audioFiles.count) 首本地音乐" : "整理你的收藏")
@@ -206,8 +206,8 @@ struct PlaylistView: View {
         }
       }
       .padding(.horizontal, 24)
-      .padding(.top, 22)
-      .padding(.bottom, 17)
+      .padding(.top, 24)
+      .padding(.bottom, 18)
       .contentShape(Rectangle())
       .onTapGesture {
         // 点击标题栏/操作按钮区域时，也取消搜索框聚焦
@@ -245,11 +245,16 @@ struct PlaylistView: View {
           } else if displayedQueueFiles.isEmpty {
             EmptyPlaylistView()
           } else {
+            TrackListColumnHeader()
+              .padding(.horizontal, 12)
+
             ScrollViewReader { proxy in
               ScrollView {
                 LazyVStack(spacing: 0) {
-                  ForEach(displayedQueueFiles) { file in
+                  ForEach(displayedQueueFiles.indices, id: \.self) { index in
+                    let file = displayedQueueFiles[index]
                     PlaylistItemView(
+                  trackNumber: index + 1,
                   file: file,
                   isCurrentTrack: currentHighlightedURL == file.url,
                   isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
@@ -666,15 +671,16 @@ struct SearchBarView: View {
       SearchSortButton(target: focusTarget, helpSuffix: "仅影响列表显示，不改变队列/歌单顺序。")
     }
     .padding(.horizontal, 12)
-    .frame(height: 36)
+    .frame(height: 38)
     .background(
       ZStack {
         RoundedRectangle(cornerRadius: 10, style: .continuous)
-          .fill(theme.mutedSurface)
-        if isFocused {
-          RoundedRectangle(cornerRadius: 10, style: .continuous)
-            .stroke(theme.accent.opacity(0.72), lineWidth: 1.5)
-        }
+          .fill(theme.surface)
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+          .stroke(
+            isFocused ? theme.accent : theme.controlStroke,
+            lineWidth: isFocused ? 1.5 : 1
+          )
       }
     )
     .onReceive(NotificationCenter.default.publisher(for: .focusSearchField)) { notification in
@@ -716,6 +722,7 @@ struct SearchBarView: View {
 }
 
 struct PlaylistItemView: View {
+  let trackNumber: Int
   let file: AudioFile
   let isCurrentTrack: Bool
   let isVolumeAnalyzed: Bool
@@ -744,10 +751,21 @@ struct PlaylistItemView: View {
           playAction(file)
         } label: {
           HStack(spacing: 11) {
-            Image(systemName: leadingSymbol)
-              .font(.system(size: 13, weight: .semibold))
-              .foregroundStyle(leadingColor)
-              .frame(width: 24, height: 24)
+            Group {
+              if unplayableReason != nil {
+                Image(systemName: "exclamationmark.triangle.fill")
+                  .font(.system(size: 11, weight: .semibold))
+              } else if isPlaybackRegionHovered {
+                Image(systemName: "play.fill")
+                  .font(.system(size: 11, weight: .semibold))
+              } else {
+                Text(String(format: "%02d", trackNumber))
+                  .font(.system(size: 11, weight: .medium, design: .rounded))
+                  .monospacedDigit()
+              }
+            }
+            .foregroundStyle(leadingColor)
+            .frame(width: 24, height: 24)
 
             VStack(alignment: .leading, spacing: 3) {
               HStack(spacing: 7) {
@@ -823,7 +841,7 @@ struct PlaylistItemView: View {
 
         Button(action: { deleteAction(file) }) {
           Image(systemName: "trash")
-            .foregroundColor(.red.opacity(0.82))
+            .foregroundColor(theme.destructive)
             .font(.system(size: 12, weight: .medium))
             .frame(width: 28, height: 28)
             .contentShape(Rectangle())
@@ -842,13 +860,13 @@ struct PlaylistItemView: View {
       RoundedRectangle(cornerRadius: 8, style: .continuous)
         .fill(
           isCurrentTrack
-            ? theme.accent.opacity(theme.scheme == .dark ? 0.12 : 0.075)
-            : (isHovered ? theme.mutedSurface : Color.clear)
+            ? theme.selectedSurface
+            : (isHovered ? theme.hoverSurface : Color.clear)
         )
     )
     .overlay(alignment: .bottom) {
       Rectangle()
-        .fill(theme.stroke.opacity(isCurrentTrack || isHovered ? 0 : 0.48))
+        .fill(isCurrentTrack || isHovered ? Color.clear : theme.paneDivider)
         .frame(height: 1)
         .padding(.leading, 46)
     }
@@ -886,12 +904,6 @@ struct PlaylistItemView: View {
     }
   }
 
-  private var leadingSymbol: String {
-    if isCurrentTrack { return "waveform" }
-    if unplayableReason != nil { return "exclamationmark.triangle.fill" }
-    return isPlaybackRegionHovered ? "play.fill" : "music.note"
-  }
-
   private var trackAccessibilityLabel: String {
     [file.metadata.title, file.metadata.artist, file.metadata.album]
       .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -900,8 +912,8 @@ struct PlaylistItemView: View {
 
   private var leadingColor: Color {
     if isCurrentTrack { return theme.accent }
-    if unplayableReason != nil { return .orange }
-    return isPlaybackRegionHovered ? .primary : theme.mutedText
+    if unplayableReason != nil { return theme.warning }
+    return isPlaybackRegionHovered ? theme.stagePrimaryText : theme.stageTertiaryText
   }
 
   private func weightLabel(_ level: PlaybackWeights.Level) -> String {
@@ -917,14 +929,10 @@ struct PlaylistItemView: View {
     let buttonType = MetadataEditor.getEditButtonType(for: file.url)
 
     switch buttonType {
-    case .directEdit:
-      return .blue
-    case .ffmpegCommand:
-      return .orange
-    case .notSupported:
-      return .gray
-    case .hidden:
-      return .gray
+    case .directEdit, .ffmpegCommand:
+      return theme.stageSecondaryText
+    case .notSupported, .hidden:
+      return theme.disabledText
     }
   }
 
