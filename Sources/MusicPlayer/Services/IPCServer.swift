@@ -1784,6 +1784,7 @@ final class IPCServer {
         data["isShuffling"] = audioPlayer.isShuffling ? "true" : "false"
         data["playbackMode"] = audioPlayer.playbackMode.rawValue
         data["normalizationEnabled"] = audioPlayer.isNormalizationEnabled ? "true" : "false"
+        data["immersivePlaybackEnabled"] = audioPlayer.isImmersivePlaybackEnabled ? "true" : "false"
         data["showLyrics"] = audioPlayer.showLyrics ? "true" : "false"
         data["scanSubfolders"] = playlistManager.scanSubfolders ? "true" : "false"
         data["ipcDebugEnabled"] = IPCDebugSettings.isEnabled() ? "true" : "false"
@@ -1799,6 +1800,16 @@ final class IPCServer {
         }
         data["currentTime"] = String(format: "%.3f", audioPlayer.playbackClock.currentTime)
         data["duration"] = String(format: "%.3f", audioPlayer.playbackClock.duration)
+
+        if let bounds = audioPlayer.activePlaybackBounds {
+            data["immersiveAudibleStart"] = String(format: "%.3f", bounds.audibleStart)
+            data["immersiveAudibleEnd"] = String(format: "%.3f", bounds.audibleEnd)
+            data["immersiveTrimmedStart"] = String(format: "%.3f", max(0, bounds.audibleStart))
+            data["immersiveTrimmedEnd"] = String(
+                format: "%.3f",
+                max(0, bounds.physicalDuration - bounds.audibleEnd)
+            )
+        }
 
         if let f = audioPlayer.currentFile {
             data["currentPath"] = f.url.path

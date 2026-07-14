@@ -45,7 +45,7 @@ struct PlaybackBounds: Codable, Equatable, Sendable {
 /// and tail. Actor isolation intentionally keeps analysis and cache mutations
 /// serial without allocating a decoded PCM cache.
 actor ImmersivePlaybackAnalyzer {
-    static let algorithmVersion = 2
+    static let algorithmVersion = 3
     private static let cacheFormatVersion = 1
     private static let cacheFileName = "immersive-boundaries.json"
     private static let maximumCacheEntries = 5_000
@@ -61,7 +61,15 @@ actor ImmersivePlaybackAnalyzer {
         var minimumConsecutiveAudibleWindows: Int = 2
         var minimumSustainedAudibleDuration: TimeInterval = 0.12
         var leadingSafetyPadding: TimeInterval = 0.25
-        var trailingSafetyPadding: TimeInterval = 0.25
+        var trailingSafetyPadding: TimeInterval = 0.35
+        var trailingReferencePercentile: Double = 0.90
+        var trailingRelativeDropDB: Double = 32
+        var minimumTrailingQuietSuffixDuration: TimeInterval = 0.75
+        var trailingConfidenceWindowDuration: TimeInterval = 2
+        var minimumTrailingConfidenceDropDB: Double = 18
+        var inaudibleTailRMSCeilingDBFS: Double = -62
+        var inaudibleTailPeakCeilingDBFS: Double = -55
+        var minimumTrailingFadeDropDB: Double = 8
         var minimumTrackDuration: TimeInterval = 3
         var minimumAudibleDuration: TimeInterval = 2
         var maximumTrimFraction: Double = 0.35
@@ -80,6 +88,14 @@ actor ImmersivePlaybackAnalyzer {
                 "sustain=\(minimumSustainedAudibleDuration.bitPattern)",
                 "lead=\(leadingSafetyPadding.bitPattern)",
                 "trail=\(trailingSafetyPadding.bitPattern)",
+                "tailPercentile=\(trailingReferencePercentile.bitPattern)",
+                "tailRelativeDrop=\(trailingRelativeDropDB.bitPattern)",
+                "tailQuietSuffix=\(minimumTrailingQuietSuffixDuration.bitPattern)",
+                "tailConfidenceWindow=\(trailingConfidenceWindowDuration.bitPattern)",
+                "tailConfidenceDrop=\(minimumTrailingConfidenceDropDB.bitPattern)",
+                "tailInaudibleRms=\(inaudibleTailRMSCeilingDBFS.bitPattern)",
+                "tailInaudiblePeak=\(inaudibleTailPeakCeilingDBFS.bitPattern)",
+                "tailFadeDrop=\(minimumTrailingFadeDropDB.bitPattern)",
                 "track=\(minimumTrackDuration.bitPattern)",
                 "audible=\(minimumAudibleDuration.bitPattern)",
                 "fraction=\(maximumTrimFraction.bitPattern)",
@@ -100,6 +116,22 @@ actor ImmersivePlaybackAnalyzer {
                 && minimumSustainedAudibleDuration.isFinite && minimumSustainedAudibleDuration > 0
                 && leadingSafetyPadding.isFinite && leadingSafetyPadding >= 0
                 && trailingSafetyPadding.isFinite && trailingSafetyPadding >= 0
+                && trailingReferencePercentile.isFinite
+                && (0.5 ... 1).contains(trailingReferencePercentile)
+                && trailingRelativeDropDB.isFinite && (0 ... 160).contains(trailingRelativeDropDB)
+                && minimumTrailingQuietSuffixDuration.isFinite
+                && minimumTrailingQuietSuffixDuration > 0
+                && trailingConfidenceWindowDuration.isFinite
+                && trailingConfidenceWindowDuration > 0
+                && trailingConfidenceWindowDuration <= analysisEdgeDuration
+                && minimumTrailingConfidenceDropDB.isFinite
+                && (0 ... 160).contains(minimumTrailingConfidenceDropDB)
+                && inaudibleTailRMSCeilingDBFS.isFinite
+                && (protectionRMSDBFS ... rmsThresholdDBFS).contains(inaudibleTailRMSCeilingDBFS)
+                && inaudibleTailPeakCeilingDBFS.isFinite
+                && (protectionPeakDBFS ... peakThresholdDBFS).contains(inaudibleTailPeakCeilingDBFS)
+                && minimumTrailingFadeDropDB.isFinite
+                && (0 ... 160).contains(minimumTrailingFadeDropDB)
                 && minimumTrackDuration.isFinite && minimumTrackDuration >= 0
                 && minimumAudibleDuration.isFinite && minimumAudibleDuration > 0
                 && maximumTrimFraction.isFinite && (0 ... 0.9).contains(maximumTrimFraction)
@@ -309,27 +341,66 @@ actor ImmersivePlaybackAnalyzer {
             in: headMetrics,
             configuration: configuration
         )
-        let trailingRunEnd = lastSustainedAudibleRunEnd(
+        let baselineTrailingRunEnd = lastSustainedAudibleRunEnd(
             in: tailMetrics,
             configuration: configuration
         )
 
         // A completely silent (or below-threshold) scan is not enough evidence
         // to remove anything.
-        guard leadingRunStart != nil || trailingRunEnd != nil else { return fallback }
+        guard leadingRunStart != nil || baselineTrailingRunEnd != nil else { return fallback }
 
-        // Stable high-threshold runs establish that the file contains music.
-        // A lower protection gate then expands toward the physical edges so
-        // quiet fades, count-ins, reverb tails, and isolated musical notes are
-        // preserved. In doubt, this deliberately skips less silence.
+        // Keep the leading edge conservative so a quiet count-in is preserved.
+        // The trailing edge is intentionally stricter: its gate is relative to
+        // each track's own tail level, requires a sustained run, and is accepted
+        // only when the physical ending is demonstrably quieter. An isolated
+        // codec spike after established silence can therefore no longer revive
+        // the boundary.
         let protectedLeadingStart = headMetrics.first(where: {
             isProtectedAudio($0, configuration: configuration)
         })?.startTime
-        let protectedTrailingEnd = tailMetrics.last(where: {
-            isProtectedAudio($0, configuration: configuration)
-        })?.endTime
         let rawLeadingStart = [leadingRunStart, protectedLeadingStart].compactMap { $0 }.min()
-        let rawTrailingEnd = [trailingRunEnd, protectedTrailingEnd].compactMap { $0 }.max()
+        let adaptiveTrailingEnd = confidentAdaptiveTrailingEnd(
+            in: tailMetrics,
+            physicalDuration: physicalDuration,
+            configuration: configuration
+        )
+        let sustainedMeaningfulTailEnd = lastSustainedAudibleRunEnd(
+            in: tailMetrics,
+            rmsThresholdDBFS: configuration.inaudibleTailRMSCeilingDBFS,
+            peakThresholdDBFS: configuration.inaudibleTailPeakCeilingDBFS,
+            configuration: configuration
+        )
+        let sustainedProtectedTailEnd = lastSustainedAudibleRunEnd(
+            in: tailMetrics,
+            rmsThresholdDBFS: configuration.protectionRMSDBFS,
+            peakThresholdDBFS: configuration.protectionPeakDBFS,
+            configuration: configuration
+        )
+        let rawTrailingEnd: TimeInterval?
+        if let adaptiveTrailingEnd {
+            rawTrailingEnd = adaptiveTrailingEnd
+        } else if let sustainedMeaningfulTailEnd,
+                  physicalDuration - sustainedMeaningfulTailEnd
+                    >= configuration.minimumTrailingQuietSuffixDuration {
+            // Preserve a stable quiet outro that the relative gate rejected.
+            rawTrailingEnd = sustainedMeaningfulTailEnd
+        } else if let sustainedProtectedTailEnd,
+                  physicalDuration - sustainedProtectedTailEnd
+                    >= configuration.minimumTrailingQuietSuffixDuration {
+            // Ultra-quiet sustained content gets the still more conservative
+            // protection floor before any terminal silence is removed.
+            rawTrailingEnd = sustainedProtectedTailEnd
+        } else if leadingRunStart != nil,
+                  baselineTrailingRunEnd == nil,
+                  sustainedProtectedTailEnd == nil {
+            // When the complete tail scan contains no sustained signal even at
+            // the protection floor, use its first sample as a conservative
+            // operational boundary. A lone click cannot defeat this fallback.
+            rawTrailingEnd = tailMetrics.first?.startTime
+        } else {
+            rawTrailingEnd = nil
+        }
 
         var proposedStart = rawLeadingStart.map {
             max(0, $0 - configuration.leadingSafetyPadding)
@@ -391,8 +462,19 @@ actor ImmersivePlaybackAnalyzer {
     }
 
     private static func isAudible(_ metric: WindowMetric, configuration: Configuration) -> Bool {
-        metric.rmsDBFS >= configuration.rmsThresholdDBFS
-            || metric.peakDBFS >= configuration.peakThresholdDBFS
+        isAudible(
+            metric,
+            rmsThresholdDBFS: configuration.rmsThresholdDBFS,
+            peakThresholdDBFS: configuration.peakThresholdDBFS
+        )
+    }
+
+    private static func isAudible(
+        _ metric: WindowMetric,
+        rmsThresholdDBFS: Double,
+        peakThresholdDBFS: Double
+    ) -> Bool {
+        metric.rmsDBFS >= rmsThresholdDBFS || metric.peakDBFS >= peakThresholdDBFS
     }
 
     private static func isProtectedAudio(_ metric: WindowMetric, configuration: Configuration) -> Bool {
@@ -439,6 +521,20 @@ actor ImmersivePlaybackAnalyzer {
         in metrics: [WindowMetric],
         configuration: Configuration
     ) -> TimeInterval? {
+        lastSustainedAudibleRunEnd(
+            in: metrics,
+            rmsThresholdDBFS: configuration.rmsThresholdDBFS,
+            peakThresholdDBFS: configuration.peakThresholdDBFS,
+            configuration: configuration
+        )
+    }
+
+    private static func lastSustainedAudibleRunEnd(
+        in metrics: [WindowMetric],
+        rmsThresholdDBFS: Double,
+        peakThresholdDBFS: Double,
+        configuration: Configuration
+    ) -> TimeInterval? {
         var runDuration: TimeInterval = 0
         var runCount = 0
         var runEnd: TimeInterval?
@@ -449,7 +545,11 @@ actor ImmersivePlaybackAnalyzer {
             let gap = previousEnd.map { metric.startTime - $0 } ?? 0
             let remainsConsecutive = gap <= continuityTolerance(configuration: configuration)
 
-            if isAudible(metric, configuration: configuration) {
+            if isAudible(
+                metric,
+                rmsThresholdDBFS: rmsThresholdDBFS,
+                peakThresholdDBFS: peakThresholdDBFS
+            ) {
                 if runEnd == nil || !remainsConsecutive {
                     runDuration = 0
                     runCount = 0
@@ -469,6 +569,137 @@ actor ImmersivePlaybackAnalyzer {
             previousEnd = metric.endTime
         }
         return lastQualifiedEnd
+    }
+
+    private static func confidentAdaptiveTrailingEnd(
+        in metrics: [WindowMetric],
+        physicalDuration: TimeInterval,
+        configuration: Configuration
+    ) -> TimeInterval? {
+        let referenceMetrics = metrics.filter {
+            isAudible($0, configuration: configuration)
+        }
+        guard !referenceMetrics.isEmpty,
+              let referenceRMS = percentile(
+                referenceMetrics.map(\.rmsDBFS),
+                fraction: configuration.trailingReferencePercentile
+              ),
+              let referencePeak = percentile(
+                referenceMetrics.map(\.peakDBFS),
+                fraction: configuration.trailingReferencePercentile
+              ) else {
+            return nil
+        }
+
+        let rmsThreshold = max(
+            configuration.rmsThresholdDBFS,
+            referenceRMS - configuration.trailingRelativeDropDB
+        )
+        let peakThreshold = max(
+            configuration.peakThresholdDBFS,
+            referencePeak - configuration.trailingRelativeDropDB
+        )
+        guard let sustainedEnd = lastSustainedAudibleRunEnd(
+            in: metrics,
+            rmsThresholdDBFS: rmsThreshold,
+            peakThresholdDBFS: peakThreshold,
+            configuration: configuration
+        ),
+        physicalDuration - sustainedEnd >= configuration.minimumTrailingQuietSuffixDuration else {
+            return nil
+        }
+
+        let confidenceWindowStart = max(
+            metrics.first?.startTime ?? 0,
+            max(
+                sustainedEnd,
+                physicalDuration - configuration.trailingConfidenceWindowDuration
+            )
+        )
+        let terminalRMSValues = metrics.lazy
+            .filter { $0.endTime > confidenceWindowStart }
+            .map(\.rmsDBFS)
+        guard let terminalMedianRMS = percentile(
+            Array(terminalRMSValues),
+            fraction: 0.5
+        ),
+        referenceRMS - terminalMedianRMS >= configuration.minimumTrailingConfidenceDropDB,
+        trailingSuffixIsSafelyDiscardable(
+            in: metrics,
+            after: sustainedEnd,
+            beforeTerminalWindowAt: confidenceWindowStart,
+            configuration: configuration
+        ) else {
+            return nil
+        }
+        return sustainedEnd
+    }
+
+    /// Distinguishes an inaudible floor or a progressive fade from a sustained
+    /// quiet outro. Loud-to-quiet contrast alone is insufficient: spoken
+    /// codas and deliberately soft arrangements can remain stable for seconds.
+    private static func trailingSuffixIsSafelyDiscardable(
+        in metrics: [WindowMetric],
+        after sustainedEnd: TimeInterval,
+        beforeTerminalWindowAt terminalWindowStart: TimeInterval,
+        configuration: Configuration
+    ) -> Bool {
+        let suffix = metrics.filter { $0.endTime > sustainedEnd }
+        guard let suffixRMS = percentile(
+            suffix.map(\.rmsDBFS),
+            fraction: configuration.trailingReferencePercentile
+        ),
+        let suffixPeak = percentile(
+            suffix.map(\.peakDBFS),
+            fraction: configuration.trailingReferencePercentile
+        ) else {
+            return false
+        }
+
+        let sustainedMeaningfulSuffixEnd = lastSustainedAudibleRunEnd(
+            in: suffix,
+            rmsThresholdDBFS: configuration.inaudibleTailRMSCeilingDBFS,
+            peakThresholdDBFS: configuration.inaudibleTailPeakCeilingDBFS,
+            configuration: configuration
+        )
+        if suffixRMS <= configuration.inaudibleTailRMSCeilingDBFS,
+           suffixPeak <= configuration.inaudibleTailPeakCeilingDBFS,
+           sustainedMeaningfulSuffixEnd == nil {
+            return true
+        }
+
+        let fadeMetrics = suffix.filter { $0.startTime < terminalWindowStart }
+        let comparisonCount = fadeMetrics.count / 3
+        let middleMetrics = fadeMetrics
+            .dropFirst(comparisonCount)
+            .dropLast(comparisonCount)
+        guard comparisonCount >= configuration.minimumConsecutiveAudibleWindows,
+              let earlyMedian = percentile(
+                Array(fadeMetrics.prefix(comparisonCount)).map(\.rmsDBFS),
+                fraction: 0.5
+              ),
+              let middleMedian = percentile(
+                Array(middleMetrics).map(\.rmsDBFS),
+                fraction: 0.5
+              ),
+              let lateMedian = percentile(
+                Array(fadeMetrics.suffix(comparisonCount)).map(\.rmsDBFS),
+                fraction: 0.5
+              ) else {
+            return false
+        }
+        let minimumSegmentDrop = configuration.minimumTrailingFadeDropDB / 4
+        return earlyMedian - lateMedian >= configuration.minimumTrailingFadeDropDB
+            && earlyMedian - middleMedian >= minimumSegmentDrop
+            && middleMedian - lateMedian >= minimumSegmentDrop
+    }
+
+    private static func percentile(_ values: [Double], fraction: Double) -> Double? {
+        guard !values.isEmpty, fraction.isFinite else { return nil }
+        let sorted = values.sorted()
+        let clampedFraction = min(1, max(0, fraction))
+        let index = Int((Double(sorted.count - 1) * clampedFraction).rounded(.down))
+        return sorted[index]
     }
 
     private static func continuityTolerance(configuration: Configuration) -> TimeInterval {

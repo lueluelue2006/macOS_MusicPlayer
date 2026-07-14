@@ -1,4 +1,4 @@
-# MusicPlayer 4.3.2 Design System
+# MusicPlayer 4.3.3 Design System
 
 ## Mode
 
@@ -104,10 +104,14 @@ colors, decorative glass, border-heavy regions, and perpetual animation.
 - No blur, file I/O, sorting, path normalization, large shadow, or artwork
   decoding inside queue rows.
 - Keep current-artwork ImageIO downsampling and the bounded playlist workers.
-- Immersive playback analyzes only bounded head and tail windows, caches the
-  result, and keeps one current plus one preloaded player. It never rewrites
-  music files, falls back to the full track when confidence is low, and does
-  not promise sample-accurate gapless playback.
+- Immersive playback v3 analyzes only the current and preloaded-next tracks,
+  using bounded head and tail windows, per-track adaptive relative tail
+  loudness, sustained-window evidence, and fade-shape confidence. Isolated
+  noise after established silence cannot extend the boundary, while sustained
+  quiet outros fall back to the lower protection gate. Results are cached
+  instead of triggering a default whole-library scan; music files are never
+  rewritten, low-confidence analysis falls back to the full track, and
+  playback does not promise sample-accurate gapless transitions.
 - Full-track normalization analysis stays on one serial `.utility` lane. Auto
   analysis starts only after 60 seconds of system-wide idle time, handles at
   most two tracks per batch, and stops for playback, input, Low Power Mode, or

@@ -103,7 +103,7 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
         )
     }
 
-    func testDetectorPreservesQuietFadeCountInAndReverbAroundStableMusic() {
+    func testDetectorPreservesQuietCountInAndIgnoresIsolatedTailReverb() {
         let configuration = detectorConfiguration()
         var head = metrics(
             from: 0,
@@ -149,7 +149,206 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
         )
 
         XCTAssertEqual(bounds.audibleStart, 0.25, accuracy: 0.001)
-        XCTAssertEqual(bounds.audibleEnd, 9.15, accuracy: 0.001)
+        XCTAssertEqual(bounds.audibleEnd, 8.35, accuracy: 0.001)
+    }
+
+    func testDetectorUsesTrackRelativeGateForLongQuietFade() {
+        let configuration = detectorConfiguration()
+        let head = metrics(from: 0, through: 3, audibleRanges: [0 ..< 3.1])
+        var tail = metrics(from: 5, through: 10, audibleRanges: [5 ..< 8.0])
+        let fadeLevels: [(rms: Double, peak: Double)] = [
+            (-30, -22), (-35, -27), (-40, -32), (-45, -37), (-50, -42),
+            (-55, -47), (-60, -52), (-65, -57), (-70, -62), (-75, -67),
+        ]
+        for (offset, levels) in fadeLevels.enumerated() {
+            let index = 30 + offset
+            tail[index] = ImmersivePlaybackAnalyzer.WindowMetric(
+                startTime: 8 + Double(offset) * 0.1,
+                duration: 0.1,
+                rmsDBFS: levels.rms,
+                peakDBFS: levels.peak
+            )
+        }
+
+        let bounds = ImmersivePlaybackAnalyzer.detectBounds(
+            physicalDuration: 10,
+            headMetrics: head,
+            tailMetrics: tail,
+            configuration: configuration
+        )
+
+        XCTAssertEqual(bounds.audibleEnd, 8.95, accuracy: 0.001)
+        XCTAssertGreaterThan(10 - bounds.audibleEnd, 1)
+    }
+
+    func testDetectorPreservesConstantQuietOutroWhenTailContrastIsLow() {
+        let configuration = detectorConfiguration()
+        let head = metrics(from: 0, through: 3, audibleRanges: [0 ..< 3.1])
+        let tail = stride(from: 7.0, to: 10.0, by: 0.1).map { start in
+            ImmersivePlaybackAnalyzer.WindowMetric(
+                startTime: start,
+                duration: min(0.1, 10 - start),
+                rmsDBFS: -55,
+                peakDBFS: -45
+            )
+        }
+
+        let bounds = ImmersivePlaybackAnalyzer.detectBounds(
+            physicalDuration: 10,
+            headMetrics: head,
+            tailMetrics: tail,
+            configuration: configuration
+        )
+
+        XCTAssertEqual(bounds.audibleEnd, 10, accuracy: 0.001)
+    }
+
+    func testDetectorPreservesSustainedQuietOutroAfterLoudSection() {
+        let configuration = detectorConfiguration()
+        let head = metrics(from: 0, through: 5, audibleRanges: [0 ..< 5.1])
+        var tail = metrics(from: 30, through: 60, audibleRanges: [])
+        for index in tail.indices {
+            let start = tail[index].startTime
+            let levels: (rms: Double, peak: Double)
+            if start < 35 {
+                levels = (-10, -5)
+            } else if start < 58 {
+                levels = (-50, -45)
+            } else {
+                levels = (-120, -100)
+            }
+            tail[index] = ImmersivePlaybackAnalyzer.WindowMetric(
+                startTime: start,
+                duration: tail[index].duration,
+                rmsDBFS: levels.rms,
+                peakDBFS: levels.peak
+            )
+        }
+
+        let bounds = ImmersivePlaybackAnalyzer.detectBounds(
+            physicalDuration: 60,
+            headMetrics: head,
+            tailMetrics: tail,
+            configuration: configuration
+        )
+
+        XCTAssertEqual(bounds.audibleEnd, 58.25, accuracy: 0.001)
+    }
+
+    func testDetectorTrimsLongSilenceWhenAudioOccupiesLessThanReferencePercentile() {
+        let configuration = detectorConfiguration()
+        let head = metrics(from: 0, through: 5, audibleRanges: [0 ..< 5.1])
+        let tail = metrics(from: 30, through: 60, audibleRanges: [30 ..< 32])
+
+        let bounds = ImmersivePlaybackAnalyzer.detectBounds(
+            physicalDuration: 60,
+            headMetrics: head,
+            tailMetrics: tail,
+            configuration: configuration
+        )
+
+        XCTAssertEqual(bounds.audibleEnd, 32.25, accuracy: 0.001)
+        XCTAssertGreaterThan(60 - bounds.audibleEnd, 27)
+    }
+
+    func testDetectorPreservesSustainedQuietPhraseInsideNoiseFloor() {
+        let configuration = detectorConfiguration()
+        let head = metrics(from: 0, through: 5, audibleRanges: [0 ..< 5.1])
+        var tail = metrics(from: 30, through: 60, audibleRanges: [30 ..< 35])
+        for index in tail.indices where tail[index].startTime >= 35 {
+            let start = tail[index].startTime
+            let isQuietPhrase = (52 ..< 52.5).contains(start)
+            tail[index] = ImmersivePlaybackAnalyzer.WindowMetric(
+                startTime: start,
+                duration: tail[index].duration,
+                rmsDBFS: isQuietPhrase ? -55 : -66,
+                peakDBFS: isQuietPhrase ? -45 : -63
+            )
+        }
+
+        let bounds = ImmersivePlaybackAnalyzer.detectBounds(
+            physicalDuration: 60,
+            headMetrics: head,
+            tailMetrics: tail,
+            configuration: configuration
+        )
+
+        XCTAssertEqual(bounds.audibleEnd, 52.75, accuracy: 0.001)
+    }
+
+    func testDetectorDoesNotMistakeSteppedQuietOutroForProgressiveFade() {
+        let configuration = detectorConfiguration()
+        let head = metrics(from: 0, through: 5, audibleRanges: [0 ..< 5.1])
+        var tail = metrics(from: 30, through: 60, audibleRanges: [])
+        for index in tail.indices {
+            let start = tail[index].startTime
+            let levels: (rms: Double, peak: Double)
+            if start < 35 {
+                levels = (-10, -5)
+            } else if start < 50 {
+                levels = (-50, -45)
+            } else if start < 58 {
+                levels = (-60, -55)
+            } else {
+                levels = (-120, -100)
+            }
+            tail[index] = ImmersivePlaybackAnalyzer.WindowMetric(
+                startTime: start,
+                duration: tail[index].duration,
+                rmsDBFS: levels.rms,
+                peakDBFS: levels.peak
+            )
+        }
+
+        let bounds = ImmersivePlaybackAnalyzer.detectBounds(
+            physicalDuration: 60,
+            headMetrics: head,
+            tailMetrics: tail,
+            configuration: configuration
+        )
+
+        XCTAssertEqual(bounds.audibleEnd, 58.25, accuracy: 0.001)
+    }
+
+    func testDetectorDoesNotTrimAQuietSuffixShorterThanMinimum() {
+        let configuration = detectorConfiguration()
+        let head = metrics(from: 0, through: 3, audibleRanges: [0 ..< 3.1])
+        let tail = metrics(from: 7, through: 10, audibleRanges: [7 ..< 9.5])
+
+        let bounds = ImmersivePlaybackAnalyzer.detectBounds(
+            physicalDuration: 10,
+            headMetrics: head,
+            tailMetrics: tail,
+            configuration: configuration
+        )
+
+        XCTAssertEqual(bounds.audibleEnd, 10, accuracy: 0.001)
+    }
+
+    func testDetectorTrimsACompletelyQuietLongTailDespiteAnIsolatedClick() {
+        let configuration = detectorConfiguration()
+        let head = metrics(from: 0, through: 5, audibleRanges: [0 ..< 4.5])
+        var tail = metrics(from: 30, through: 60, audibleRanges: [])
+        guard let clickIndex = tail.firstIndex(where: { abs($0.startTime - 50) < 0.001 }) else {
+            XCTFail("Expected a tail metric at 50 seconds")
+            return
+        }
+        tail[clickIndex] = ImmersivePlaybackAnalyzer.WindowMetric(
+            startTime: 50,
+            duration: 0.1,
+            rmsDBFS: -8,
+            peakDBFS: -1
+        )
+
+        let bounds = ImmersivePlaybackAnalyzer.detectBounds(
+            physicalDuration: 60,
+            headMetrics: head,
+            tailMetrics: tail,
+            configuration: configuration
+        )
+
+        XCTAssertEqual(bounds.audibleEnd, 30.25, accuracy: 0.001)
+        XCTAssertLessThan(bounds.audibleEnd, 31)
     }
 
     func testAnalyzerFindsBoundsInSyntheticWAVAndReloadsCacheAfterColdStart() async throws {
@@ -208,6 +407,33 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
 
         XCTAssertEqual(bounds.audibleStart, 0.7, accuracy: 0.09)
         XCTAssertEqual(bounds.audibleEnd, 3.2, accuracy: 0.09)
+    }
+
+    func testAnalyzerRejectsSustainedLowLevelTailNoise() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent("low-level-tail.wav")
+        try writeWAV(
+            to: audioURL,
+            duration: 36,
+            audibleRange: 0 ..< 27,
+            lowLevelTailRange: 27 ..< 36
+        )
+
+        let analyzer = ImmersivePlaybackAnalyzer(
+            cacheFileURL: nil,
+            configuration: ImmersivePlaybackAnalyzer.Configuration(
+                minimumTrackDuration: 1,
+                minimumAudibleDuration: 0.5,
+                maximumTrimFraction: 0.8
+            )
+        )
+        let bounds = await analyzer.bounds(for: audioURL)
+
+        XCTAssertEqual(bounds.physicalDuration, 36, accuracy: 0.02)
+        XCTAssertEqual(bounds.audibleStart, 0, accuracy: 0.02)
+        XCTAssertEqual(bounds.audibleEnd, 27.35, accuracy: 0.12)
+        XCTAssertGreaterThan(36 - bounds.audibleEnd, 8.5)
     }
 
     func testCorruptCacheIsIgnoredAndFileReplacementInvalidatesEntry() async throws {
@@ -314,7 +540,8 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
         duration: TimeInterval,
         audibleRange: Range<TimeInterval>,
         channelCount: AVAudioChannelCount = 1,
-        audibleChannel: Int = 0
+        audibleChannel: Int = 0,
+        lowLevelTailRange: Range<TimeInterval>? = nil
     ) throws {
         if FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)
@@ -345,9 +572,17 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
                 for index in 0 ..< count {
                     let absoluteFrame = writtenFrames + index
                     let time = Double(absoluteFrame) / sampleRate
-                    channels[channelIndex][index] = channelIndex == audibleChannel && audibleRange.contains(time)
-                        ? Float(sin(2 * Double.pi * 440 * time) * 0.25)
-                        : 0
+                    let sample: Float
+                    if audibleRange.contains(time) {
+                        sample = Float(sin(2 * Double.pi * 440 * time) * 0.25)
+                    } else if lowLevelTailRange?.contains(time) == true {
+                        // Roughly -66 dBFS RMS: above the old -70 dBFS
+                        // protection floor, but far below this track's active tail.
+                        sample = Float(sin(2 * Double.pi * 997 * time) * 0.000_71)
+                    } else {
+                        sample = 0
+                    }
+                    channels[channelIndex][index] = channelIndex == audibleChannel ? sample : 0
                 }
             }
             try file.write(from: buffer)
