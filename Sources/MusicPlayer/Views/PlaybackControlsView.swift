@@ -20,7 +20,7 @@ struct PlaybackControlsView: View {
     let canTogglePlayback = audioPlayer.canTogglePlayback
 
     HStack(spacing: 0) {
-      PlaybackModePicker(
+      PlaybackModeToggle(
         selection: playbackModeBinding,
         isEphemeralPlayback: isEphemeralPlayback
       )
@@ -101,11 +101,18 @@ struct PlaybackControlsView: View {
   }
 }
 
-private struct PlaybackModePicker: View {
+private struct PlaybackModeToggle: View {
   @Binding var selection: AudioPlayer.PlaybackMode
   let isEphemeralPlayback: Bool
   @Environment(\.colorScheme) private var colorScheme
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+
+  private var isRepeatOne: Binding<Bool> {
+    Binding(
+      get: { selection == .repeatOne },
+      set: { selection = $0 ? .repeatOne : .shuffle }
+    )
+  }
 
   private var selectionTitle: String {
     switch selection {
@@ -114,27 +121,117 @@ private struct PlaybackModePicker: View {
     }
   }
 
-  var body: some View {
-    Picker("播放方式", selection: $selection) {
-      Label("随机播放", systemImage: "shuffle")
-        .labelStyle(.iconOnly)
-        .tag(AudioPlayer.PlaybackMode.shuffle)
-        .help(isEphemeralPlayback ? "随机播放（临时播放结束后用于队列切歌）" : "随机播放")
+  private var nextSelectionTitle: String {
+    selection == .shuffle ? "单曲循环" : "随机播放"
+  }
 
-      Label("单曲循环", systemImage: "repeat.1")
-        .labelStyle(.iconOnly)
-        .tag(AudioPlayer.PlaybackMode.repeatOne)
-        .help("单曲循环")
+  var body: some View {
+    Toggle("播放方式：\(selectionTitle)", isOn: isRepeatOne)
+      .toggleStyle(
+        PlaybackModeSlidingToggleStyle(
+          theme: theme
+        )
+      )
+      .frame(width: 76, height: 34)
+      .help(
+        isEphemeralPlayback && selection == .shuffle
+          ? "随机播放（临时播放结束后用于队列切歌）；点按切换为单曲循环"
+          : "播放方式：\(selectionTitle)；点按切换为\(nextSelectionTitle)"
+      )
+      .accessibilityRepresentation {
+        Toggle("播放方式：\(selectionTitle)", isOn: isRepeatOne)
+          .accessibilityHint("按一下切换为\(nextSelectionTitle)")
+      }
+  }
+}
+
+private struct PlaybackModeSlidingToggleStyle: ToggleStyle {
+  let theme: AppTheme
+
+  func makeBody(configuration: Configuration) -> some View {
+    PlaybackModeSlidingToggleBody(
+      isRepeatOne: configuration.isOn,
+      theme: theme
+    ) {
+      configuration.isOn.toggle()
     }
-    .labelsHidden()
-    .pickerStyle(.segmented)
-    .controlSize(.large)
-    .tint(theme.interactiveAccent)
-    .frame(width: 76)
-    .help("播放方式：\(selectionTitle)")
-    .accessibilityLabel("播放方式")
-    .accessibilityValue(selectionTitle)
-    .accessibilityHint("在随机播放和单曲循环之间选择")
+  }
+}
+
+private struct PlaybackModeSlidingToggleBody: View {
+  let isRepeatOne: Bool
+  let theme: AppTheme
+  let toggle: () -> Void
+
+  @State private var isHovered = false
+  @FocusState private var isFocused: Bool
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+  private let controlWidth: CGFloat = 76
+  private let controlHeight: CGFloat = 34
+  private let inset: CGFloat = 2
+  private var segmentWidth: CGFloat { (controlWidth - inset * 2) / 2 }
+
+  var body: some View {
+    Button(action: toggle) {
+      ZStack(alignment: .leading) {
+        Capsule()
+          .fill(theme.mutedSurface)
+          .overlay {
+            Capsule()
+              .stroke(theme.stroke, lineWidth: 1)
+          }
+
+        Capsule()
+          .fill(theme.interactiveAccent)
+          .frame(width: segmentWidth, height: controlHeight - inset * 2)
+          .shadow(color: theme.subtleShadow.opacity(0.32), radius: 2, y: 1)
+          .offset(x: isRepeatOne ? inset + segmentWidth : inset)
+          .animation(
+            reduceMotion
+              ? nil
+              : .spring(response: 0.24, dampingFraction: 1.0, blendDuration: 0),
+            value: isRepeatOne
+          )
+
+        HStack(spacing: 0) {
+          modeIcon(
+            systemName: "shuffle",
+            isSelected: !isRepeatOne
+          )
+          modeIcon(
+            systemName: "repeat.1",
+            isSelected: isRepeatOne
+          )
+        }
+        .padding(.horizontal, inset)
+      }
+      .frame(width: controlWidth, height: controlHeight)
+      .contentShape(Capsule())
+      .overlay {
+        Capsule()
+          .stroke(isFocused ? theme.interactiveAccent : Color.clear, lineWidth: 2)
+      }
+    }
+    .buttonStyle(TransportPressButtonStyle())
+    .focused($isFocused)
+    .onHover { isHovered = $0 }
+  }
+
+  private func modeIcon(systemName: String, isSelected: Bool) -> some View {
+    Image(systemName: systemName)
+      .font(.system(size: 13, weight: .semibold))
+      .foregroundStyle(
+        isSelected
+          ? selectedIconColor
+          : (isHovered ? theme.stagePrimaryText : theme.stageSecondaryText)
+      )
+      .frame(width: segmentWidth, height: controlHeight - inset * 2)
+      .accessibilityHidden(true)
+  }
+
+  private var selectedIconColor: Color {
+    theme.scheme == .dark ? theme.accentForeground : .white
   }
 }
 

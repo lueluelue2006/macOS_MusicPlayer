@@ -60,6 +60,9 @@ final class PlaybackModeTests: XCTestCase {
             volumeCacheFileURLOverride: directory.appendingPathComponent("volume-cache.json")
         )
 
+        XCTAssertNil(player.currentFile)
+        XCTAssertFalse(player.isPlaying)
+        XCTAssertFalse(player.isPlaybackRequested)
         assertMode(.shuffle, player: player)
         player.setPlaybackMode(.shuffle)
         assertMode(.shuffle, player: player)
@@ -69,6 +72,9 @@ final class PlaybackModeTests: XCTestCase {
         assertMode(.repeatOne, player: player)
         player.setPlaybackMode(.shuffle)
         assertMode(.shuffle, player: player)
+        XCTAssertNil(player.currentFile)
+        XCTAssertFalse(player.isPlaying)
+        XCTAssertFalse(player.isPlaybackRequested)
     }
 
     private func assertMode(
