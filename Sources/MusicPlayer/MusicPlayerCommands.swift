@@ -4,7 +4,7 @@ import Foundation
 import UserNotifications
 
 struct MusicPlayerCommands: Commands {
-    let audioPlayer: AudioPlayer
+    @ObservedObject var audioPlayer: AudioPlayer
     let playlistManager: PlaylistManager
     @AppStorage("userNotifyOnDeviceSwitch") private var notifyOnDeviceSwitch: Bool = true
     @AppStorage("userNotifyDeviceSwitchSilent") private var notifyDeviceSwitchSilent: Bool = true
@@ -53,6 +53,14 @@ struct MusicPlayerCommands: Commands {
             }
 
             Divider()
+
+            Toggle(isOn: Binding(
+                get: { audioPlayer.isImmersivePlaybackEnabled },
+                set: { audioPlayer.setImmersivePlaybackEnabled($0) }
+            )) {
+                Text("沉浸播放")
+            }
+            .help("自动跳过歌曲前后的静音，让下一首更快接上；不会修改音乐文件")
 
             Button("音量均衡分析…") {
                 NotificationCenter.default.post(name: .showVolumeNormalizationAnalysis, object: nil)
@@ -132,6 +140,25 @@ struct MusicPlayerCommands: Commands {
                         guard confirmed else { return }
                         audioPlayer.clearVolumeCache()
                         NotificationCenter.default.post(name: .showVolumeCacheClearedAlert, object: nil)
+                    }
+                }
+
+                Button("清空沉浸分析缓存") {
+                    Task { @MainActor in
+                        let confirmed = DestructiveConfirmation.confirm(
+                            title: "清空沉浸分析缓存？",
+                            message: "只会删除歌曲首尾的响度分析结果，不会修改音乐文件。下次开启沉浸播放时会按需重新分析。",
+                            confirmTitle: "清除",
+                            cancelTitle: "不清除"
+                        )
+                        guard confirmed else { return }
+                        await audioPlayer.clearImmersivePlaybackCache()
+                        NotificationSettingsHelper.postToast(
+                            title: "沉浸分析缓存已清空",
+                            subtitle: "音乐文件没有改动",
+                            kind: "success",
+                            duration: 2.6
+                        )
                     }
                 }
 
@@ -226,12 +253,13 @@ struct MusicPlayerCommands: Commands {
                     Task { @MainActor in
                         let confirmed = DestructiveConfirmation.confirm(
                             title: "清空所有缓存？",
-                            message: "将清空音量均衡缓存、时长缓存、封面缩略图（内存）、歌词缓存。操作不可撤销。",
+                            message: "将清空音量均衡、沉浸分析、时长、封面缩略图（内存）和歌词缓存，不会修改音乐文件。操作不可撤销。",
                             confirmTitle: "清除",
                             cancelTitle: "不清除"
                         )
                         guard confirmed else { return }
                         audioPlayer.clearVolumeCache()
+                        await audioPlayer.clearImmersivePlaybackCache()
                         await DurationCache.shared.removeAll()
                         playlistManager.resetDurationsAndRestartPrefetch()
                         audioPlayer.clearArtworkCache()

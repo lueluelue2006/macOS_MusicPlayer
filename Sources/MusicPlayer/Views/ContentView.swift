@@ -148,7 +148,7 @@ struct ContentView: View {
                         playlistManager.currentIndex = index
                         playlistManager.savePlaylist()
                         // 恢复到上次曲目与进度，但默认不自动播放
-                        audioPlayer.prepareInitialSeekForRestore(to: time)
+                        audioPlayer.prepareInitialSeekForRestore(to: time, for: url)
                         audioPlayer.play(file, autostart: false, bypassConfirm: true)
                     } else {
                         showToastMessage("未能在播放列表中找到上次播放文件", kind: .warning)

@@ -345,9 +345,9 @@ enum RegressionTests {
         }
         manager.audioFiles = files
         manager.currentIndex = 0
-        manager.removeFile(at: 0)
+        guard let removal = manager.removeFile(at: 0) else { return false }
 
-        guard let next = manager.nextFileAfterRemovingQueueItem(atDeletedIndex: 0) else {
+        guard let next = manager.nextFileAfterRemovingQueueItem(removal) else {
             return false
         }
         return next.url == files[1].url && manager.currentIndex == 0

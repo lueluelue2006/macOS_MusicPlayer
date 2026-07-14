@@ -1,6 +1,13 @@
 import Foundation
 import Combine
 
+struct QueueRemovalContext {
+    let removedFile: AudioFile
+    let originalQueueIndex: Int
+    let playbackScope: PlaybackScope
+    let playlistPosition: Int?
+}
+
 final class PlaylistManager: ObservableObject {
     @Published var audioFiles: [AudioFile] = []
     @Published var currentIndex: Int = 0
@@ -54,6 +61,12 @@ final class PlaylistManager: ObservableObject {
     private let isRunningRegressionTests: Bool
     private let playlistIOQueue = DispatchQueue(label: "playlist.persistence", qos: .utility)
     private let playlistIOQueueKey = DispatchSpecificKey<Void>()
+    private let playlistSaveStateLock = NSLock()
+    private var playlistSaveRevision: UInt64 = 0
+    private var playlistSaveWorkItem: DispatchWorkItem?
+    private var pendingPlaylistWrite: (revision: UInt64, snapshot: SavedPlaylist)?
+    private var isPlaylistWriteDrainScheduled = false
+    private let playlistSaveDebounceInterval: TimeInterval
     private let metadataGate = ConcurrencyGate(maxConcurrent: 4) // 限制元数据加载并发
     private let durationGate = ConcurrencyGate(maxConcurrent: 2) // 限制时长计算并发（更轻量但也需要控速）
 
@@ -70,12 +83,19 @@ final class PlaylistManager: ObservableObject {
     @MainActor private var pendingDurationURLKeys: Set<String> = []
     @MainActor private var pendingDurationIndex: Int = 0
 
-    init(playlistFileURLOverride: URL? = nil, disablePersistence: Bool = false) {
+    init(
+        playlistFileURLOverride: URL? = nil,
+        disablePersistence: Bool = false,
+        persistenceDebounceInterval: TimeInterval = 0.4
+    ) {
         self.playlistFileURLOverride = playlistFileURLOverride
+        self.playlistSaveDebounceInterval = max(0, persistenceDebounceInterval)
         self.isRunningRegressionTests = disablePersistence
             || ProcessInfo.processInfo.environment["MUSICPLAYER_RUN_REGRESSION_TESTS"] == "1"
         playlistIOQueue.setSpecific(key: playlistIOQueueKey, value: ())
-        loadScanSubfoldersPreference()
+        if !isRunningRegressionTests {
+            loadScanSubfoldersPreference()
+        }
 
         // When weights change, regenerate shuffle queues on next usage.
         NotificationCenter.default.addObserver(
@@ -128,6 +148,7 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func persistPlaybackScope(_ scope: PlaybackScope) {
+        guard !isRunningRegressionTests else { return }
         let d = UserDefaults.standard
         switch scope {
         case .queue:
@@ -843,9 +864,25 @@ final class PlaylistManager: ObservableObject {
         return fresh
     }
     
-    func removeFile(at index: Int) {
-        guard audioFiles.indices.contains(index) else { return }
-        let removedURL = audioFiles[index].url
+    @discardableResult
+    func removeFile(at index: Int) -> QueueRemovalContext? {
+        guard audioFiles.indices.contains(index) else { return nil }
+        let removedFile = audioFiles[index]
+        let removedURL = removedFile.url
+        let scopeBeforeRemoval = playbackScope
+        let playlistPositionBeforeRemoval: Int?
+        switch scopeBeforeRemoval {
+        case .queue:
+            playlistPositionBeforeRemoval = nil
+        case .playlist:
+            playlistPositionBeforeRemoval = playbackPlaylistPositionByKey[pathKey(removedURL)]
+        }
+        let context = QueueRemovalContext(
+            removedFile: removedFile,
+            originalQueueIndex: index,
+            playbackScope: scopeBeforeRemoval,
+            playlistPosition: playlistPositionBeforeRemoval
+        )
         audioFiles.remove(at: index)
         invalidateQueueIndexCache()
         unplayableReasons.removeValue(forKey: pathKey(removedURL))
@@ -861,14 +898,45 @@ final class PlaylistManager: ObservableObject {
         updateFilteredFiles()
         resetShuffleQueue()
         savePlaylist() // 保存播放列表
+        return context
     }
 
-    func nextFileAfterRemovingQueueItem(atDeletedIndex deletedIndex: Int) -> AudioFile? {
+    func nextFileAfterRemovingQueueItem(
+        _ context: QueueRemovalContext,
+        queueIndexAfterBatchRemoval: Int? = nil
+    ) -> AudioFile? {
         guard !audioFiles.isEmpty else { return nil }
-        let nextIndex = audioFiles.indices.contains(deletedIndex) ? deletedIndex : 0
-        currentIndex = nextIndex
-        savePlaylist()
-        return audioFiles[nextIndex]
+        guard playbackScope == context.playbackScope else { return nil }
+
+        switch context.playbackScope {
+        case .queue:
+            let insertionIndex = queueIndexAfterBatchRemoval ?? context.originalQueueIndex
+            let normalizedInsertionIndex = max(0, insertionIndex)
+            let start = normalizedInsertionIndex < audioFiles.count ? normalizedInsertionIndex : 0
+            for offset in 0 ..< audioFiles.count {
+                let index = (start + offset) % audioFiles.count
+                guard !isUnplayableIndex(index) else { continue }
+                currentIndex = index
+                savePlaylist()
+                return audioFiles[index]
+            }
+            return nil
+
+        case .playlist:
+            guard let removedPosition = context.playlistPosition,
+                  !playbackPlaylistTrackKeys.isEmpty else { return nil }
+            let total = playbackPlaylistTrackKeys.count
+            for offset in 1 ... total {
+                let position = (removedPosition + offset) % total
+                let key = playbackPlaylistTrackKeys[position]
+                guard let index = indexInQueue(forPathKey: key),
+                      !isUnplayableIndex(index) else { continue }
+                currentIndex = index
+                savePlaylist()
+                return audioFiles[index]
+            }
+            return nil
+        }
     }
     
     @MainActor
@@ -1026,6 +1094,7 @@ final class PlaylistManager: ObservableObject {
             currentIndex = (currentIndex + 1) % total
             attempts += 1
             if !isUnplayableIndex(currentIndex) {
+                savePlaylist()
                 return audioFiles[currentIndex]
             }
         }
@@ -1043,6 +1112,7 @@ final class PlaylistManager: ObservableObject {
             currentIndex = currentIndex > 0 ? currentIndex - 1 : total - 1
             attempts += 1
             if !isUnplayableIndex(currentIndex) {
+                savePlaylist()
                 return audioFiles[currentIndex]
             }
         }
@@ -1084,6 +1154,7 @@ final class PlaylistManager: ObservableObject {
         if !shuffleQueue.isEmpty {
             currentIndex = shuffleQueue[0]
             shuffleIndex = 1
+            savePlaylist()
             return audioFiles[currentIndex]
         }
         return nil
@@ -1443,6 +1514,7 @@ final class PlaylistManager: ObservableObject {
             shuffleIndex += 1
             if !isUnplayableIndex(idx) {
                 currentIndex = idx
+                savePlaylist()
                 return audioFiles[idx]
             }
         }
@@ -1455,6 +1527,7 @@ final class PlaylistManager: ObservableObject {
             let idx = shuffleQueue[shuffleIndex]
             if !isUnplayableIndex(idx) {
                 currentIndex = idx
+                savePlaylist()
                 return audioFiles[idx]
             }
         }
@@ -1476,6 +1549,7 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func saveScanSubfoldersPreference() {
+        guard !isRunningRegressionTests else { return }
         let d = UserDefaults.standard
         d.set(scanSubfolders, forKey: userScanSubfoldersKey)
     }
@@ -1655,25 +1729,101 @@ final class PlaylistManager: ObservableObject {
             debugLog("回归测试模式：跳过播放列表持久化写盘")
             return
         }
-        let snapshot = SavedPlaylist(paths: audioFiles.map { $0.url.path }, currentIndex: currentIndex)
-        debugLog("保存播放列表: \(snapshot.paths.count) 个文件, 当前索引: \(snapshot.currentIndex)")
-        guard let url = playlistFileURL() else {
-            PersistenceLogger.log("保存播放列表失败: 无法创建应用支持目录")
-            DispatchQueue.main.async {
-                PersistenceLogger.notifyUser(title: "播放列表保存失败", subtitle: "无法创建应用支持目录")
+        let previousWorkItem: DispatchWorkItem?
+        playlistSaveStateLock.lock()
+        playlistSaveRevision &+= 1
+        let revision = playlistSaveRevision
+        previousWorkItem = playlistSaveWorkItem
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.playlistSaveStateLock.lock()
+            let isLatest = revision == self.playlistSaveRevision
+            if isLatest {
+                self.playlistSaveWorkItem = nil
             }
+            self.playlistSaveStateLock.unlock()
+            guard isLatest else { return }
+
+            // Capture the latest queue only when the debounce drains, so rapid
+            // navigation does not repeatedly allocate O(queue-size) path arrays.
+            let snapshot = SavedPlaylist(
+                paths: self.audioFiles.map { $0.url.path },
+                currentIndex: self.currentIndex
+            )
+            self.debugLog(
+                "保存播放列表: \(snapshot.paths.count) 个文件, 当前索引: \(snapshot.currentIndex)"
+            )
+            self.enqueuePlaylistWrite(snapshot, revision: revision)
+        }
+        playlistSaveWorkItem = workItem
+        playlistSaveStateLock.unlock()
+        previousWorkItem?.cancel()
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + playlistSaveDebounceInterval,
+            execute: workItem
+        )
+    }
+
+    func flushPlaylistPersistence() {
+        guard !isRunningRegressionTests else { return }
+
+        // Publish the flush snapshot through the same bounded, serial drain as
+        // debounced saves. A flush can therefore never overtake an older write
+        // or overwrite a newer snapshot that the active drain already picked up.
+        let snapshot = SavedPlaylist(paths: audioFiles.map { $0.url.path }, currentIndex: currentIndex)
+        playlistSaveStateLock.lock()
+        playlistSaveRevision &+= 1
+        let pending = playlistSaveWorkItem
+        playlistSaveWorkItem = nil
+        pendingPlaylistWrite = (playlistSaveRevision, snapshot)
+        isPlaylistWriteDrainScheduled = true
+        playlistSaveStateLock.unlock()
+        pending?.cancel()
+
+        if DispatchQueue.getSpecific(key: playlistIOQueueKey) != nil {
+            drainLatestPlaylistWrites()
+        } else {
+            playlistIOQueue.sync {
+                drainLatestPlaylistWrites()
+            }
+        }
+    }
+
+    private func enqueuePlaylistWrite(_ snapshot: SavedPlaylist, revision: UInt64) {
+        playlistSaveStateLock.lock()
+        guard revision == playlistSaveRevision else {
+            playlistSaveStateLock.unlock()
             return
         }
-        playlistIOQueue.async {
-            do {
-                try self.writePlaylistSnapshot(snapshot, to: url)
-            } catch {
-                self.debugLog("保存播放列表到磁盘失败: \(error)")
-                PersistenceLogger.log("保存播放列表失败: \(error)")
-                DispatchQueue.main.async {
-                    PersistenceLogger.notifyUser(title: "播放列表保存失败", subtitle: "请检查磁盘权限或空间")
-                }
+        pendingPlaylistWrite = (revision, snapshot)
+        guard !isPlaylistWriteDrainScheduled else {
+            playlistSaveStateLock.unlock()
+            return
+        }
+        isPlaylistWriteDrainScheduled = true
+        playlistSaveStateLock.unlock()
+
+        playlistIOQueue.async { [weak self] in
+            self?.drainLatestPlaylistWrites()
+        }
+    }
+
+    private func drainLatestPlaylistWrites() {
+        while true {
+            playlistSaveStateLock.lock()
+            guard let pending = pendingPlaylistWrite else {
+                isPlaylistWriteDrainScheduled = false
+                playlistSaveStateLock.unlock()
+                return
             }
+            pendingPlaylistWrite = nil
+            playlistSaveStateLock.unlock()
+
+            // Revisions can advance before their debounce has produced a new
+            // snapshot. The captured snapshot is still safe to write: enqueues
+            // are monotonic, and a newer captured snapshot replaces the single
+            // pending slot or is written on the next loop iteration.
+            _ = savePlaylistToDisk(pending.snapshot)
         }
     }
     

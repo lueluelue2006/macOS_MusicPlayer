@@ -10,16 +10,20 @@ struct PlaybackControlsView: View {
   var body: some View {
     let playableCount = playlistManager.playbackScopePlayableCount()
     let canChangeTrack = playableCount > 0 && !isEphemeralPlayback
+    let isPlaybackActive = audioPlayer.isPlaybackRequested || audioPlayer.isPlaying
+    let canTogglePlayback = audioPlayer.canTogglePlayback
 
     HStack(spacing: 22) {
-      TransportIconButton(
+      TransportIconToggle(
         systemName: "shuffle",
-        isActive: audioPlayer.isShuffling,
+        accessibilityLabel: "随机播放",
+        isOn: Binding(
+          get: { audioPlayer.isShuffling },
+          set: { audioPlayer.setShuffling($0) }
+        ),
         isDisabled: isEphemeralPlayback,
         help: isEphemeralPlayback ? "临时播放模式下不可切歌" : "随机播放"
-      ) {
-        audioPlayer.toggleShuffle()
-      }
+      )
 
       TransportIconButton(
         systemName: "backward.fill",
@@ -36,17 +40,17 @@ struct PlaybackControlsView: View {
             .fill(theme.accent)
             .frame(width: 54, height: 54)
 
-          Image(systemName: audioPlayer.isPlaying ? "pause.fill" : "play.fill")
+          Image(systemName: isPlaybackActive ? "pause.fill" : "play.fill")
             .font(.system(size: 20, weight: .bold))
-            .foregroundStyle(Color.white)
-            .offset(x: audioPlayer.isPlaying ? 0 : 1)
+            .foregroundStyle(theme.accentForeground)
+            .offset(x: isPlaybackActive ? 0 : 1)
         }
       }
       .buttonStyle(TransportPressButtonStyle())
-      .disabled(audioPlayer.currentFile == nil)
-      .opacity(audioPlayer.currentFile == nil ? 0.42 : 1)
-      .help(audioPlayer.isPlaying ? "暂停" : "播放")
-      .accessibilityLabel(audioPlayer.isPlaying ? "暂停" : "播放")
+      .disabled(!canTogglePlayback)
+      .opacity(canTogglePlayback ? 1 : 0.42)
+      .help(isPlaybackActive ? "暂停" : "播放")
+      .accessibilityLabel(isPlaybackActive ? "暂停" : "播放")
 
       TransportIconButton(
         systemName: "forward.fill",
@@ -57,23 +61,31 @@ struct PlaybackControlsView: View {
         nextTrack()
       }
 
-      TransportIconButton(
+      TransportIconToggle(
         systemName: "repeat.1",
-        isActive: audioPlayer.isLooping,
+        accessibilityLabel: "单曲循环",
+        isOn: Binding(
+          get: { audioPlayer.isLooping },
+          set: { audioPlayer.setLooping($0) }
+        ),
         help: "单曲循环"
-      ) {
-        audioPlayer.toggleLoop()
-      }
+      )
+
+      TransportIconToggle(
+        systemName: "infinity",
+        accessibilityLabel: "沉浸播放",
+        isOn: Binding(
+          get: { audioPlayer.isImmersivePlaybackEnabled },
+          set: { audioPlayer.setImmersivePlaybackEnabled($0) }
+        ),
+        help: "沉浸播放：自动跳过歌曲前后的静音，让下一首更快接上"
+      )
     }
     .frame(maxWidth: .infinity)
   }
 
   private func togglePlayback() {
-    if audioPlayer.isPlaying {
-      audioPlayer.pause()
-    } else if audioPlayer.currentFile != nil {
-      audioPlayer.resume()
-    }
+    audioPlayer.togglePlayPause()
   }
 
   private func nextTrack() {
@@ -88,6 +100,56 @@ struct PlaybackControlsView: View {
     if let previousFile = playlistManager.previousFile(isShuffling: audioPlayer.isShuffling) {
       audioPlayer.play(previousFile)
     }
+  }
+}
+
+private struct TransportIconToggle: View {
+  let systemName: String
+  let accessibilityLabel: String
+  @Binding var isOn: Bool
+  var size: CGFloat = 15
+  var isDisabled: Bool = false
+  let help: String
+
+  @State private var isHovered = false
+  @FocusState private var isFocused: Bool
+  @Environment(\.colorScheme) private var colorScheme
+  private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+
+  var body: some View {
+    Toggle(isOn: $isOn) {
+      Image(systemName: systemName)
+        .font(.system(size: size, weight: .semibold))
+        .foregroundStyle(
+          isOn
+            ? theme.interactiveAccent
+            : (isHovered ? theme.stagePrimaryText : theme.stageSecondaryText)
+        )
+        .frame(width: 34, height: 34)
+        .background {
+          Circle()
+            .fill(isOn ? theme.interactiveAccent.opacity(0.11) : Color.clear)
+        }
+        .overlay {
+          Circle()
+            .stroke(
+              isFocused
+                ? theme.interactiveAccent
+                : (isOn ? theme.interactiveAccent.opacity(0.50) : Color.clear),
+              lineWidth: isFocused ? 2 : 1
+            )
+        }
+        .contentShape(Rectangle())
+    }
+    .toggleStyle(.button)
+    .buttonStyle(TransportPressButtonStyle())
+    .focused($isFocused)
+    .disabled(isDisabled)
+    .opacity(isDisabled ? 0.28 : 1)
+    .onHover { isHovered = $0 }
+    .help(help)
+    .accessibilityLabel(accessibilityLabel)
+    .accessibilityValue(isOn ? "已开启" : "已关闭")
   }
 }
 

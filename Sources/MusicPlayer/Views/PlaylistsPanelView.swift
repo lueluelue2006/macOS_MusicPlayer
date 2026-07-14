@@ -148,7 +148,7 @@ struct PlaylistsPanelView: View {
                   .foregroundColor(theme.mutedText)
               }
               Spacer(minLength: 0)
-              if audioPlayer.currentFile != nil,
+              if audioPlayer.playbackTargetURL != nil,
                 audioPlayer.persistPlaybackState,
                 playlistManager.playbackScope == .playlist(playlist.id)
               {
@@ -499,14 +499,7 @@ struct PlaylistsPanelView: View {
     }
 
     playlistManager.setPlaybackScopePlaylist(playlist.id, trackURLsInOrder: playable.map(\.url))
-    // 若点击的是“当前已加载/正在播放”的曲目，不要重启到 0:00。
-    if audioPlayer.currentFile?.url == selected.url {
-      if !audioPlayer.isPlaying {
-        audioPlayer.resume()
-      }
-      return
-    }
-    audioPlayer.play(selected)
+    audioPlayer.selectOrResume(selected)
   }
 
   // MARK: - Loading

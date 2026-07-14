@@ -36,7 +36,7 @@ struct MusicPlayerApp: App {
                     guard let ap = audioPlayer else { return }
                     ap.isHeadphoneOutput = false
                     ap.shouldConfirmSpeakerPlayback = true
-                    if ap.isPlaying {
+                    if ap.isPlaybackRequested || ap.isPlaying {
                         ap.shouldAutoResumeAfterRoute = true
                         ap.pause()
                     }
@@ -61,9 +61,11 @@ struct MusicPlayerApp: App {
                         ap.shouldAutoResumeAfterRoute = false
                         return
                     }
-                    if ap.shouldAutoResumeAfterRoute, !ap.isPlaying, ap.currentFile != nil {
+                    if ap.shouldAutoResumeAfterRoute {
                         ap.shouldAutoResumeAfterRoute = false
-                        ap.resume()
+                        if !ap.isPlaybackRequested, ap.canTogglePlayback {
+                            ap.resume()
+                        }
                     }
                 }
             },

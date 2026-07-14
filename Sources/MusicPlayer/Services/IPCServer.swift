@@ -313,6 +313,9 @@ final class IPCServer {
             return IPCReply(id: request.id, ok: true)
 
         case .resume:
+            guard audioPlayer.canTogglePlayback else {
+                return IPCReply(id: request.id, ok: false, message: "no track to resume")
+            }
             audioPlayer.resume()
             return IPCReply(id: request.id, ok: true)
 
@@ -391,16 +394,18 @@ final class IPCServer {
             return IPCReply(id: request.id, ok: false, message: "no match for query")
 
         case .seek:
-            guard audioPlayer.currentFile != nil else {
-                return IPCReply(id: request.id, ok: false, message: "no track loaded")
+            guard audioPlayer.playbackTargetURL != nil else {
+                return IPCReply(id: request.id, ok: false, message: "no track selected")
             }
             guard let raw = request.arguments?["time"], let t = Double(raw), t.isFinite else {
                 return IPCReply(id: request.id, ok: false, message: "missing/invalid time")
             }
-            let duration = audioPlayer.playbackClock.duration
-            let clamped = duration > 0 ? max(0, min(t, duration)) : max(0, t)
-            audioPlayer.seek(to: clamped)
-            return IPCReply(id: request.id, ok: true, data: ["time": String(format: "%.3f", clamped)])
+            audioPlayer.seek(to: max(0, t))
+            return IPCReply(
+                id: request.id,
+                ok: true,
+                data: ["time": String(format: "%.3f", audioPlayer.playbackClock.currentTime)]
+            )
 
         case .setVolume:
             guard let raw = request.arguments?["value"], let v = Float(raw), v.isFinite else {
@@ -449,19 +454,34 @@ final class IPCServer {
             return IPCReply(id: request.id, ok: true, message: "enqueued \(urls.count) item(s)")
 
         case .remove:
-            let currentURL = audioPlayer.currentFile?.url
+            let installedPlaybackURL = audioPlayer.currentFile?.url
+            let pendingPlaybackURL = audioPlayer.pendingPlaybackURL
 
             if let raw = request.arguments?["index"], let idx = Int(raw), idx >= 0 {
                 guard idx < playlistManager.audioFiles.count else {
                     return IPCReply(id: request.id, ok: false, message: "index out of range")
                 }
                 let urlToRemove = playlistManager.audioFiles[idx].url
-                playlistManager.removeFile(at: idx)
-                if let currentURL, currentURL == urlToRemove {
-                    audioPlayer.handleCurrentTrackRemoved(
+                let removesPlaybackReference =
+                    installedPlaybackURL == urlToRemove || pendingPlaybackURL == urlToRemove
+                let removalContext = playlistManager.removeFile(at: idx)
+                if removesPlaybackReference {
+                    audioPlayer.handleRemovedTrack(
+                        urlToRemove,
                         remainingFiles: playlistManager.audioFiles,
-                        playNext: { self.playlistManager.nextFileAfterRemovingQueueItem(atDeletedIndex: idx) },
-                        playRandom: { self.playlistManager.getRandomFile() }
+                        playNext: {
+                            removalContext.flatMap {
+                                self.playlistManager.nextFileAfterRemovingQueueItem($0)
+                            }
+                        },
+                        playRandom: { self.playlistManager.getRandomFile() },
+                        restoreInstalledSelection: {
+                            guard let installedURL = self.audioPlayer.currentFile?.url,
+                                  let installedIndex = self.playlistManager.audioFiles.firstIndex(
+                                    where: { $0.url == installedURL }
+                                  ) else { return }
+                            _ = self.playlistManager.selectFile(at: installedIndex)
+                        }
                     )
                 }
                 return IPCReply(
@@ -526,32 +546,45 @@ final class IPCServer {
                 guard idx >= 0, idx < playlistManager.audioFiles.count else { return nil }
                 return playlistManager.audioFiles[idx].url
             }
-            let deletedCurrentIndex: Int? = currentURL.flatMap { current in
-                indicesToRemove.first { idx in
-                    idx >= 0 &&
-                    idx < playlistManager.audioFiles.count &&
-                    playlistManager.audioFiles[idx].url == current
-                }
-            }
-            let adjustedDeletedCurrentIndex = deletedCurrentIndex.map { deletedIndex in
-                deletedIndex - indicesToRemove.filter { $0 < deletedIndex }.count
+            var removedPlaybackURLs: [URL] = []
+            for url in [pendingPlaybackURL, installedPlaybackURL].compactMap({ $0 })
+            where urlsToRemove.contains(url) && !removedPlaybackURLs.contains(url) {
+                removedPlaybackURLs.append(url)
             }
 
+            var removalContexts: [String: QueueRemovalContext] = [:]
             for idx in indicesToRemove.sorted(by: >) {
                 if idx >= 0, idx < playlistManager.audioFiles.count {
-                    playlistManager.removeFile(at: idx)
+                    if let context = playlistManager.removeFile(at: idx) {
+                        removalContexts[PathKey.canonical(for: context.removedFile.url)] = context
+                    }
                 }
             }
 
-            if let currentURL, urlsToRemove.contains(currentURL) {
-                audioPlayer.handleCurrentTrackRemoved(
+            for removedPlaybackURL in removedPlaybackURLs {
+                let context = removalContexts[PathKey.canonical(for: removedPlaybackURL)]
+                let adjustedIndex = context.map { removal in
+                    removal.originalQueueIndex
+                        - indicesToRemove.filter { $0 < removal.originalQueueIndex }.count
+                }
+                audioPlayer.handleRemovedTrack(
+                    removedPlaybackURL,
                     remainingFiles: playlistManager.audioFiles,
                     playNext: {
-                        self.playlistManager.nextFileAfterRemovingQueueItem(
-                            atDeletedIndex: adjustedDeletedCurrentIndex ?? 0
+                        guard let context else { return nil }
+                        return self.playlistManager.nextFileAfterRemovingQueueItem(
+                            context,
+                            queueIndexAfterBatchRemoval: adjustedIndex
                         )
                     },
-                    playRandom: { self.playlistManager.getRandomFile() }
+                    playRandom: { self.playlistManager.getRandomFile() },
+                    restoreInstalledSelection: {
+                        guard let installedURL = self.audioPlayer.currentFile?.url,
+                              let installedIndex = self.playlistManager.audioFiles.firstIndex(
+                                where: { $0.url == installedURL }
+                              ) else { return }
+                        _ = self.playlistManager.selectFile(at: installedIndex)
+                    }
                 )
             }
 
@@ -1098,13 +1131,7 @@ final class IPCServer {
         playlistsStore.selectedPlaylistID = playlistID
         playlistManager.setPlaybackScopePlaylist(playlistID, trackURLsInOrder: urlsInOrder)
 
-        if audioPlayer.currentFile?.url == selected.url {
-            if !audioPlayer.isPlaying {
-                audioPlayer.resume()
-            }
-        } else {
-            audioPlayer.play(selected)
-        }
+        audioPlayer.selectOrResume(selected)
 
         return IPCReply(
             id: request.id,

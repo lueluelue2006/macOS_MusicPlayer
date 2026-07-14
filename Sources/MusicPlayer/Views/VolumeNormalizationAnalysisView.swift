@@ -196,10 +196,10 @@ struct VolumeNormalizationAnalysisView: View {
         VStack(alignment: .leading, spacing: 12) {
           preferenceToggle(
             title: "闲置时自动分析",
-            detail: "无操作 10 秒后开始，任意输入会暂停。",
+            detail: "全机闲置 60 秒后，每批最多 2 首；播放、低电量模式或升温时暂停。",
             isOn: autoPreanalysisBinding
           )
-          .help("检测鼠标/键盘操作；无操作一段时间后自动后台分析，任意操作会暂停自动预分析。")
+          .help("其他应用中的输入会在监测到后暂停；在播放器内操作或开始播放会立即暂停当前自动分析。")
 
           Divider().opacity(0.55)
 

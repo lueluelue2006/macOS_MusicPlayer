@@ -80,7 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 空格（49）/ 回车（36）/ 小键盘回车（76）：切换播放/暂停
             let keyCode = event.keyCode
             if keyCode == 49 || keyCode == 36 || keyCode == 76 {
-                if ap.currentFile != nil {
+                if ap.canTogglePlayback {
                     ap.togglePlayPause()
                 }
                 // 吞掉事件，避免系统“嘟”一声或触发其它默认快捷键
@@ -94,7 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             guard let ap = self?.audioPlayer else { return }
             // 明确暂停，确保不会凭底层自动恢复继续播放
-            if ap.isPlaying { ap.pause() }
+            if ap.isPlaybackRequested || ap.isPlaying { ap.pause() }
             // 标记睡眠状态并清理自动续播意图
             ap.isSystemSleeping = true
             ap.shouldAutoResumeAfterRoute = false
@@ -110,6 +110,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        audioPlayer?.cancelVolumeNormalizationPreanalysis()
+        audioPlayer?.flushVolumeCachePersistence()
+        audioPlayer?.flushImmersivePlaybackCachePersistence()
+        playlistManager?.flushPlaylistPersistence()
         if let monitor = keyEventMonitor {
             NSEvent.removeMonitor(monitor)
             keyEventMonitor = nil

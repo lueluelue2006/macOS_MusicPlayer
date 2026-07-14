@@ -45,7 +45,7 @@ struct PlaylistView: View {
   }
 
   private var activePlaybackScopeBadge: PlaybackScopeBadge? {
-    guard audioPlayer.currentFile != nil, audioPlayer.persistPlaybackState else { return nil }
+    guard audioPlayer.playbackTargetURL != nil, audioPlayer.persistPlaybackState else { return nil }
 
     switch playlistManager.playbackScope {
     case .queue:
@@ -263,36 +263,42 @@ struct PlaylistView: View {
                     guard let index = playlistManager.audioFiles.firstIndex(of: selectedFile),
                       let file = playlistManager.selectFile(at: index)
                     else { return }
-                    // 若点击的是“当前已加载/正在播放”的曲目，不要重启到 0:00。
-                    if audioPlayer.currentFile?.url == file.url {
-                      if !audioPlayer.isPlaying {
-                        audioPlayer.resume()
-                      }
-                      return
-                    }
-                    audioPlayer.play(file)
+                    audioPlayer.selectOrResume(file)
                   },
                   deleteAction: { fileToDelete in
                     NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                    // 删除前判断是否命中当前播放
-                    let isDeletingCurrent = (audioPlayer.currentFile?.url == fileToDelete.url)
+                    // 删除前判断是否命中已安装播放器或仍在加载的目标。
+                    let isDeletingPlaybackReference =
+                      audioPlayer.currentFile?.url == fileToDelete.url ||
+                      audioPlayer.pendingPlaybackURL == fileToDelete.url
                     if let index = playlistManager.audioFiles.firstIndex(of: fileToDelete) {
                       // 先执行删除
-                      playlistManager.removeFile(at: index)
+                      let removalContext = playlistManager.removeFile(at: index)
 
-                      // 若删除的是当前播放，根据播放模式处理
-                      if isDeletingCurrent {
+                      // 若删除命中播放状态，根据播放模式处理。
+                      if isDeletingPlaybackReference {
                         // 删除后剩余文件列表（从真实数据源拿）
                         let remaining = playlistManager.audioFiles
 
                         // 如果后续需要顺序“下一首”，可在此提供闭包：playNext: { playlistManager.nextAfterDeletion(from: index) }
                         // 现阶段按约定：单曲循环->停止并清空；随机->随机一首；其他->停止并清空
-                        audioPlayer.handleCurrentTrackRemoved(
+                        audioPlayer.handleRemovedTrack(
+                          fileToDelete.url,
                           remainingFiles: remaining,
                           playNext: {
-                            playlistManager.nextFileAfterRemovingQueueItem(atDeletedIndex: index)
+                            removalContext.flatMap {
+                              playlistManager.nextFileAfterRemovingQueueItem($0)
+                            }
                           },
-                          playRandom: { playlistManager.getRandomFile() }
+                          playRandom: { playlistManager.getRandomFile() },
+                          restoreInstalledSelection: {
+                            guard let installedURL = audioPlayer.currentFile?.url,
+                              let installedIndex = playlistManager.audioFiles.firstIndex(
+                                where: { $0.url == installedURL }
+                              )
+                            else { return }
+                            _ = playlistManager.selectFile(at: installedIndex)
+                          }
                         )
                       }
                     }

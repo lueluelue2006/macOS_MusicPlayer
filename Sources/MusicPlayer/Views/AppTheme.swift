@@ -19,6 +19,14 @@ struct AppTheme {
     Color(red: 1.0, green: 0.58, blue: 0.31)
   }
 
+  /// Accent used for small controls and keyboard focus indicators.
+  /// The darker light-mode value stays legible on the warm listening stage.
+  var interactiveAccent: Color {
+    scheme == .dark
+      ? accent
+      : Color(red: 0.55, green: 0.075, blue: 0.105)
+  }
+
   /// High-contrast label color for text placed directly on the coral accent.
   var accentForeground: Color {
     Color(red: 0.13, green: 0.070, blue: 0.080)

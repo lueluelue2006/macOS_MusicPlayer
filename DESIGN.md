@@ -1,4 +1,4 @@
-# MusicPlayer 4.2.2 Design System
+# MusicPlayer 4.3 Design System
 
 ## Mode
 
@@ -36,8 +36,9 @@ colors, decorative glass, border-heavy regions, and perpetual animation.
 
 ### Color
 
-- Brand accent: a single restrained coral red used for play state, selection,
-  focus, and primary actions.
+- Brand accent: a single restrained coral-red family used for play state,
+  selection, focus, and primary actions. Small active controls use a darker
+  burgundy value in light appearance to preserve contrast on warm gray.
 - Dark appearance: deep graphite player plus a low-saturation wine-to-graphite
   library, both with cool-white labels.
 - Light appearance: muted rose-gray player and warm-gray library with dark
@@ -75,8 +76,12 @@ colors, decorative glass, border-heavy regions, and perpetual animation.
 
 - **Now Playing:** orientation header, 280–320 point artwork/sleeve, left-aligned
   title metadata, progress, one coherent transport row, then quiet utilities.
-- **Transport:** shuffle, previous, play/pause, next, repeat. Only play/pause is
-  solid; active modes use the single accent without text pills.
+- **Transport:** shuffle, previous, play/pause, next, repeat, immersive. Only
+  play/pause is solid; active modes use the single accent without text pills.
+  Immersive playback uses a compact infinity symbol with native help and
+  accessibility state instead of adding another labeled control. Shuffle,
+  repeat, and immersive are native button-style `Toggle` controls; shuffle and
+  single-track repeat remain mutually exclusive.
 - **Queue toolbar:** title/count and text tabs on the left; one import action and
   quiet icon tools on the right. Destructive and infrequent actions live in an
   overflow menu.
@@ -94,6 +99,18 @@ colors, decorative glass, border-heavy regions, and perpetual animation.
 - No blur, file I/O, sorting, path normalization, large shadow, or artwork
   decoding inside queue rows.
 - Keep current-artwork ImageIO downsampling and the bounded playlist workers.
+- Immersive playback analyzes only bounded head and tail windows, caches the
+  result, and keeps one current plus one preloaded player. It never rewrites
+  music files, falls back to the full track when confidence is low, and does
+  not promise sample-accurate gapless playback.
+- Full-track normalization analysis stays on one serial `.utility` lane. Auto
+  analysis starts only after 60 seconds of system-wide idle time, handles at
+  most two tracks per batch, and stops for playback, input, Low Power Mode, or
+  any thermal state above nominal. Its signed cache is bounded to 5,000 entries
+  and roughly 8 MiB; no decoded PCM is retained.
+- Queue snapshots are captured only when a 400 ms latest-state debounce drains,
+  then use atomic replacement; loudness-cache saves are coalesced, and queue,
+  loudness, and immersive-boundary stores flush at application termination.
 - Use native `Button`, `Menu`, `Slider`, `Toggle`, `TextField`, and scroll
   semantics so keyboard and accessibility behavior survive the redesign.
 - The root owns lifecycle, notifications, alerts, sheets, drops, and updates;
