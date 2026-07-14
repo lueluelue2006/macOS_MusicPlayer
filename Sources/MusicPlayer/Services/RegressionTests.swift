@@ -365,14 +365,14 @@ enum RegressionTests {
         let levels = PlaybackWeights.Level.allCases
         guard levels.map(\.rawValue) == Array(0 ... 5),
               levels.map(\.multiplier) == [0.5, 1.0, 1.6, 3.2, 4.8, 6.4],
-              PlaybackWeights.Level.defaultLevel == .blue,
-              weights.level(for: url, scope: .queue) == .blue else { return false }
+              PlaybackWeights.Level.defaultLevel == .green,
+              weights.level(for: url, scope: .queue) == .green else { return false }
 
         weights.setLevel(.white, for: url, scope: .queue)
         guard weights.level(for: url, scope: .queue) == .white else { return false }
 
-        weights.setLevel(.blue, for: url, scope: .queue)
-        guard weights.level(for: url, scope: .queue) == .blue else { return false }
+        weights.setLevel(.green, for: url, scope: .queue)
+        guard weights.level(for: url, scope: .queue) == .green else { return false }
 
         weights.setLevel(.white, for: url, scope: .playlist(playlistID))
         let sync = weights.syncPlaylistOverridesToQueue(from: playlistID)

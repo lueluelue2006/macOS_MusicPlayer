@@ -1,4 +1,4 @@
-# MusicPlayer 4.3.3 Design System
+# MusicPlayer 4.3.4 Design System
 
 ## Mode
 
@@ -90,9 +90,10 @@ colors, decorative glass, border-heavy regions, and perpetual animation.
   duration, and hover/context actions. The random-weight control stays hidden
   until hover unless overridden; when shown, it always states both level and
   multiplier.
-- **Random weight:** six levels numbered 0–5 map to 0.5×, 1.0×, 1.6×, 3.2×,
-  4.8×, and 6.4×. Level 2 (1.6×) is the default. Menus mark it as default and
-  use labels such as “档位 2 · 1.6×” instead of color alone.
+- **Random weight:** six visible square buttons in the now-playing utility row
+  map to 0.5×, 1.0×, 1.6×, 3.2×, 4.8×, and 6.4×; they never collapse into a
+  text menu. The second level (1.0×) is the default. Track-row menus use human
+  ordinals such as “第 2 档 · 1.0×”; the CLI/API retains raw levels 0–5.
 - **Lyrics:** absent when no lyrics exist; otherwise a flat continuation of the
   listening stage, not another card.
 

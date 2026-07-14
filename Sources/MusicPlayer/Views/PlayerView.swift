@@ -242,7 +242,7 @@ struct CurrentTrackView: View {
         )
         .padding(.top, 17)
 
-        HStack(spacing: 18) {
+        HStack(spacing: 12) {
           Menu {
             let rates: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
             ForEach(rates, id: \.self) { rate in
@@ -265,33 +265,14 @@ struct CurrentTrackView: View {
           .buttonStyle(.plain)
           .help("播放速度")
 
-          Menu {
-            ForEach(PlaybackWeights.Level.allCases, id: \.rawValue) { level in
-              Button {
-                weights.setLevel(level, for: currentFile.url, scope: weightScope())
-              } label: {
-                if weights.level(for: currentFile.url, scope: weightScope()) == level {
-                  Label(weightLabel(level), systemImage: "checkmark")
-                } else {
-                  Text(weightLabel(level))
-                }
-              }
-            }
-          } label: {
-            Label(
-              weightValueLabel(weights.level(for: currentFile.url, scope: weightScope())),
-              systemImage: "dial.medium"
-            )
-            .font(.system(size: 11, weight: .medium))
+          WeightBlocksView(
+            level: weights.level(for: currentFile.url, scope: weightScope()),
+            scopeLabel: weightScopeLabel()
+          ) { newLevel in
+            weights.setLevel(newLevel, for: currentFile.url, scope: weightScope())
           }
-          .buttonStyle(.plain)
-          .help(
-            "随机权重：\(weightLabel(weights.level(for: currentFile.url, scope: weightScope())))（范围：\(weightScopeLabel())）"
-          )
-          .accessibilityLabel("随机权重")
-          .accessibilityValue(
-            "\(weightLabel(weights.level(for: currentFile.url, scope: weightScope())))，范围：\(weightScopeLabel())"
-          )
+          .fixedSize(horizontal: true, vertical: true)
+          .layoutPriority(3)
 
           Button {
             playRandomTrack()
@@ -359,15 +340,6 @@ struct CurrentTrackView: View {
     case .playlist:
       return "歌单"
     }
-  }
-
-  private func weightLabel(_ level: PlaybackWeights.Level) -> String {
-    let value = weightValueLabel(level)
-    return level == .defaultLevel ? "\(value)（默认）" : value
-  }
-
-  private func weightValueLabel(_ level: PlaybackWeights.Level) -> String {
-    "档位 \(level.rawValue) · \(String(format: "%.1f", level.multiplier))×"
   }
 
   private func playRandomTrack() {

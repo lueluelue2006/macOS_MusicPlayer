@@ -9,7 +9,7 @@ final class PlaybackWeightsTests: XCTestCase {
         let playlistLevels: [String: [String: Int]]
     }
 
-    func testSixLevelTableAndBlueDefault() throws {
+    func testSixLevelTableAndGreenDefault() throws {
         let expected: [(PlaybackWeights.Level, Int, Double)] = [
             (.white, 0, 0.5),
             (.green, 1, 1.0),
@@ -20,7 +20,7 @@ final class PlaybackWeightsTests: XCTestCase {
         ]
 
         XCTAssertEqual(PlaybackWeights.Level.allCases.map(\.rawValue), expected.map(\.1))
-        XCTAssertEqual(PlaybackWeights.Level.defaultLevel, .blue)
+        XCTAssertEqual(PlaybackWeights.Level.defaultLevel, .green)
         for (level, rawValue, multiplier) in expected {
             XCTAssertEqual(level.rawValue, rawValue)
             XCTAssertEqual(level.multiplier, multiplier, accuracy: 0.000_1)
@@ -31,9 +31,9 @@ final class PlaybackWeightsTests: XCTestCase {
             let trackURL = directory.appendingPathComponent("default.mp3")
             let playlistID = UUID()
 
-            XCTAssertEqual(weights.level(for: trackURL, scope: .queue), .blue)
-            XCTAssertEqual(weights.level(for: trackURL, scope: .playlist(playlistID)), .blue)
-            XCTAssertEqual(weights.multiplier(for: trackURL, scope: .queue), 1.6, accuracy: 0.000_1)
+            XCTAssertEqual(weights.level(for: trackURL, scope: .queue), .green)
+            XCTAssertEqual(weights.level(for: trackURL, scope: .playlist(playlistID)), .green)
+            XCTAssertEqual(weights.multiplier(for: trackURL, scope: .queue), 1.0, accuracy: 0.000_1)
         }
     }
 
@@ -79,15 +79,15 @@ final class PlaybackWeightsTests: XCTestCase {
             }
 
             let envelope = try decodeEnvelope(at: cacheURL)
-            XCTAssertEqual(envelope.version, 2)
-            XCTAssertNil(envelope.queueLevels[PlaybackWeights.key(for: queueURLs[2])])
+            XCTAssertEqual(envelope.version, 3)
+            XCTAssertNil(envelope.queueLevels[PlaybackWeights.key(for: queueURLs[1])])
             XCTAssertNil(
-                envelope.playlistLevels[playlistID.uuidString]?[PlaybackWeights.key(for: playlistURLs[2])]
+                envelope.playlistLevels[playlistID.uuidString]?[PlaybackWeights.key(for: playlistURLs[1])]
             )
         }
     }
 
-    func testV1QueueAndPlaylistMigrationPersistsV2WithoutMigratingTwice() throws {
+    func testV1QueueAndPlaylistMigrationPersistsV3WithoutMigratingTwice() throws {
         try withTemporaryCache { cacheURL, directory in
             let playlistID = UUID()
             let legacyRawValues = Array(-1 ... 4)
@@ -122,34 +122,102 @@ final class PlaybackWeightsTests: XCTestCase {
                 )
             }
 
-            let persistedV2 = try decodeEnvelope(at: cacheURL)
-            XCTAssertEqual(persistedV2.version, 2)
+            let persistedV3 = try decodeEnvelope(at: cacheURL)
+            XCTAssertEqual(persistedV3.version, 3)
             for (index, legacyRaw) in legacyRawValues.enumerated() {
                 let expectedRaw = legacyRaw + 1
                 let queueKey = PlaybackWeights.key(for: queueURLs[index])
                 let playlistKey = PlaybackWeights.key(for: playlistURLs[index])
                 if expectedRaw == PlaybackWeights.Level.defaultLevel.rawValue {
-                    XCTAssertNil(persistedV2.queueLevels[queueKey])
-                    XCTAssertNil(persistedV2.playlistLevels[playlistID.uuidString]?[playlistKey])
+                    XCTAssertNil(persistedV3.queueLevels[queueKey])
+                    XCTAssertNil(persistedV3.playlistLevels[playlistID.uuidString]?[playlistKey])
                 } else {
-                    XCTAssertEqual(persistedV2.queueLevels[queueKey], expectedRaw)
+                    XCTAssertEqual(persistedV3.queueLevels[queueKey], expectedRaw)
                     XCTAssertEqual(
-                        persistedV2.playlistLevels[playlistID.uuidString]?[playlistKey],
+                        persistedV3.playlistLevels[playlistID.uuidString]?[playlistKey],
                         expectedRaw
                     )
                 }
             }
 
-            let reloadedV2 = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            let reloadedV3 = PlaybackWeights(cacheFileURLOverride: cacheURL)
             for (index, legacyRaw) in legacyRawValues.enumerated() {
                 let expected = try XCTUnwrap(PlaybackWeights.Level(rawValue: legacyRaw + 1))
-                XCTAssertEqual(reloadedV2.level(for: queueURLs[index], scope: .queue), expected)
+                XCTAssertEqual(reloadedV3.level(for: queueURLs[index], scope: .queue), expected)
                 XCTAssertEqual(
-                    reloadedV2.level(for: playlistURLs[index], scope: .playlist(playlistID)),
+                    reloadedV3.level(for: playlistURLs[index], scope: .playlist(playlistID)),
                     expected
                 )
             }
-            XCTAssertEqual(try decodeEnvelope(at: cacheURL), persistedV2)
+            XCTAssertEqual(try decodeEnvelope(at: cacheURL), persistedV3)
+        }
+    }
+
+    func testV2MigrationMakesGreenSparseDefaultAndPreservesOverrides() throws {
+        try withTemporaryCache { cacheURL, directory in
+            let playlistID = UUID()
+            let queueURLs = PlaybackWeights.Level.allCases.map {
+                directory.appendingPathComponent("v2-queue-\($0.rawValue).mp3")
+            }
+            let playlistURLs = PlaybackWeights.Level.allCases.map {
+                directory.appendingPathComponent("v2-playlist-\($0.rawValue).mp3")
+            }
+            let missingQueueURL = directory.appendingPathComponent("v2-queue-missing.mp3")
+            let missingPlaylistURL = directory.appendingPathComponent("v2-playlist-missing.mp3")
+            let v2 = CacheEnvelope(
+                version: 2,
+                queueLevels: Dictionary(uniqueKeysWithValues: zip(
+                    queueURLs.map(PlaybackWeights.key(for:)),
+                    PlaybackWeights.Level.allCases.map(\.rawValue)
+                )),
+                playlistLevels: [
+                    playlistID.uuidString: Dictionary(uniqueKeysWithValues: zip(
+                        playlistURLs.map(PlaybackWeights.key(for:)),
+                        PlaybackWeights.Level.allCases.map(\.rawValue)
+                    ))
+                ]
+            )
+            try JSONEncoder().encode(v2).write(to: cacheURL, options: .atomic)
+
+            let migrated = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            XCTAssertEqual(migrated.level(for: missingQueueURL, scope: .queue), .green)
+            XCTAssertEqual(
+                migrated.level(for: missingPlaylistURL, scope: .playlist(playlistID)),
+                .green
+            )
+            for (index, expected) in PlaybackWeights.Level.allCases.enumerated() {
+                XCTAssertEqual(migrated.level(for: queueURLs[index], scope: .queue), expected)
+                XCTAssertEqual(
+                    migrated.level(for: playlistURLs[index], scope: .playlist(playlistID)),
+                    expected
+                )
+            }
+
+            let persistedV3 = try decodeEnvelope(at: cacheURL)
+            XCTAssertEqual(persistedV3.version, 3)
+            for (index, level) in PlaybackWeights.Level.allCases.enumerated() {
+                let queueKey = PlaybackWeights.key(for: queueURLs[index])
+                let playlistKey = PlaybackWeights.key(for: playlistURLs[index])
+                if level == .defaultLevel {
+                    XCTAssertNil(persistedV3.queueLevels[queueKey])
+                    XCTAssertNil(persistedV3.playlistLevels[playlistID.uuidString]?[playlistKey])
+                } else {
+                    XCTAssertEqual(persistedV3.queueLevels[queueKey], level.rawValue)
+                    XCTAssertEqual(
+                        persistedV3.playlistLevels[playlistID.uuidString]?[playlistKey],
+                        level.rawValue
+                    )
+                }
+            }
+
+            let reloadedV3 = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            for (index, expected) in PlaybackWeights.Level.allCases.enumerated() {
+                XCTAssertEqual(reloadedV3.level(for: queueURLs[index], scope: .queue), expected)
+                XCTAssertEqual(
+                    reloadedV3.level(for: playlistURLs[index], scope: .playlist(playlistID)),
+                    expected
+                )
+            }
         }
     }
 
@@ -160,16 +228,16 @@ final class PlaybackWeightsTests: XCTestCase {
             let queueURL = directory.appendingPathComponent("sparse-queue.mp3")
             let playlistURL = directory.appendingPathComponent("sparse-playlist.mp3")
 
-            XCTAssertEqual(weights.level(for: queueURL, scope: .queue), .blue)
-            XCTAssertEqual(weights.level(for: playlistURL, scope: .playlist(playlistID)), .blue)
+            XCTAssertEqual(weights.level(for: queueURL, scope: .queue), .green)
+            XCTAssertEqual(weights.level(for: playlistURL, scope: .playlist(playlistID)), .green)
             weights.setLevel(.red, for: queueURL, scope: .queue)
             weights.setLevel(.gold, for: playlistURL, scope: .playlist(playlistID))
-            weights.setLevel(.blue, for: queueURL, scope: .queue)
-            weights.setLevel(.blue, for: playlistURL, scope: .playlist(playlistID))
+            weights.setLevel(.green, for: queueURL, scope: .queue)
+            weights.setLevel(.green, for: playlistURL, scope: .playlist(playlistID))
             weights.flushPersistence()
 
             let envelope = try decodeEnvelope(at: cacheURL)
-            XCTAssertEqual(envelope.version, 2)
+            XCTAssertEqual(envelope.version, 3)
             XCTAssertTrue(envelope.queueLevels.isEmpty)
             XCTAssertTrue(envelope.playlistLevels.isEmpty)
         }
@@ -187,7 +255,7 @@ final class PlaybackWeightsTests: XCTestCase {
             try originalData.write(to: cacheURL, options: .atomic)
 
             let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
-            XCTAssertEqual(weights.level(for: trackURL, scope: .queue), .blue)
+            XCTAssertEqual(weights.level(for: trackURL, scope: .queue), .green)
             weights.flushPersistence()
 
             XCTAssertEqual(try Data(contentsOf: cacheURL), originalData)
@@ -207,7 +275,7 @@ final class PlaybackWeightsTests: XCTestCase {
                 let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
                 let trackURL = directory.appendingPathComponent("preserved.mp3")
 
-                XCTAssertEqual(weights.level(for: trackURL, scope: .queue), .blue)
+                XCTAssertEqual(weights.level(for: trackURL, scope: .queue), .green)
                 weights.flushPersistence()
 
                 XCTAssertEqual(try Data(contentsOf: cacheURL), originalData)
@@ -221,11 +289,11 @@ final class PlaybackWeightsTests: XCTestCase {
         try withTemporaryCache { cacheURL, directory in
             try futureData.write(to: cacheURL, options: .atomic)
             let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
-            weights.setLevel(.blue, for: directory.appendingPathComponent("default.mp3"), scope: .queue)
+            weights.setLevel(.green, for: directory.appendingPathComponent("default.mp3"), scope: .queue)
             weights.flushPersistence()
 
             let replaced = try decodeEnvelope(at: cacheURL)
-            XCTAssertEqual(replaced.version, 2)
+            XCTAssertEqual(replaced.version, 3)
             XCTAssertTrue(replaced.queueLevels.isEmpty)
             XCTAssertTrue(replaced.playlistLevels.isEmpty)
         }
@@ -237,7 +305,7 @@ final class PlaybackWeightsTests: XCTestCase {
             weights.flushPersistence()
 
             let replaced = try decodeEnvelope(at: cacheURL)
-            XCTAssertEqual(replaced.version, 2)
+            XCTAssertEqual(replaced.version, 3)
             XCTAssertTrue(replaced.queueLevels.isEmpty)
             XCTAssertTrue(replaced.playlistLevels.isEmpty)
         }

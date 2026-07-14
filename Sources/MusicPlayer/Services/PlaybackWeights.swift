@@ -27,7 +27,7 @@ final class PlaybackWeights: ObservableObject {
         case gold = 4
         case red = 5
 
-        static let defaultLevel: Level = .blue
+        static let defaultLevel: Level = .green
         static let minimumStoredRawValue = Level.white.rawValue
         static let maximumStoredRawValue = Level.red.rawValue
 
@@ -46,7 +46,7 @@ final class PlaybackWeights: ObservableObject {
     @Published private(set) var revision: UInt64 = 0
 
     private let cacheFileName = "playback-weights.json"
-    private let formatVersion = 2
+    private let formatVersion = 3
     private let cacheFileURLOverride: URL?
     private let lock = NSLock()
     private let persistenceLock = NSLock()
@@ -217,7 +217,7 @@ final class PlaybackWeights: ObservableObject {
     ///
     /// Notes:
     /// - Only non-default levels are stored, so this copies *overrides* and will not wipe queue weights
-    ///   for tracks that are default (blue) in the playlist.
+    ///   for tracks that are default (green) in the playlist.
     /// - Returns how many overrides were present and how many actually changed in the queue scope.
     func syncPlaylistOverridesToQueue(from playlistID: UserPlaylist.ID) -> SyncResult {
         loadIfNeeded()
@@ -266,7 +266,7 @@ final class PlaybackWeights: ObservableObject {
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         guard let data = try? Data(contentsOf: url),
               let envelope = try? JSONDecoder().decode(CacheVersionEnvelope.self, from: data),
-              envelope.version == 1 || envelope.version == formatVersion,
+              envelope.version == 1 || envelope.version == 2 || envelope.version == formatVersion,
               let decoded = try? JSONDecoder().decode(CacheFile.self, from: data) else {
             preserveExistingCache()
             return
@@ -285,6 +285,13 @@ final class PlaybackWeights: ObservableObject {
                 decoded.playlistLevels,
                 transform: migrateV1RawValue
             )
+            needsPersistence = true
+        case 2:
+            // v2 used the same raw values, but treated blue (1.6x) as the
+            // sparse default. Re-normalize it against the v3 green (1.0x)
+            // default while preserving every explicit non-default override.
+            normalizedQueue = normalizeLevelMap(decoded.queueLevels)
+            normalizedPlaylists = normalizePlaylistLevelMaps(decoded.playlistLevels)
             needsPersistence = true
         case formatVersion:
             normalizedQueue = normalizeLevelMap(decoded.queueLevels)

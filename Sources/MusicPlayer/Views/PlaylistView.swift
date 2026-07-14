@@ -913,7 +913,7 @@ struct PlaylistItemView: View {
   }
 
   private func weightValueLabel(_ level: PlaybackWeights.Level) -> String {
-    "档位 \(level.rawValue) · \(String(format: "%.1f", level.multiplier))×"
+    "第 \(level.rawValue + 1) 档 · \(String(format: "%.1f", level.multiplier))×"
   }
 
   private func buttonColor(for file: AudioFile) -> Color {
