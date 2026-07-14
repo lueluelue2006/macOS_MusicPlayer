@@ -6,6 +6,12 @@ struct PlaybackControlsView: View {
   @Environment(\.colorScheme) private var colorScheme
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
   private var isEphemeralPlayback: Bool { audioPlayer.persistPlaybackState == false }
+  private var playbackModeBinding: Binding<AudioPlayer.PlaybackMode> {
+    Binding(
+      get: { audioPlayer.playbackMode },
+      set: { audioPlayer.setPlaybackMode($0) }
+    )
+  }
 
   var body: some View {
     let playableCount = playlistManager.playbackScopePlayableCount()
@@ -13,63 +19,54 @@ struct PlaybackControlsView: View {
     let isPlaybackActive = audioPlayer.isPlaybackRequested || audioPlayer.isPlaying
     let canTogglePlayback = audioPlayer.canTogglePlayback
 
-    HStack(spacing: 22) {
-      TransportIconToggle(
-        systemName: "shuffle",
-        accessibilityLabel: "随机播放",
-        isOn: Binding(
-          get: { audioPlayer.isShuffling },
-          set: { audioPlayer.setShuffling($0) }
-        ),
-        isDisabled: isEphemeralPlayback,
-        help: isEphemeralPlayback ? "临时播放模式下不可切歌" : "随机播放"
+    HStack(spacing: 0) {
+      PlaybackModePicker(
+        selection: playbackModeBinding,
+        isEphemeralPlayback: isEphemeralPlayback
       )
+      .frame(width: 76)
 
-      TransportIconButton(
-        systemName: "backward.fill",
-        size: 17,
-        isDisabled: !canChangeTrack,
-        help: "上一首"
-      ) {
-        previousTrack()
-      }
+      Spacer(minLength: 8)
 
-      Button(action: togglePlayback) {
-        ZStack {
-          Circle()
-            .fill(theme.accent)
-            .frame(width: 54, height: 54)
+      HStack(spacing: 22) {
+        TransportIconButton(
+          systemName: "backward.fill",
+          size: 17,
+          isDisabled: !canChangeTrack,
+          help: "上一首"
+        ) {
+          previousTrack()
+        }
 
-          Image(systemName: isPlaybackActive ? "pause.fill" : "play.fill")
-            .font(.system(size: 20, weight: .bold))
-            .foregroundStyle(theme.accentForeground)
-            .offset(x: isPlaybackActive ? 0 : 1)
+        Button(action: togglePlayback) {
+          ZStack {
+            Circle()
+              .fill(theme.accent)
+              .frame(width: 54, height: 54)
+
+            Image(systemName: isPlaybackActive ? "pause.fill" : "play.fill")
+              .font(.system(size: 20, weight: .bold))
+              .foregroundStyle(theme.accentForeground)
+              .offset(x: isPlaybackActive ? 0 : 1)
+          }
+        }
+        .buttonStyle(TransportPressButtonStyle())
+        .disabled(!canTogglePlayback)
+        .opacity(canTogglePlayback ? 1 : 0.42)
+        .help(isPlaybackActive ? "暂停" : "播放")
+        .accessibilityLabel(isPlaybackActive ? "暂停" : "播放")
+
+        TransportIconButton(
+          systemName: "forward.fill",
+          size: 17,
+          isDisabled: !canChangeTrack,
+          help: "下一首"
+        ) {
+          nextTrack()
         }
       }
-      .buttonStyle(TransportPressButtonStyle())
-      .disabled(!canTogglePlayback)
-      .opacity(canTogglePlayback ? 1 : 0.42)
-      .help(isPlaybackActive ? "暂停" : "播放")
-      .accessibilityLabel(isPlaybackActive ? "暂停" : "播放")
 
-      TransportIconButton(
-        systemName: "forward.fill",
-        size: 17,
-        isDisabled: !canChangeTrack,
-        help: "下一首"
-      ) {
-        nextTrack()
-      }
-
-      TransportIconToggle(
-        systemName: "repeat.1",
-        accessibilityLabel: "单曲循环",
-        isOn: Binding(
-          get: { audioPlayer.isLooping },
-          set: { audioPlayer.setLooping($0) }
-        ),
-        help: "单曲循环"
-      )
+      Spacer(minLength: 8)
 
       TransportIconToggle(
         systemName: "infinity",
@@ -80,6 +77,7 @@ struct PlaybackControlsView: View {
         ),
         help: "沉浸播放：自动跳过歌曲前后的静音，让下一首更快接上"
       )
+      .frame(width: 76)
     }
     .frame(maxWidth: .infinity)
   }
@@ -100,6 +98,43 @@ struct PlaybackControlsView: View {
     if let previousFile = playlistManager.previousFile(isShuffling: audioPlayer.isShuffling) {
       audioPlayer.play(previousFile)
     }
+  }
+}
+
+private struct PlaybackModePicker: View {
+  @Binding var selection: AudioPlayer.PlaybackMode
+  let isEphemeralPlayback: Bool
+  @Environment(\.colorScheme) private var colorScheme
+  private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+
+  private var selectionTitle: String {
+    switch selection {
+    case .shuffle: return "随机播放"
+    case .repeatOne: return "单曲循环"
+    }
+  }
+
+  var body: some View {
+    Picker("播放方式", selection: $selection) {
+      Label("随机播放", systemImage: "shuffle")
+        .labelStyle(.iconOnly)
+        .tag(AudioPlayer.PlaybackMode.shuffle)
+        .help(isEphemeralPlayback ? "随机播放（临时播放结束后用于队列切歌）" : "随机播放")
+
+      Label("单曲循环", systemImage: "repeat.1")
+        .labelStyle(.iconOnly)
+        .tag(AudioPlayer.PlaybackMode.repeatOne)
+        .help("单曲循环")
+    }
+    .labelsHidden()
+    .pickerStyle(.segmented)
+    .controlSize(.large)
+    .tint(theme.interactiveAccent)
+    .frame(width: 76)
+    .help("播放方式：\(selectionTitle)")
+    .accessibilityLabel("播放方式")
+    .accessibilityValue(selectionTitle)
+    .accessibilityHint("在随机播放和单曲循环之间选择")
   }
 }
 

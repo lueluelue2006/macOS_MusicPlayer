@@ -39,9 +39,7 @@ struct PlaylistView: View {
   }
 
   private var scopeIndicatorSystemName: String {
-    if audioPlayer.isLooping { return "repeat" }
-    if audioPlayer.isShuffling { return "shuffle" }
-    return "play.fill"
+    audioPlayer.playbackMode == .repeatOne ? "repeat" : "shuffle"
   }
 
   private var activePlaybackScopeBadge: PlaybackScopeBadge? {

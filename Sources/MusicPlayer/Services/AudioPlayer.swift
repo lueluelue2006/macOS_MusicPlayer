@@ -14,6 +14,11 @@ private struct WeakAudioPlayerBox: @unchecked Sendable {
 }
 
 final class AudioPlayer: NSObject, ObservableObject {
+    enum PlaybackMode: String, CaseIterable, Sendable {
+        case shuffle
+        case repeatOne
+    }
+
     let playbackClock = PlaybackClock()
     @Published var currentFile: AudioFile?
     @Published var isPlaying = false
@@ -21,8 +26,9 @@ final class AudioPlayer: NSObject, ObservableObject {
     @Published private(set) var pendingPlaybackURL: URL?
     @Published var volume: Float = 0.5
     @Published var playbackRate: Float = 1.0
-    @Published var isLooping = false
-    @Published var isShuffling = true  // 默认开启随机播放
+    @Published private(set) var playbackMode: PlaybackMode = .shuffle
+    var isLooping: Bool { playbackMode == .repeatOne }
+    var isShuffling: Bool { playbackMode == .shuffle }
     @Published var isNormalizationEnabled = true  // 音量均衡开关
     @Published private(set) var isImmersivePlaybackEnabled = false
     // 歌词相关
@@ -190,6 +196,7 @@ final class AudioPlayer: NSObject, ObservableObject {
     private let userNormalizationFadeDurationKey = "userNormalizationFadeDuration"
     @Published var requireVolumeAnalysisBeforePlayback: Bool = false // 无缓存时先分析再播放
     private let userRequireVolumeAnalysisBeforePlaybackKey = "userRequireVolumeAnalysisBeforePlayback"
+    private let userPlaybackModeKey = "userPlaybackMode"
     private let userLoopingKey = "userLoopingEnabled"             // 单曲循环开关
     private let userShuffleKey = "userShuffleEnabled"             // 随机播放开关
     private var wasPlayingBeforeInterruption = false
@@ -2146,37 +2153,29 @@ final class AudioPlayer: NSObject, ObservableObject {
         _ = completion.wait(timeout: .now() + timeout)
     }
     
-    func toggleLoop() {
-        isLooping.toggle()
-        if isShuffling && isLooping {
-            isShuffling = false
-            saveShufflePreference()
-        }
-        // 立即应用循环设置到当前播放器
+    func setPlaybackMode(_ mode: PlaybackMode) {
+        guard mode != playbackMode else { return }
+        playbackMode = mode
         updateLoopSetting()
-        saveLoopingPreference()
+        savePlaybackModePreference()
         scheduleImmersiveEndIfNeeded()
     }
 
-    func setLooping(_ enabled: Bool) {
-        guard enabled != isLooping else { return }
-        toggleLoop()
-    }
-    
-    func toggleShuffle() {
-        isShuffling.toggle()
-        if isLooping && isShuffling {
-            isLooping = false
-            updateLoopSetting()
-            saveLoopingPreference()
+    /// Resolve persisted state from the new single-value preference or the two
+    /// legacy booleans. Invalid legacy combinations are deterministic:
+    /// repeat-one wins true/true, while false/false returns to shuffle.
+    nonisolated static func resolvedPlaybackMode(
+        storedRawValue: String?,
+        legacyLooping: Bool,
+        legacyShuffling: Bool
+    ) -> PlaybackMode {
+        if let storedRawValue, let stored = PlaybackMode(rawValue: storedRawValue) {
+            return stored
         }
-        saveShufflePreference()
-        scheduleImmersiveEndIfNeeded()
-    }
-
-    func setShuffling(_ enabled: Bool) {
-        guard enabled != isShuffling else { return }
-        toggleShuffle()
+        switch (legacyLooping, legacyShuffling) {
+        case (true, _): return .repeatOne
+        case (false, _): return .shuffle
+        }
     }
     
     private func updateLoopSetting() {
@@ -3628,20 +3627,23 @@ extension AudioPlayer {
         if d.object(forKey: userNormalizationKey) != nil {
             isNormalizationEnabled = d.bool(forKey: userNormalizationKey)
         }
-        if d.object(forKey: userLoopingKey) != nil {
-            isLooping = d.bool(forKey: userLoopingKey)
-        }
-        if d.object(forKey: userShuffleKey) != nil {
-            isShuffling = d.bool(forKey: userShuffleKey)
-        }
+        let legacyLooping = d.object(forKey: userLoopingKey) == nil
+            ? false
+            : d.bool(forKey: userLoopingKey)
+        let legacyShuffling = d.object(forKey: userShuffleKey) == nil
+            ? true
+            : d.bool(forKey: userShuffleKey)
+        playbackMode = Self.resolvedPlaybackMode(
+            storedRawValue: d.string(forKey: userPlaybackModeKey),
+            legacyLooping: legacyLooping,
+            legacyShuffling: legacyShuffling
+        )
         if d.object(forKey: userImmersivePlaybackEnabledKey) != nil {
             isImmersivePlaybackEnabled = d.bool(forKey: userImmersivePlaybackEnabledKey)
         }
-        // 互斥处理：如果两者都为 true，优先保留“循环”，关闭“随机”
-        if isLooping && isShuffling {
-            isShuffling = false
-        }
-        // 应用循环设置（如当前已有播放器）
+        // Persist the canonical value and complementary legacy keys together,
+        // so upgrades and downgrades cannot restore an invalid combination.
+        savePlaybackModePreference()
         updateLoopSetting()
     }
 
@@ -3650,13 +3652,10 @@ extension AudioPlayer {
         d.set(isNormalizationEnabled, forKey: userNormalizationKey)
     }
 
-    private func saveLoopingPreference() {
+    private func savePlaybackModePreference() {
         let d = UserDefaults.standard
+        d.set(playbackMode.rawValue, forKey: userPlaybackModeKey)
         d.set(isLooping, forKey: userLoopingKey)
-    }
-
-    private func saveShufflePreference() {
-        let d = UserDefaults.standard
         d.set(isShuffling, forKey: userShuffleKey)
     }
 

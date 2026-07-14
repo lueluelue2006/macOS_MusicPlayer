@@ -1,4 +1,4 @@
-# MusicPlayer 4.3.1 Design System
+# MusicPlayer 4.3.2 Design System
 
 ## Mode
 
@@ -76,12 +76,12 @@ colors, decorative glass, border-heavy regions, and perpetual animation.
 
 - **Now Playing:** orientation header, 280–320 point artwork/sleeve, left-aligned
   title metadata, progress, one coherent transport row, then quiet utilities.
-- **Transport:** shuffle, previous, play/pause, next, repeat, immersive. Only
-  play/pause is solid; active modes use the single accent without text pills.
-  Immersive playback uses a compact infinity symbol with native help and
-  accessibility state instead of adding another labeled control. Shuffle,
-  repeat, and immersive are native button-style `Toggle` controls; shuffle and
-  single-track repeat remain mutually exclusive.
+- **Transport:** a single 76-point native segmented picker selects shuffle or
+  single-track repeat, and one mode is always selected. Previous, play/pause,
+  and next stay centered between the picker and a matching 76-point immersive
+  slot. Only play/pause is solid; the picker uses the interactive accent in both
+  appearances. Immersive playback remains a compact infinity `Toggle` with
+  native help and accessibility state.
 - **Queue toolbar:** title/count and text tabs on the left; one import action and
   quiet icon tools on the right. Destructive and infrequent actions live in an
   overflow menu.

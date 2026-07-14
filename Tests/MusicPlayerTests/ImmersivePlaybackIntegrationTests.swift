@@ -41,8 +41,7 @@ final class ImmersivePlaybackIntegrationTests: XCTestCase {
             initialImmersivePlaybackEnabled: true
         )
         player.isNormalizationEnabled = false
-        player.isShuffling = false
-        player.isLooping = false
+        player.setPlaybackMode(.shuffle)
         let manager = PlaylistManager(disablePersistence: true)
         manager.audioFiles = [first, second]
         manager.currentIndex = 0

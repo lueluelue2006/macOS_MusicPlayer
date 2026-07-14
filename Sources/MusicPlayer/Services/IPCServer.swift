@@ -320,12 +320,12 @@ final class IPCServer {
             return IPCReply(id: request.id, ok: true)
 
         case .toggleShuffle:
-            audioPlayer.toggleShuffle()
-            return IPCReply(id: request.id, ok: true)
+            audioPlayer.setPlaybackMode(.shuffle)
+            return IPCReply(id: request.id, ok: true, data: ["playbackMode": "shuffle"])
 
         case .toggleLoop:
-            audioPlayer.toggleLoop()
-            return IPCReply(id: request.id, ok: true)
+            audioPlayer.setPlaybackMode(.repeatOne)
+            return IPCReply(id: request.id, ok: true, data: ["playbackMode": "repeatOne"])
 
         case .next:
             guard let nextFile = playlistManager.nextFile(isShuffling: audioPlayer.isShuffling) else {
@@ -1782,6 +1782,7 @@ final class IPCServer {
         data["rate"] = String(format: "%.3f", audioPlayer.playbackRate)
         data["isLooping"] = audioPlayer.isLooping ? "true" : "false"
         data["isShuffling"] = audioPlayer.isShuffling ? "true" : "false"
+        data["playbackMode"] = audioPlayer.playbackMode.rawValue
         data["normalizationEnabled"] = audioPlayer.isNormalizationEnabled ? "true" : "false"
         data["showLyrics"] = audioPlayer.showLyrics ? "true" : "false"
         data["scanSubfolders"] = playlistManager.scanSubfolders ? "true" : "false"

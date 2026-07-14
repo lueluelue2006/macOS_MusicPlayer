@@ -164,7 +164,7 @@ struct PlaylistsPanelView: View {
               {
                 ActivePlaybackScopeIndicator(
                   systemName: audioPlayer.isLooping
-                    ? "repeat" : (audioPlayer.isShuffling ? "shuffle" : "play.fill"),
+                    ? "repeat" : "shuffle",
                   isPlaying: audioPlayer.isPlaying
                 )
                 .help("正在以该歌单作为播放范围")

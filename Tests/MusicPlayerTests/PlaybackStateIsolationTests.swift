@@ -59,7 +59,7 @@ final class PlaybackStateIsolationTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
         let player = AudioPlayer(volumeCacheFileURLOverride: fixture.cacheURL)
         player.isNormalizationEnabled = false
-        player.isLooping = false
+        player.setPlaybackMode(.shuffle)
         defer { player.stopAndClearCurrent(clearLastPlayed: false) }
 
         player.play(fixture.file, autostart: false, persist: false, bypassConfirm: true)
@@ -343,8 +343,7 @@ final class PlaybackStateIsolationTests: XCTestCase {
             initialImmersivePlaybackEnabled: false
         )
         player.isNormalizationEnabled = false
-        player.isLooping = false
-        player.isShuffling = false
+        player.setPlaybackMode(.shuffle)
         return player
     }
 

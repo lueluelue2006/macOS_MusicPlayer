@@ -333,13 +333,7 @@ final class PlaybackCoordinator {
             }
             .store(in: &cancellables)
 
-        audioPlayer.$isShuffling
-            .dropFirst()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.invalidateNextPreload() }
-            .store(in: &cancellables)
-
-        audioPlayer.$isLooping
+        audioPlayer.$playbackMode
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.invalidateNextPreload() }

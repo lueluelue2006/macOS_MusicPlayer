@@ -51,8 +51,7 @@ final class PlaybackFailureOrderingTests: XCTestCase {
         )
 
         let player = AudioPlayer()
-        player.isLooping = false
-        player.isShuffling = false
+        player.setPlaybackMode(.shuffle)
         let playlistManager = PlaylistManager(disablePersistence: true)
         playlistManager.audioFiles = [badFile]
         playlistManager.currentIndex = 0
