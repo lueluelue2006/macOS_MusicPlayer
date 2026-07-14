@@ -70,6 +70,33 @@ else
     echo "⚠️  警告: 未找到 AppIcon.icns 文件"
 fi
 
+# 复制内置歌手歌单封面。显式校验文件，避免发行包静默退回字母封面。
+PLAYLIST_COVER_SOURCE="assets/playlist-covers"
+PLAYLIST_COVER_DESTINATION="MusicPlayer.app/Contents/Resources/PlaylistCovers"
+PLAYLIST_COVERS=(
+    "yang-kun.png"
+    "fei-yu-ching.png"
+    "stefanie-sun.png"
+    "faye-wong.png"
+)
+PLAYLIST_COVER_ATTRIBUTIONS="ATTRIBUTIONS.txt"
+mkdir -p "$PLAYLIST_COVER_DESTINATION"
+for cover in "${PLAYLIST_COVERS[@]}"; do
+    if [[ ! -f "$PLAYLIST_COVER_SOURCE/$cover" ]]; then
+        echo "❌ 错误: 缺少内置歌单封面 $PLAYLIST_COVER_SOURCE/$cover"
+        exit 1
+    fi
+    cp "$PLAYLIST_COVER_SOURCE/$cover" "$PLAYLIST_COVER_DESTINATION/$cover"
+done
+if [[ ! -f "$PLAYLIST_COVER_SOURCE/$PLAYLIST_COVER_ATTRIBUTIONS" ]]; then
+    echo "❌ 错误: 缺少歌单封面许可说明 $PLAYLIST_COVER_SOURCE/$PLAYLIST_COVER_ATTRIBUTIONS"
+    exit 1
+fi
+cp \
+    "$PLAYLIST_COVER_SOURCE/$PLAYLIST_COVER_ATTRIBUTIONS" \
+    "$PLAYLIST_COVER_DESTINATION/$PLAYLIST_COVER_ATTRIBUTIONS"
+echo "🖼️  已添加 ${#PLAYLIST_COVERS[@]} 张内置歌单封面及许可说明"
+
 # 创建 Info.plist
 cat > MusicPlayer.app/Contents/Info.plist << EOF
 <?xml version="1.0" encoding="UTF-8"?>

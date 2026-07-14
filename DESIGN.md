@@ -36,8 +36,10 @@ and perpetual motion.
   playback utilities, transport, volume, next-up preview, lyrics, and output.
 - The right-side reading order is collection title, panel tabs/actions, search,
   selected-playlist identity, column labels, and track index.
-- A playlist has one generated vector monogram in its header. Track rows never
-  decode or display artwork.
+- A playlist has one identity cover shared by its header and sidebar row. The
+  four built-in artist playlists use bundled editorial portraits; any playlist
+  can override its cover with a local image, and the vector monogram remains the
+  fallback. Track rows never decode or display artwork.
 - Track rows use 01/02/03 numbering for the current visible order, a narrow
   coral active rail, visible six-level weights, a fixed duration column, and
   hover-only management actions.
@@ -88,8 +90,9 @@ and perpetual motion.
 - **Random weight:** every current-track and track-row picker permanently shows
   six independent squares for 0.5×, 1.0×, 1.6×, 3.2×, 4.8×, and 6.4×. The
   second level is the default. Picker padding and gaps never trigger playback.
-- **Playlist header:** one static monogram, track count, known duration, primary
-  play action, neutral add action, and an overflow menu.
+- **Playlist header:** one static cover, track count, known duration, primary
+  play action, neutral add action, and an overflow menu. Clicking the cover opens
+  the native image picker; the overflow and context menus can restore defaults.
 - **Lyrics:** lyrics continue the listening stage instead of becoming a card.
   The active line uses serif display type and coral; auto-follow is coral only
   while enabled, while “当前句” remains a neutral one-shot action.
@@ -102,9 +105,11 @@ and perpetual motion.
   semantics. Add no UI, animation, image, or typography dependency.
 - Keep lazy row creation and stable path-based identity. Never wrap an entire
   track row around its weight or management controls.
-- Use only the current 600-pixel downsampled artwork. Do no artwork decoding,
-  sorting, file I/O, path normalization, blur, shadow, mask, or color extraction
-  inside track rows.
+- Use only downsampled artwork. Current-track artwork stays capped at 600 pixels;
+  playlist covers decode on demand at their display size, with a 16-item / 8 MiB
+  cache. Custom cover imports are normalized once to at most 1,024 pixels. Do no
+  artwork decoding, sorting, file I/O, path normalization, blur, shadow, mask,
+  or color extraction inside track rows.
 - No continuous animation. Short hover, press, Toggle, and state transitions may
   use the existing 160–240 ms motion tokens and must respect Reduce Motion.
 - Immersive-boundary and normalization work stays bounded and cached. The UI

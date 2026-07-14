@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import SwiftUI
 
@@ -76,6 +77,64 @@ struct PlaylistMonogramView: View {
       }
     }
     .aspectRatio(1, contentMode: .fit)
+    .accessibilityHidden(true)
+  }
+}
+
+/// A bounded, asynchronously downsampled playlist cover with the generated
+/// monogram as its zero-cost fallback.
+struct PlaylistArtworkView: View {
+  let playlist: UserPlaylist
+  var isActive = false
+  var targetPixelSize = 160
+  var revision: UInt64 = 0
+
+  @State private var image: CGImage?
+  @State private var displayedPlaylistIdentity: String?
+  @Environment(\.colorScheme) private var colorScheme
+  private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+
+  private var loadID: String {
+    "\(playlist.id.uuidString)|\(playlist.name)|\(targetPixelSize)|\(revision)"
+  }
+
+  private var playlistIdentity: String {
+    "\(playlist.id.uuidString)|\(playlist.name)"
+  }
+
+  var body: some View {
+    GeometryReader { proxy in
+      ZStack {
+        if let image {
+          Image(decorative: image, scale: 1)
+            .resizable()
+            .scaledToFill()
+            .frame(width: proxy.size.width, height: proxy.size.height)
+            .clipped()
+        } else {
+          PlaylistMonogramView(name: playlist.name, isActive: isActive)
+        }
+      }
+      .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+      .overlay {
+        RoundedRectangle(cornerRadius: 9, style: .continuous)
+          .stroke(isActive ? theme.accent : theme.stroke, lineWidth: isActive ? 1.5 : 1)
+      }
+    }
+    .aspectRatio(1, contentMode: .fit)
+    .task(id: loadID) {
+      let requestedIdentity = playlistIdentity
+      if displayedPlaylistIdentity != requestedIdentity {
+        image = nil
+      }
+      let loaded = await PlaylistArtworkStore.shared.image(
+        for: playlist,
+        targetPixelSize: targetPixelSize
+      )
+      guard !Task.isCancelled else { return }
+      image = loaded
+      displayedPlaylistIdentity = requestedIdentity
+    }
     .accessibilityHidden(true)
   }
 }

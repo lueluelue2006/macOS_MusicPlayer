@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct PlaylistsPanelView: View {
   @ObservedObject var audioPlayer: AudioPlayer
@@ -24,6 +25,7 @@ struct PlaylistsPanelView: View {
   @State private var playlistScrollTask: Task<Void, Never>?
   @State private var playlistTableView: NSTableView?
   @State private var handledLocateNowPlayingRequestID: Int = 0
+  @State private var artworkRevisions: [UserPlaylist.ID: UInt64] = [:]
 
   // Add-from-queue multi-select sheet
   @State private var showAddFromQueueSheet: Bool = false
@@ -127,8 +129,7 @@ struct PlaylistsPanelView: View {
         Spacer()
       } else {
         List {
-          ForEach(playlistsStore.playlists.indices, id: \.self) { index in
-            let playlist = playlistsStore.playlists[index]
+          ForEach(playlistsStore.playlists) { playlist in
             let isSelected = playlistsStore.selectedPlaylistID == playlist.id
             Button {
               playlistsStore.selectedPlaylistID = playlist.id
@@ -138,11 +139,14 @@ struct PlaylistsPanelView: View {
                   .fill(isSelected ? theme.accent : Color.clear)
                   .frame(width: 2, height: 30)
 
-                Text(String(format: "%02d", index + 1))
-                  .font(.system(size: 10, weight: .semibold, design: .rounded))
-                  .monospacedDigit()
-                  .foregroundStyle(isSelected ? theme.accent : theme.stageTertiaryText)
-                  .frame(width: 22, alignment: .leading)
+                PlaylistArtworkView(
+                  playlist: playlist,
+                  isActive: playlistManager.playbackScope == .playlist(playlist.id)
+                    && audioPlayer.playbackTargetURL != nil,
+                  targetPixelSize: 72,
+                  revision: artworkRevisions[playlist.id] ?? 0
+                )
+                .frame(width: 32, height: 32)
 
                 VStack(alignment: .leading, spacing: 2) {
                   Text(playlist.name)
@@ -175,11 +179,19 @@ struct PlaylistsPanelView: View {
               .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("\(playlist.name)，\(playlist.tracks.count) 首")
             .accessibilityAddTraits(isSelected ? .isSelected : [])
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
             .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
             .contextMenu {
+              Button("设置歌单封面…") {
+                choosePlaylistArtwork(playlist)
+              }
+              Button("恢复默认封面") {
+                resetPlaylistArtwork(playlist)
+              }
+              Divider()
               Button("重命名…") {
                 renamePlaylist(playlist)
               }
@@ -333,13 +345,48 @@ struct PlaylistsPanelView: View {
   }
 
   private func header(for playlist: UserPlaylist) -> some View {
-    HStack(spacing: 14) {
-      PlaylistMonogramView(
-        name: playlist.name,
-        isActive: playlistManager.playbackScope == .playlist(playlist.id)
-          && audioPlayer.playbackTargetURL != nil
-      )
-      .frame(width: 64, height: 64)
+    let isActive = playlistManager.playbackScope == .playlist(playlist.id)
+      && audioPlayer.playbackTargetURL != nil
+
+    return HStack(spacing: 14) {
+      Button {
+        choosePlaylistArtwork(playlist)
+      } label: {
+        PlaylistArtworkView(
+          playlist: playlist,
+          isActive: isActive,
+          targetPixelSize: 160,
+          revision: artworkRevisions[playlist.id] ?? 0
+        )
+        .frame(width: 64, height: 64)
+        .overlay(alignment: .bottomTrailing) {
+          ZStack {
+            Image(systemName: "photo")
+              .font(.system(size: 9, weight: .semibold))
+            Image(systemName: "plus.circle.fill")
+              .font(.system(size: 7, weight: .bold))
+              .offset(x: 5, y: 5)
+          }
+            .foregroundStyle(theme.stagePrimaryText)
+            .frame(width: 20, height: 20)
+            .background(theme.elevatedSurface, in: Circle())
+            .overlay {
+              Circle().stroke(theme.stroke, lineWidth: 1)
+            }
+            .offset(x: 4, y: 4)
+        }
+      }
+      .buttonStyle(.plain)
+      .help("更换“\(playlist.name)”的歌单封面")
+      .accessibilityLabel("更换“\(playlist.name)”的歌单封面")
+      .contextMenu {
+        Button("选择图片…") {
+          choosePlaylistArtwork(playlist)
+        }
+        Button("恢复默认封面") {
+          resetPlaylistArtwork(playlist)
+        }
+      }
 
       VStack(alignment: .leading, spacing: 5) {
         Text(playlist.name)
@@ -405,6 +452,15 @@ struct PlaylistsPanelView: View {
       .help(playlistManager.audioFiles.isEmpty ? "队列为空：先在“队列”里导入一些歌曲" : "")
 
       Menu {
+        Button("设置歌单封面…") {
+          choosePlaylistArtwork(playlist)
+        }
+        Button("恢复默认封面") {
+          resetPlaylistArtwork(playlist)
+        }
+
+        Divider()
+
         if audioPlayer.currentFile != nil {
           Button("添加正在播放") {
             if let url = audioPlayer.currentFile?.url {
@@ -527,6 +583,50 @@ struct PlaylistsPanelView: View {
   }
 
   @MainActor
+  private func choosePlaylistArtwork(_ playlist: UserPlaylist) {
+    let panel = NSOpenPanel()
+    panel.title = "设置歌单封面"
+    panel.message = "选择一张图片作为“\(playlist.name)”的歌单封面"
+    panel.prompt = "使用这张图片"
+    panel.allowedContentTypes = [.image]
+    panel.canChooseDirectories = false
+    panel.canChooseFiles = true
+    panel.allowsMultipleSelection = false
+
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    Task { @MainActor in
+      do {
+        try await PlaylistArtworkStore.shared.importArtwork(from: url, for: playlist.id)
+        artworkRevisions[playlist.id, default: 0] &+= 1
+        postToast(title: "歌单封面已更新", subtitle: playlist.name, kind: "success")
+      } catch {
+        postToast(
+          title: "无法设置歌单封面",
+          subtitle: error.localizedDescription,
+          kind: "error"
+        )
+      }
+    }
+  }
+
+  @MainActor
+  private func resetPlaylistArtwork(_ playlist: UserPlaylist) {
+    Task { @MainActor in
+      do {
+        try await PlaylistArtworkStore.shared.removeCustomArtwork(for: playlist.id)
+        artworkRevisions[playlist.id, default: 0] &+= 1
+        postToast(title: "已恢复默认歌单封面", subtitle: playlist.name, kind: "success")
+      } catch {
+        postToast(
+          title: "无法恢复默认歌单封面",
+          subtitle: error.localizedDescription,
+          kind: "error"
+        )
+      }
+    }
+  }
+
+  @MainActor
   private func renamePlaylist(_ playlist: UserPlaylist) {
     if let name = TextInputPrompt.prompt(
       title: "重命名歌单",
@@ -552,6 +652,9 @@ struct PlaylistsPanelView: View {
       playlistManager.setPlaybackScopeQueue()
     }
     playlistsStore.deletePlaylist(playlist)
+    Task {
+      try? await PlaylistArtworkStore.shared.removeCustomArtwork(for: playlist.id)
+    }
     reloadSelectedPlaylist()
   }
 
