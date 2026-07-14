@@ -55,7 +55,7 @@ actor UpdateChecker {
             }
 
             if latest > current {
-                let asset = selectBestAsset(from: latestRelease.assets)
+                let asset = selectBestAsset(from: latestRelease.assets, version: latestVersionString)
                 let checksum = selectChecksumAsset(from: latestRelease.assets)
                 return .updateAvailable(UpdateInfo(
                     currentVersion: currentVersion,
@@ -93,7 +93,12 @@ actor UpdateChecker {
         let url: URL
     }
 
-    private func selectBestAsset(from assets: [GitHubAsset]) -> SelectedAsset? {
+    nonisolated static func preferredDMGAssetName(from names: [String], version: String) -> String? {
+        let expectedName = "musicplayer-v\(version).dmg".lowercased()
+        return names.first(where: { $0.lowercased() == expectedName })
+    }
+
+    private func selectBestAsset(from assets: [GitHubAsset], version: String) -> SelectedAsset? {
         let dmgAssets: [SelectedAsset] =
             assets
             .compactMap { a in
@@ -102,21 +107,13 @@ actor UpdateChecker {
                 return SelectedAsset(name: a.name, url: url)
             }
 
-        guard !dmgAssets.isEmpty else { return nil }
-
-#if arch(x86_64)
-        // Intel / Rosetta: prefer "-intel.dmg"
-        if let preferred = dmgAssets.first(where: { $0.name.lowercased().contains("-intel.dmg") }) {
-            return preferred
+        guard let preferredName = Self.preferredDMGAssetName(
+            from: dmgAssets.map(\.name),
+            version: version
+        ) else {
+            return nil
         }
-#else
-        // Apple Silicon: prefer non-intel dmg
-        if let preferred = dmgAssets.first(where: { !$0.name.lowercased().contains("-intel.dmg") }) {
-            return preferred
-        }
-#endif
-
-        return dmgAssets.first
+        return dmgAssets.first(where: { $0.name == preferredName })
     }
 
     private func selectChecksumAsset(from assets: [GitHubAsset]) -> SelectedAsset? {

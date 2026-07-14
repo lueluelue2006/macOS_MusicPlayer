@@ -169,6 +169,14 @@ actor SelfUpdater {
           exit 3
         fi
 
+        SRC_EXECUTABLE="$SRC_APP/Contents/MacOS/MusicPlayer"
+        SRC_CLI="$SRC_APP/Contents/MacOS/musicplayerctl"
+        APP_FILE_TYPE="$(/usr/bin/file -b "$SRC_EXECUTABLE" 2>/dev/null || true)"
+        CLI_FILE_TYPE="$(/usr/bin/file -b "$SRC_CLI" 2>/dev/null || true)"
+        if [[ "$APP_FILE_TYPE" != "Mach-O 64-bit executable arm64" || "$CLI_FILE_TYPE" != "Mach-O 64-bit executable arm64" ]]; then
+          exit 4
+        fi
+
         # Stage new bundle in /Applications for an atomic rename swap.
         rm -rf "$NEW_APP" >/dev/null 2>&1 || true
         /usr/bin/ditto "$SRC_APP" "$NEW_APP"

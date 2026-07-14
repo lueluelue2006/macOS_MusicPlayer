@@ -22,13 +22,14 @@
 - 不仅 `x.y`，**`x.y.z` 小版本也必须上传到 GitHub Releases**。
 - 每次发布都必须包含可下载资产，不允许只发 tag/源码压缩包。
 
-### 2) Release 资产要求（强制双架构）
+### 2) Release 资产要求（强制 Apple Silicon 单架构）
 
 每个 Release 必须上传以下文件：
 
 - `MusicPlayer-vX.Y(.Z).dmg`（Apple Silicon / M 系列）
-- `MusicPlayer-vX.Y(.Z)-intel.dmg`（Intel）
-- `SHA256SUMS.txt`（至少包含上面两个 DMG 的 sha256）
+- `SHA256SUMS.txt`（至少包含上面 DMG 的 sha256）
+
+Intel 发行包不再维护；发布流程不得生成或上传 `-intel.dmg`。
 
 ### 3) Releases 页面保留策略
 
@@ -44,7 +45,7 @@
 每次发布后都要检查：
 
 - `Latest` 是否指向目标版本。
-- 资产是否齐全（M 芯片 + Intel + SHA256SUMS）。
+- 资产是否齐全（Apple Silicon DMG + SHA256SUMS）。
 - 是否残留旧 `x.y.z` Release（若有立即删除旧的）。
 
 建议命令：
@@ -62,9 +63,8 @@ gh release delete vOLD -R lueluelue2006/macOS_MusicPlayer --yes
 - 如 GitHub CLI 需要 notes 文件，使用临时 `--notes-file`，内容只写一两句必要说明，避免 `\n` 字面量导致页面格式错乱。
 - 上传资产前必须校验架构：
   - Apple Silicon 包内可执行文件应为 `arm64`
-  - Intel 包内可执行文件应为 `x86_64`
-  - 建议命令：`file MusicPlayer.app/Contents/MacOS/MusicPlayer`、`file MusicPlayer-intel.app/Contents/MacOS/MusicPlayer`
-- `SHA256SUMS.txt` 必须覆盖当次发布的两个 DMG（M 芯片 + Intel）。
+  - 建议命令：`file MusicPlayer.app/Contents/MacOS/MusicPlayer`
+- `SHA256SUMS.txt` 必须覆盖当次发布的 Apple Silicon DMG。
 - 发布后必须复查 Release 页面展示（文案格式、资产数量、文件名）。
 
 ### 6) 发布产物与仓库卫生

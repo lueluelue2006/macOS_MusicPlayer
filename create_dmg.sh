@@ -15,34 +15,13 @@ if [[ -z "$VERSION" ]]; then
     exit 1
 fi
 
-# 配置参数（基于脚本目录）
+# Apple Silicon 单架构发行配置（基于脚本目录）
 APP_NAME="MusicPlayer"
-APP_BUNDLE="${APP_BUNDLE:-MusicPlayer.app}"
-DMG_SUFFIX="${DMG_SUFFIX:-}"
-DMG_NAME="MusicPlayer-v${VERSION}${DMG_SUFFIX}"
+APP_BUNDLE="MusicPlayer.app"
+DMG_NAME="MusicPlayer-v${VERSION}"
 SOURCE_APP="${SCRIPT_DIR}/${APP_BUNDLE}"
 DMG_TEMP_DIR="${SCRIPT_DIR}/dmg-temp"
 DMG_CONTENTS_DIR="${SCRIPT_DIR}/dmg-contents"
-
-# 清理之前的临时文件 / 旧 DMG（默认只保留当前版本的 DMG，避免目录堆积）
-echo "🧹 清理临时文件..."
-rm -rf "$DMG_TEMP_DIR"
-
-# 旧 DMG 清理策略：
-# - 默认：删除当前版本以外的 MusicPlayer-v*.dmg（包含 intel/arm 等后缀）。
-# - 如需保留旧 DMG：运行时设置 KEEP_OLD_DMGS=1 跳过清理。
-if [[ "${KEEP_OLD_DMGS:-0}" != "1" ]]; then
-    echo "🧹 清理旧版本 DMG（保留 v${VERSION}）..."
-    for f in "${SCRIPT_DIR}"/MusicPlayer-v*.dmg; do
-        [[ -e "$f" ]] || continue
-        base="$(basename "$f")"
-        if [[ "$base" != "MusicPlayer-v${VERSION}"*".dmg" ]]; then
-            rm -f "$f"
-        fi
-    done
-fi
-
-rm -f "${DMG_NAME}.dmg"
 
 # 检查源应用是否存在
 if [ ! -d "$SOURCE_APP" ]; then
@@ -50,6 +29,57 @@ if [ ! -d "$SOURCE_APP" ]; then
     echo "请先运行 ./build.sh 构建应用"
     exit 1
 fi
+
+SOURCE_EXECUTABLE="$SOURCE_APP/Contents/MacOS/MusicPlayer"
+SOURCE_CLI="$SOURCE_APP/Contents/MacOS/musicplayerctl"
+SOURCE_INFO_PLIST="$SOURCE_APP/Contents/Info.plist"
+if [[ ! -x "$SOURCE_EXECUTABLE" || ! -x "$SOURCE_CLI" || ! -f "$SOURCE_INFO_PLIST" ]]; then
+    echo "❌ 错误：应用包结构不完整，请重新运行 ./build.sh"
+    exit 1
+fi
+
+BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SOURCE_INFO_PLIST" 2>/dev/null || true)"
+if [[ "$BUNDLE_VERSION" != "$VERSION" ]]; then
+    echo "❌ 错误：应用版本为 ${BUNDLE_VERSION:-未知}，VERSION 文件为 ${VERSION}"
+    echo "请重新运行 ./build.sh，禁止给旧应用重新套用新版本文件名"
+    exit 1
+fi
+
+verify_arm64_binary() {
+    local binary="$1"
+    local architectures
+    architectures="$(/usr/bin/lipo -archs "$binary" 2>/dev/null || true)"
+    if [[ "$architectures" != "arm64" ]]; then
+        echo "❌ 错误：发行包只支持 Apple Silicon，$binary 的架构为 ${architectures:-未知}"
+        exit 1
+    fi
+}
+
+verify_arm64_binary "$SOURCE_EXECUTABLE"
+verify_arm64_binary "$SOURCE_CLI"
+
+if ! /usr/bin/codesign --verify --deep --strict "$SOURCE_APP" 2>/dev/null; then
+    echo "❌ 错误：应用签名校验失败，请重新运行 ./build.sh"
+    exit 1
+fi
+
+# 只有源应用通过校验后才清理旧产物，避免失败的打包尝试误删可用 DMG。
+echo "🧹 清理临时文件..."
+rm -rf "$DMG_TEMP_DIR"
+
+# 默认只保留当前版本的 Apple Silicon DMG；设置 KEEP_OLD_DMGS=1 可跳过清理。
+if [[ "${KEEP_OLD_DMGS:-0}" != "1" ]]; then
+    echo "🧹 清理旧版本 DMG（保留 v${VERSION}）..."
+    for f in "${SCRIPT_DIR}"/MusicPlayer-v*.dmg; do
+        [[ -e "$f" ]] || continue
+        base="$(basename "$f")"
+        if [[ "$base" != "MusicPlayer-v${VERSION}.dmg" ]]; then
+            rm -f "$f"
+        fi
+    done
+fi
+
+rm -f "${DMG_NAME}.dmg"
 
 # 创建临时DMG目录
 echo "📁 创建DMG内容..."
@@ -99,6 +129,12 @@ hdiutil create -volname "$APP_NAME" \
                -imagekey zlib-level=9 \
                "${DMG_NAME}.dmg"
 
+/usr/bin/shasum -a 256 "${DMG_NAME}.dmg" > SHA256SUMS.txt
+if [[ "$(wc -l < SHA256SUMS.txt | tr -d '[:space:]')" != "1" ]] || ! grep -Fq "  ${DMG_NAME}.dmg" SHA256SUMS.txt; then
+    echo "❌ 错误：SHA256SUMS.txt 生成失败"
+    exit 1
+fi
+
 # 清理临时文件
 echo "🧹 清理临时文件..."
 rm -rf "$DMG_TEMP_DIR"
@@ -112,6 +148,7 @@ echo "📦 文件信息："
 echo "   名称: ${DMG_NAME}.dmg"
 echo "   大小: $DMG_SIZE"
 echo "   位置: $(pwd)/${DMG_NAME}.dmg"
+echo "   校验: $(pwd)/SHA256SUMS.txt"
 echo ""
 echo "🚀 使用方法："
 echo "   1. 双击 ${DMG_NAME}.dmg 挂载"
@@ -121,4 +158,4 @@ echo ""
 echo "💡 分发提示："
 echo "   - 可以直接分享这个 DMG 文件"
 echo "   - 用户双击即可安装"
-echo "   - 支持 macOS 13.0+ (Apple Silicon & Intel)"
+echo "   - 支持 macOS 13.0+（仅 Apple Silicon）"

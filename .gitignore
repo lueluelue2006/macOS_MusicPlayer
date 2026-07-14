@@ -1,8 +1,6 @@
 .DS_Store
 .build/
-.build-intel/
 MusicPlayer.app/
-MusicPlayer-intel.app/
 .clang-module-cache/
 .home/
 EmbeddedOutput/
@@ -12,3 +10,4 @@ dmg-temp/
 .swiftpm/
 .codex/
 *.dmg
+SHA256SUMS.txt

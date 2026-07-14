@@ -17,6 +17,11 @@ if [[ -z "$VERSION" ]]; then
     exit 1
 fi
 
+if [[ "$(uname -m)" != "arm64" ]]; then
+    echo "❌ 错误: 发行版只支持 Apple Silicon，请在 M 系列 Mac 上构建"
+    exit 1
+fi
+
 # 检查 Xcode 是否安装
 if ! command -v swift &> /dev/null; then
     echo "❌ 错误: 未找到 Swift。请安装 Xcode Command Line Tools:"
@@ -148,6 +153,20 @@ EOF
 chmod +x MusicPlayer.app/Contents/MacOS/MusicPlayer
 chmod +x MusicPlayer.app/Contents/MacOS/musicplayerctl
 
+verify_arm64_binary() {
+  local binary="$1"
+  local architectures
+  architectures="$(/usr/bin/lipo -archs "$binary" 2>/dev/null || true)"
+  if [[ "$architectures" != "arm64" ]]; then
+    echo "❌ 错误: $binary 的架构为 ${architectures:-未知}，发行版要求纯 arm64"
+    exit 1
+  fi
+}
+
+verify_arm64_binary "MusicPlayer.app/Contents/MacOS/MusicPlayer"
+verify_arm64_binary "MusicPlayer.app/Contents/MacOS/musicplayerctl"
+echo "✅ 已确认 Apple Silicon（arm64）架构"
+
 # 尝试进行临时(adhoc)签名以提升通知注册可靠性
 echo "🔏 对应用进行临时签名(adhoc)…"
 if codesign --force --deep --sign - "MusicPlayer.app" 2>/dev/null; then
@@ -155,8 +174,8 @@ if codesign --force --deep --sign - "MusicPlayer.app" 2>/dev/null; then
   # 打印简要签名信息（非致命）
   codesign -dv --verbose=1 MusicPlayer.app 2>&1 | head -n 3 || true
 else
-  echo "   ⚠️ 未能完成签名（可忽略）。如需通知更稳定，可手动执行："
-  echo "      codesign --force --deep --sign - /Applications/MusicPlayer.app"
+  echo "❌ 错误: 未能完成应用签名，发行包将无法通过校验"
+  exit 1
 fi
 
 echo "✅ 构建完成！"

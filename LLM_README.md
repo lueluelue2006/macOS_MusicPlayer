@@ -16,10 +16,10 @@ This file is intended for AI coding assistants (Codex/Cursor/Claude/etc.). It is
 
 ## Build & run
 
-- Build app: `./build.sh` (outputs `MusicPlayer.app` in the repo root)
+- Build app: `./build.sh` (outputs an Apple Silicon-only `MusicPlayer.app` in the repo root)
 - Run app: `open MusicPlayer.app`
 - Build CLI: `swift build -c release` (outputs `.build/release/musicplayerctl`)
-- Package DMG: `./create_dmg.sh` (outputs `MusicPlayer-v<version>.dmg`)
+- Package DMG: `./create_dmg.sh` (outputs Apple Silicon-only `MusicPlayer-v<version>.dmg` and `SHA256SUMS.txt`)
 
 ## CLI (debug / automation)
 
