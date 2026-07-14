@@ -96,7 +96,9 @@ struct PlaylistsPanelView: View {
       refreshVisibleTracks()
     }
     .onChange(of: weights.revision) { _ in
-      refreshVisibleTracks()
+      if sortState.option(for: .playlists).field == .weight {
+        refreshVisibleTracks()
+      }
     }
     .onChange(of: sortState.revision) { _ in
       refreshVisibleTracks()
@@ -260,8 +262,7 @@ struct PlaylistsPanelView: View {
                   weightLevel: weights.level(for: file.url, scope: .playlist(playlist.id)),
                   onWeightSelect: { newLevel in
                     weights.setLevel(newLevel, for: file.url, scope: .playlist(playlist.id))
-                  },
-                  showsWeightControl: true
+                  }
                 )
                 .id(file.id)
                 .listRowBackground(Color.clear)

@@ -87,6 +87,27 @@ final class PlaybackWeightsTests: XCTestCase {
         }
     }
 
+    func testSameTrackKeepsQueueAndPlaylistWeightsIndependentAfterReload() throws {
+        try withTemporaryCache { cacheURL, directory in
+            let trackURL = directory.appendingPathComponent("shared-track.mp3")
+            let playlistID = UUID()
+
+            do {
+                let writer = PlaybackWeights(cacheFileURLOverride: cacheURL)
+                writer.setLevel(.white, for: trackURL, scope: .queue)
+                writer.setLevel(.red, for: trackURL, scope: .playlist(playlistID))
+
+                XCTAssertEqual(writer.level(for: trackURL, scope: .queue), .white)
+                XCTAssertEqual(writer.level(for: trackURL, scope: .playlist(playlistID)), .red)
+                writer.flushPersistence()
+            }
+
+            let reader = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            XCTAssertEqual(reader.level(for: trackURL, scope: .queue), .white)
+            XCTAssertEqual(reader.level(for: trackURL, scope: .playlist(playlistID)), .red)
+        }
+    }
+
     func testV1QueueAndPlaylistMigrationPersistsV3WithoutMigratingTwice() throws {
         try withTemporaryCache { cacheURL, directory in
             let playlistID = UUID()

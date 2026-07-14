@@ -312,7 +312,6 @@ struct PlaylistView: View {
                   onWeightSelect: { newLevel in
                     weights.setLevel(newLevel, for: file.url, scope: .queue)
                   },
-                  showsWeightControl: true,
                   weightScopeLabel: "队列"
                     )
                     .id(file.id)
@@ -372,7 +371,9 @@ struct PlaylistView: View {
       refreshQueueVisibleFiles()
     }
     .onChange(of: weights.revision) { _ in
-      refreshQueueVisibleFiles()
+      if sortState.option(for: .queue).field == .weight {
+        refreshQueueVisibleFiles()
+      }
     }
     .onChange(of: playlistManager.isInitialRestorePending) { _ in
       refreshQueueVisibleFiles()
@@ -723,11 +724,11 @@ struct PlaylistItemView: View {
   let playAction: (AudioFile) -> Void
   let deleteAction: (AudioFile) -> Void
   let editAction: (AudioFile) -> Void
-  let weightLevel: PlaybackWeights.Level?
-  let onWeightSelect: ((PlaybackWeights.Level) -> Void)?
-  let showsWeightControl: Bool
+  let weightLevel: PlaybackWeights.Level
+  let onWeightSelect: (PlaybackWeights.Level) -> Void
   var weightScopeLabel: String = "歌单"
   @State private var isHovered = false
+  @State private var isPlaybackRegionHovered = false
   @Environment(\.colorScheme) private var colorScheme
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
@@ -739,71 +740,65 @@ struct PlaylistItemView: View {
         .padding(.trailing, 11)
 
       HStack(spacing: 11) {
-        Image(systemName: leadingSymbol)
-          .font(.system(size: 13, weight: .semibold))
-          .foregroundStyle(leadingColor)
-          .frame(width: 24, height: 24)
-          .help(unplayableReason.map { "不可播放：\($0)" } ?? "")
-
-        VStack(alignment: .leading, spacing: 3) {
-          HStack(spacing: 7) {
-            Text(highlightedText(file.metadata.title, searchText: searchText))
+        Button {
+          playAction(file)
+        } label: {
+          HStack(spacing: 11) {
+            Image(systemName: leadingSymbol)
               .font(.system(size: 13, weight: .semibold))
-              .lineLimit(1)
-              .foregroundStyle(unplayableReason == nil ? Color.primary : Color.secondary)
+              .foregroundStyle(leadingColor)
+              .frame(width: 24, height: 24)
 
-            if isVolumeAnalyzed {
-              Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(theme.mutedText.opacity(0.72))
-                .help("音量均衡已分析")
-                .accessibilityLabel("音量均衡已分析")
-            }
-          }
+            VStack(alignment: .leading, spacing: 3) {
+              HStack(spacing: 7) {
+                Text(highlightedText(file.metadata.title, searchText: searchText))
+                  .font(.system(size: 13, weight: .semibold))
+                  .lineLimit(1)
+                  .foregroundStyle(unplayableReason == nil ? Color.primary : Color.secondary)
 
-          Text(
-            "\(highlightedText(file.metadata.artist, searchText: searchText)) · \(highlightedText(file.metadata.album, searchText: searchText))"
-          )
-          .font(.system(size: 11))
-          .foregroundColor(theme.mutedText)
-          .lineLimit(1)
-          .help(file.url.lastPathComponent)
-        }
-
-        Spacer(minLength: 10)
-
-        if showsWeightControl, let weightLevel, let onWeightSelect {
-          Menu {
-            ForEach(PlaybackWeights.Level.allCases, id: \.rawValue) { level in
-              Button {
-                onWeightSelect(level)
-              } label: {
-                if level == weightLevel {
-                  Label(weightLabel(level), systemImage: "checkmark")
-                } else {
-                  Text(weightLabel(level))
+                if isVolumeAnalyzed {
+                  Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(theme.mutedText.opacity(0.72))
+                    .help("音量均衡已分析")
+                    .accessibilityLabel("音量均衡已分析")
                 }
               }
+
+              Text(
+                "\(highlightedText(file.metadata.artist, searchText: searchText)) · \(highlightedText(file.metadata.album, searchText: searchText))"
+              )
+              .font(.system(size: 11))
+              .foregroundColor(theme.mutedText)
+              .lineLimit(1)
+              .help(file.url.lastPathComponent)
             }
-          } label: {
-            HStack(spacing: 4) {
-              Image(systemName: "dial.medium")
-              Text(weightValueLabel(weightLevel))
-                .monospacedDigit()
-                .lineLimit(1)
-            }
-            .font(.system(size: 10, weight: .medium))
-            .foregroundStyle(weightLevel == .defaultLevel ? theme.mutedText : theme.accent)
-            .frame(minWidth: 24, minHeight: 24)
-            .contentShape(Rectangle())
+
+            Spacer(minLength: 10)
           }
-          .menuStyle(.borderlessButton)
-          .menuIndicator(.hidden)
-          .opacity(isHovered || weightLevel != .defaultLevel ? 1 : 0)
-          .help("随机权重：\(weightLabel(weightLevel))（范围：\(weightScopeLabel)）")
-          .accessibilityLabel("随机权重")
-          .accessibilityValue("\(weightLabel(weightLevel))，范围：\(weightScopeLabel)")
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .accessibilityLabel(trackAccessibilityLabel)
+        .accessibilityHint(unplayableReason.map { "不可播放：\($0)" } ?? "播放歌曲")
+        .accessibilityAddTraits(isCurrentTrack ? .isSelected : [])
+        .onHover { hovering in
+          isPlaybackRegionHovered = hovering
+        }
+
+        WeightBlocksView(
+          level: weightLevel,
+          scopeLabel: weightScopeLabel,
+          itemLabel: file.metadata.title
+        ) { newLevel in
+          onWeightSelect(newLevel)
+        }
+        // Keep the full picker footprint—including its padding and the gaps
+        // between visible squares—outside the playback button's hit region.
+        .padding(.horizontal, 4)
+        .fixedSize(horizontal: true, vertical: true)
+        .layoutPriority(2)
 
         Text(durationLabel)
           .font(.system(size: 11, weight: .medium))
@@ -812,8 +807,6 @@ struct PlaylistItemView: View {
           .frame(width: 42, alignment: .trailing)
           .accessibilityLabel(file.duration == nil ? "时长加载中" : "时长 \(durationLabel)")
       }
-      .contentShape(Rectangle())
-      .onTapGesture { playAction(file) }
       .frame(maxWidth: .infinity, alignment: .leading)
 
       HStack(spacing: 2) {
@@ -863,23 +856,21 @@ struct PlaylistItemView: View {
       isHovered = hovering
     }
     .contextMenu {
-      if showsWeightControl, let weightLevel, let onWeightSelect {
-        Menu("随机权重") {
-          ForEach(PlaybackWeights.Level.allCases, id: \.rawValue) { level in
-            Button {
-              onWeightSelect(level)
-            } label: {
-              if level == weightLevel {
-                Label(weightLabel(level), systemImage: "checkmark")
-              } else {
-                Text(weightLabel(level))
-              }
+      Menu("随机权重") {
+        ForEach(PlaybackWeights.Level.allCases, id: \.rawValue) { level in
+          Button {
+            onWeightSelect(level)
+          } label: {
+            if level == weightLevel {
+              Label(weightLabel(level), systemImage: "checkmark")
+            } else {
+              Text(weightLabel(level))
             }
           }
         }
-
-        Divider()
       }
+
+      Divider()
 
       if MetadataEditor.canShowEditButton(for: file.url) {
         Button("编辑元数据…") {
@@ -898,13 +889,19 @@ struct PlaylistItemView: View {
   private var leadingSymbol: String {
     if isCurrentTrack { return "waveform" }
     if unplayableReason != nil { return "exclamationmark.triangle.fill" }
-    return isHovered ? "play.fill" : "music.note"
+    return isPlaybackRegionHovered ? "play.fill" : "music.note"
+  }
+
+  private var trackAccessibilityLabel: String {
+    [file.metadata.title, file.metadata.artist, file.metadata.album]
+      .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+      .joined(separator: "，")
   }
 
   private var leadingColor: Color {
     if isCurrentTrack { return theme.accent }
     if unplayableReason != nil { return .orange }
-    return isHovered ? .primary : theme.mutedText
+    return isPlaybackRegionHovered ? .primary : theme.mutedText
   }
 
   private func weightLabel(_ level: PlaybackWeights.Level) -> String {

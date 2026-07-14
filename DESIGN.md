@@ -1,4 +1,4 @@
-# MusicPlayer 4.3.5 Design System
+# MusicPlayer 4.3.6 Design System
 
 ## Mode
 
@@ -14,8 +14,8 @@ the queue supplies precision.
 **Keywords:** album-first, editorial, tactile, native, calm, dense, high-contrast.
 
 **Avoid:** blank placeholder art, giant import banners, pill-shaped control
-clusters, visible weight controls on every row, stacked cards, rainbow status
-colors, decorative glass, border-heavy regions, and perpetual animation.
+clusters, stacked cards, rainbow status colors, decorative glass, border-heavy
+regions, and perpetual animation.
 
 ## Composition
 
@@ -87,13 +87,15 @@ colors, decorative glass, border-heavy regions, and perpetual animation.
   overflow menu.
 - **Search:** one native-looking search surface with a visible focus state.
 - **Track row:** glyph/equalizer, two lines of metadata, optional analyzed state,
-  duration, and hover/context actions. The random-weight control stays hidden
-  until hover unless overridden; when shown, it always states both level and
-  multiplier.
-- **Random weight:** six visible square buttons in the now-playing utility row
-  map to 0.5×, 1.0×, 1.6×, 3.2×, 4.8×, and 6.4×; they never collapse into a
-  text menu. The second level (1.0×) is the default. Track-row menus use human
-  ordinals such as “第 2 档 · 1.0×”; the CLI/API retains raw levels 0–5.
+  a permanently visible six-block random-weight picker, duration, and
+  hover/context actions. The title/metadata region is the playback button; the
+  weight buttons are independent controls, and the picker padding, inter-button
+  gaps, and duration region never trigger playback.
+- **Random weight:** the same six visible square buttons appear in the
+  now-playing utility row and every track row, mapping to 0.5×, 1.0×, 1.6×,
+  3.2×, 4.8×, and 6.4×. They never collapse into a text menu. The second level
+  (1.0×) is the default. Context menus use human ordinals such as “第 2 档 ·
+  1.0×”; the CLI/API retains raw levels 0–5.
 - **Lyrics:** absent when no lyrics exist; otherwise a flat continuation of the
   listening stage, not another card.
 
@@ -102,6 +104,8 @@ colors, decorative glass, border-heavy regions, and perpetual animation.
 - Keep SwiftUI, AppKit, AVFoundation, CoreAudio, and SF Symbols; add no UI or
   animation dependency.
 - Preserve lazy row creation and stable path-based identity.
+- Keep the six weight buttons lightweight and instantiate them only with their
+  virtualized track row; selecting a level performs no file I/O on the UI path.
 - No blur, file I/O, sorting, path normalization, large shadow, or artwork
   decoding inside queue rows.
 - Keep current-artwork ImageIO downsampling and the bounded playlist workers.

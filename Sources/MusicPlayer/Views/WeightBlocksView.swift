@@ -4,6 +4,7 @@ import SwiftUI
 struct WeightBlocksView: View {
   let level: PlaybackWeights.Level
   let scopeLabel: String
+  var itemLabel: String? = nil
   let onSelect: (PlaybackWeights.Level) -> Void
 
   @Environment(\.colorScheme) private var colorScheme
@@ -11,7 +12,7 @@ struct WeightBlocksView: View {
 
   var body: some View {
     HStack(spacing: 0) {
-      ForEach(Array(PlaybackWeights.Level.allCases.enumerated()), id: \.offset) { _, candidate in
+      ForEach(PlaybackWeights.Level.allCases, id: \.rawValue) { candidate in
         let isSelected = candidate == level
 
         Button {
@@ -31,7 +32,7 @@ struct WeightBlocksView: View {
               color: isSelected ? levelColor(for: candidate).opacity(0.28) : .clear,
               radius: 4
             )
-            .frame(width: 16, height: 22)
+            .frame(width: 18, height: 24)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -42,6 +43,7 @@ struct WeightBlocksView: View {
       }
     }
     .accessibilityElement(children: .contain)
+    .accessibilityLabel(itemLabel.map { "\($0)的随机权重" } ?? "随机权重")
   }
 
   private func levelColor(for level: PlaybackWeights.Level) -> Color {
