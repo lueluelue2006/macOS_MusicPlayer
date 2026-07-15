@@ -1492,14 +1492,24 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func getPreviousShuffledFileInPlaylist() -> AudioFile? {
-        while playlistShuffleIndex > 0 {
-            playlistShuffleIndex -= 1
-            let key = playlistShuffleQueueKeys[playlistShuffleIndex]
-            guard let idx = indexInQueue(forPathKey: key) else { continue }
-            if isUnplayableIndex(idx) { continue }
-            currentIndex = idx
-            savePlaylist()
-            return audioFiles[idx]
+        // playlistShuffleIndex points to "next position to read for next()"
+        // To go back, we need the item at playlistShuffleIndex - 2
+        guard playlistShuffleIndex >= 2 else { return nil }
+
+        var searchIndex = playlistShuffleIndex - 2
+        while searchIndex >= 0 {
+            let key = playlistShuffleQueueKeys[searchIndex]
+            guard let idx = indexInQueue(forPathKey: key) else {
+                searchIndex -= 1
+                continue
+            }
+            if !isUnplayableIndex(idx) {
+                currentIndex = idx
+                playlistShuffleIndex = searchIndex + 1  // Set cursor so next() returns the following item
+                savePlaylist()
+                return audioFiles[idx]
+            }
+            searchIndex -= 1
         }
         return nil
     }
@@ -1522,14 +1532,20 @@ final class PlaylistManager: ObservableObject {
     }
     
     private func getPreviousShuffledFile() -> AudioFile? {
-        while shuffleIndex > 0 {
-            shuffleIndex -= 1
-            let idx = shuffleQueue[shuffleIndex]
+        // shuffleIndex points to "next position to read for next()"
+        // To go back, we need the item at shuffleIndex - 2
+        guard shuffleIndex >= 2 else { return nil }
+
+        var searchIndex = shuffleIndex - 2
+        while searchIndex >= 0 {
+            let idx = shuffleQueue[searchIndex]
             if !isUnplayableIndex(idx) {
                 currentIndex = idx
+                shuffleIndex = searchIndex + 1  // Set cursor so next() returns the following item
                 savePlaylist()
                 return audioFiles[idx]
             }
+            searchIndex -= 1
         }
         return nil
     }
