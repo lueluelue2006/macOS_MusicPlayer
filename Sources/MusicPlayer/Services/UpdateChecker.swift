@@ -130,7 +130,7 @@ actor UpdateChecker {
     }
 }
 
-private struct Version: Comparable, Sendable {
+struct Version: Comparable, Sendable {
     let components: [Int]
 
     static func parse(_ raw: String) -> Version? {
@@ -147,6 +147,16 @@ private struct Version: Comparable, Sendable {
 
         guard !parts.isEmpty else { return nil }
         return Version(components: parts)
+    }
+
+    static func == (lhs: Version, rhs: Version) -> Bool {
+        let maxCount = max(lhs.components.count, rhs.components.count)
+        for i in 0..<maxCount {
+            let a = i < lhs.components.count ? lhs.components[i] : 0
+            let b = i < rhs.components.count ? rhs.components[i] : 0
+            if a != b { return false }
+        }
+        return true
     }
 
     static func < (lhs: Version, rhs: Version) -> Bool {
