@@ -341,7 +341,7 @@ public actor LyricsService {
     }
     
     // MARK: - LRC parsing
-    private func parseLRC(text: String, source: LyricsSource) -> LyricsTimeline? {
+    func parseLRC(text: String, source: LyricsSource) -> LyricsTimeline? {
         // 1) 反转义字面换行，再统一换行
         let unescaped = text
             .replacingOccurrences(of: "\\r\\n", with: "\n")
@@ -350,7 +350,20 @@ public actor LyricsService {
         let normalized = unescaped
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
-        
+
+        // 2) 解析 [offset:...] 标签（全局时间偏移，单位毫秒，可正可负）
+        var offsetSeconds: TimeInterval = 0
+        let offsetPattern = #"\[offset:\s*([+-]?\d+)\s*\]"#
+        if let offsetRegex = try? NSRegularExpression(pattern: offsetPattern, options: .caseInsensitive),
+           let match = offsetRegex.firstMatch(in: normalized, options: [], range: NSRange(normalized.startIndex..., in: normalized)),
+           match.numberOfRanges >= 2 {
+            let nsString = normalized as NSString
+            let offsetMs = nsString.substring(with: match.range(at: 1))
+            if let ms = Int(offsetMs) {
+                offsetSeconds = Double(ms) / 1000.0
+            }
+        }
+
         var lines: [(TimeInterval?, String)] = []
 
         // Example tag: [mm:ss.xx] lyric
@@ -397,7 +410,7 @@ public actor LyricsService {
                     if m.numberOfRanges >= 4, m.range(at: 3).location != NSNotFound {
                         cs = nsLine.substring(with: m.range(at: 3))
                     }
-                    let t = timeFrom(mm: mm, ss: ss, cs: cs)
+                    let t = timeFrom(mm: mm, ss: ss, cs: cs) + offsetSeconds
                     lines.append((t, lyricText))
                 }
             }
@@ -435,9 +448,8 @@ public actor LyricsService {
         let minutes = Double(mm) ?? 0
         let seconds = Double(ss) ?? 0
         var fraction = 0.0
-        if var cs = cs, !cs.isEmpty {
-            // 仅读取前两位精度（如 229996 -> 22 表示 0.22s）
-            if cs.count > 2 { cs = String(cs.prefix(2)) }
+        if let cs = cs, !cs.isEmpty {
+            // 保留完整小数精度（支持 .xx、.xxx、.xxxx 等）
             if let frac = Double("0." + cs) { fraction = frac }
         }
         return minutes * 60 + seconds + fraction
