@@ -103,7 +103,22 @@ struct PlaylistsPanelView: View {
 
   private var playlistsSidebar: some View {
     VStack(alignment: .leading, spacing: 12) {
-      EditorialSectionLabel(index: "A", title: "歌单目录")
+      HStack {
+        EditorialSectionLabel(index: "A", title: "歌单目录")
+        Spacer()
+        Button {
+          importM3U8Playlist()
+        } label: {
+          Image(systemName: "square.and.arrow.down")
+            .font(.system(size: 11))
+            .frame(width: 28, height: 28)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!playlistsStore.isReady)
+        .help("导入 M3U8 歌单")
+        .accessibilityLabel("导入 M3U8 歌单")
+      }
 
       if !playlistsStore.isReady {
         VStack(alignment: .leading, spacing: 10) {
@@ -194,6 +209,9 @@ struct PlaylistsPanelView: View {
               Divider()
               Button("重命名…") {
                 renamePlaylist(playlist)
+              }
+              Button("导出 M3U8…") {
+                exportPlaylistAsM3U8(playlist)
               }
               Divider()
               Button("删除歌单", role: .destructive) {
@@ -503,6 +521,12 @@ struct PlaylistsPanelView: View {
           postToast(
             title: "已同步权重到队列", subtitle: "应用了 \(result.changed)/\(result.total) 条权重",
             kind: "success")
+        }
+
+        Divider()
+
+        Button("导出 M3U8…") {
+          exportPlaylistAsM3U8(playlist)
         }
       } label: {
         Image(systemName: "ellipsis")
@@ -1076,5 +1100,142 @@ struct PlaylistsPanelView: View {
     }
     .padding(16)
     .frame(minWidth: 520, minHeight: 560)
+  }
+
+  // MARK: - M3U8 Import/Export
+
+  @MainActor
+  private func importM3U8Playlist() {
+    let panel = NSOpenPanel()
+    panel.title = "导入 M3U8 歌单"
+    panel.message = "选择要导入的 M3U8 歌单文件"
+    panel.prompt = "导入"
+
+    guard let m3u8Type = UTType(filenameExtension: "m3u8", conformingTo: .plainText) else {
+      postToast(title: "无法创建 M3U8 文件类型", subtitle: nil, kind: "error")
+      return
+    }
+    panel.allowedContentTypes = [m3u8Type]
+    panel.allowsMultipleSelection = false
+
+    panel.begin { response in
+      guard response == .OK, let fileURL = panel.url else { return }
+
+      Task.detached {
+        do {
+          let result = try M3U8ImportService.importPlaylist(from: fileURL)
+
+          // Create sendable snapshot
+          let snapshot = (
+            name: result.playlistName,
+            paths: result.tracks.map(\.path),
+            issueCount: result.issues.count
+          )
+
+          await MainActor.run {
+            let trackURLs = snapshot.paths.map { URL(fileURLWithPath: $0) }
+            self.playlistsStore.createPlaylist(name: snapshot.name, trackURLs: trackURLs)
+            self.reloadSelectedPlaylist()
+
+            if snapshot.issueCount == 0 {
+              self.postToast(
+                title: "已导入歌单",
+                subtitle: "\(snapshot.paths.count) 首歌曲",
+                kind: "success"
+              )
+            } else if snapshot.paths.isEmpty {
+              self.postToast(
+                title: "导入的歌单为空",
+                subtitle: "没有找到有效的歌曲文件",
+                kind: "warning"
+              )
+            } else {
+              self.postToast(
+                title: "已导入歌单（部分跳过）",
+                subtitle: "\(snapshot.paths.count) 首有效，\(snapshot.issueCount) 个问题",
+                kind: "warning"
+              )
+            }
+          }
+        } catch let error as M3U8ServiceError {
+          await MainActor.run {
+            switch error.code {
+            case .readFailed:
+              self.postToast(
+                title: "无法读取 M3U8 文件",
+                subtitle: fileURL.lastPathComponent,
+                kind: "error"
+              )
+            case .invalidUTF8:
+              self.postToast(
+                title: "文件编码无效",
+                subtitle: "M3U8 文件必须是 UTF-8 编码",
+                kind: "error"
+              )
+            case .writeFailed:
+              break
+            }
+          }
+        } catch {
+          await MainActor.run {
+            self.postToast(
+              title: "导入失败",
+              subtitle: error.localizedDescription,
+              kind: "error"
+            )
+          }
+        }
+      }
+    }
+  }
+
+  @MainActor
+  private func exportPlaylistAsM3U8(_ playlist: UserPlaylist) {
+    let panel = NSSavePanel()
+    panel.title = "导出 M3U8 歌单"
+    panel.message = "选择保存位置"
+    panel.nameFieldStringValue = "\(playlist.name).m3u8"
+
+    guard let m3u8Type = UTType(filenameExtension: "m3u8", conformingTo: .plainText) else {
+      postToast(title: "无法创建 M3U8 文件类型", subtitle: nil, kind: "error")
+      return
+    }
+    panel.allowedContentTypes = [m3u8Type]
+    panel.canCreateDirectories = true
+
+    panel.begin { response in
+      guard response == .OK, let fileURL = panel.url else { return }
+
+      // Create sendable snapshot
+      let playlistName = playlist.name
+      let trackPaths = playlist.tracks.map(\.path)
+      let trackCount = playlist.tracks.count
+
+      Task.detached {
+        do {
+          // Reconstruct playlist in detached context
+          let tracks = trackPaths.map { UserPlaylist.Track(path: $0) }
+          let temporaryPlaylist = UserPlaylist(name: playlistName, tracks: tracks)
+
+          try M3U8ExportService.exportPlaylist(temporaryPlaylist, to: fileURL)
+
+          await MainActor.run {
+            self.postToast(
+              title: "已导出歌单",
+              subtitle: "\(trackCount) 首歌曲",
+              kind: "success"
+            )
+          }
+        } catch {
+          await MainActor.run {
+            self.postToast(
+              title: "导出失败",
+              subtitle: fileURL.lastPathComponent,
+              kind: "error"
+            )
+          }
+        }
+      }
+    }
   }
 }
