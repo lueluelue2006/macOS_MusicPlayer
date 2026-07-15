@@ -516,17 +516,43 @@ final class PlaylistManager: ObservableObject {
         }
 
         await updateUI(phase: "扫描文件…", detail: "", current: 0, total: 0, force: true)
-        let fileURLs = await collectAudioFileURLs(
-            from: urls,
-            scanSubfolders: shouldScanSubfolders,
-            updateUI: updateUI
+
+        let scanResult = RecursiveImportScanner.scan(
+            urls: urls,
+            recursive: shouldScanSubfolders,
+            isCancelled: { Task.isCancelled }
         )
 
-        if Task.isCancelled { return }
+        if scanResult.wasCancelled || Task.isCancelled { return }
+
+        let fileURLs = scanResult.files
+
+        // Log actionable skipped items for debugging
+        for skipped in scanResult.skipped {
+            switch skipped.reason {
+            case .unreadable, .obviousNonAudio:
+                debugLog("Skipped: \(skipped.path) (\(skipped.reason))")
+            case .symbolicLink, .duplicate, .hidden, .package:
+                break // Expected, no action needed
+            }
+        }
+
+        // Build scan completion summary
+        var summaryParts: [String] = ["发现 \(fileURLs.count) 首"]
+        if scanResult.skipped.count > 0 {
+            summaryParts.append("跳过 \(scanResult.skipped.count) 项")
+        }
+        if scanResult.unsupportedFormatCount > 0 {
+            summaryParts.append("不支持格式 \(scanResult.unsupportedFormatCount) 个")
+        }
+        let scanSummary = summaryParts.joined(separator: "，")
+
         if fileURLs.isEmpty {
-            await updateUI(phase: "未找到可导入的音频文件", detail: "", current: 0, total: 0, force: true)
+            await updateUI(phase: "未找到可导入的音频文件", detail: scanSummary, current: 0, total: 0, force: true)
             return
         }
+
+        await updateUI(phase: "扫描完成", detail: scanSummary, current: fileURLs.count, total: fileURLs.count, force: true)
 
         await updateUI(phase: "读取元数据…", detail: "", current: 0, total: fileURLs.count, force: true)
 
@@ -608,96 +634,6 @@ final class PlaylistManager: ObservableObject {
         }
     }
 
-    /// 收集音频文件 URL：支持文件夹扫描（可选子文件夹），并跳过符号链接目录以避免循环。
-    private func collectAudioFileURLs(
-        from urls: [URL],
-        scanSubfolders: Bool,
-        updateUI: (String, String, Int, Int, Bool) async -> Void
-    ) async -> [URL] {
-        let fileManager = FileManager.default
-        var stack: [URL] = urls
-        var visitedDirectories: Set<String> = []
-        var results: [URL] = []
-
-        var scannedItems = 0
-        var foundFiles = 0
-
-        while let url = stack.popLast() {
-            if Task.isCancelled { break }
-            scannedItems += 1
-
-            if scannedItems % 64 == 0 {
-                await Task.yield()
-            }
-
-            if scannedItems % 40 == 0 {
-                await updateUI("扫描文件…", url.lastPathComponent, foundFiles, 0, false)
-            }
-
-            var isDirectory: ObjCBool = false
-            guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { continue }
-
-            if isDirectory.boolValue {
-                // Skip symlinked directories to avoid loops.
-                let isSymlink = (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) ?? false
-                if isSymlink { continue }
-
-                let canonical = PathKey.canonical(path: url.resolvingSymlinksInPath().standardizedFileURL.path)
-                if visitedDirectories.contains(canonical) { continue }
-                visitedDirectories.insert(canonical)
-
-                do {
-                    let contents = try fileManager.contentsOfDirectory(
-                        at: url,
-                        includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-                        options: [.skipsHiddenFiles]
-                    )
-
-                    for child in contents {
-                        if Task.isCancelled { break }
-                        let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-                        if values?.isSymbolicLink == true { continue }
-                        if values?.isDirectory == true {
-                            if scanSubfolders {
-                                stack.append(child)
-                            }
-                            continue
-                        }
-                        if isAudioFile(child) {
-                            results.append(child)
-                            foundFiles += 1
-                            if foundFiles % 20 == 0 {
-                                await updateUI("扫描文件…", child.lastPathComponent, foundFiles, 0, false)
-                            }
-                        }
-                    }
-                } catch {
-                    // Ignore unreadable folders.
-                    continue
-                }
-            } else {
-                if isAudioFile(url) {
-                    results.append(url)
-                    foundFiles += 1
-                }
-            }
-        }
-
-        // 去重（路径粒度）：仅保留首次出现的路径
-        var seen = Set<String>()
-        var deduped: [URL] = []
-        deduped.reserveCapacity(results.count)
-        for u in results {
-            let key = pathKey(u)
-            if !seen.contains(key) {
-                seen.insert(key)
-                deduped.append(u)
-            }
-        }
-        await updateUI("扫描完成", "发现 \(deduped.count) 首", deduped.count, 0, true)
-        return deduped
-    }
-    
     // 更新文件的元数据（仅覆盖指定字段：标题/艺术家/专辑/年份/类型）
     func updateFileMetadata(_ file: AudioFile, title: String, artist: String, album: String, year: String?, genre: String?) {
         if let index = audioFiles.firstIndex(where: { $0.id == file.id }) {
@@ -1569,15 +1505,6 @@ final class PlaylistManager: ObservableObject {
         let d = UserDefaults.standard
         d.set(scanSubfolders, forKey: userScanSubfoldersKey)
     }
-    
-	    private func isAudioFile(_ url: URL) -> Bool {
-	        let audioExtensions = [
-	            "mp3", "m4a", "aac", // MPEG family
-	            "wav", "aif", "aiff", "aifc", "caf", // PCM/CoreAudio
-	            "flac" // Lossless
-	        ]
-	        return audioExtensions.contains(url.pathExtension.lowercased())
-	    }
 
     // 统一的路径键（Unicode 规范化 + 标准路径，不再强制 lowercased）
     private func pathKey(_ url: URL) -> String {
