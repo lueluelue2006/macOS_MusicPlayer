@@ -286,7 +286,13 @@ struct PlaylistsPanelView: View {
                   },
                   weightLevel: weights.level(for: file.url, scope: .playlist(playlist.id)),
                   onWeightSelect: { newLevel in
-                    weights.setLevel(newLevel, for: file.url, scope: .playlist(playlist.id))
+                    let result = weights.setLevel(newLevel, for: file.url, scope: .playlist(playlist.id))
+                    switch result {
+                    case .applied, .unchanged:
+                      break
+                    case .rejectedReadOnly(let reason):
+                      postToast(title: "无法修改随机权重", subtitle: reason.diagnosticMessage, kind: "error")
+                    }
                   }
                 )
                   .id(file.id)
@@ -482,6 +488,10 @@ struct PlaylistsPanelView: View {
 
         Button("同步随机权重给队列") {
           let result = weights.syncPlaylistOverridesToQueue(from: playlist.id)
+          if case .rejectedReadOnly(let reason) = result.mutationResult {
+            postToast(title: "无法同步随机权重", subtitle: reason.diagnosticMessage, kind: "error")
+            return
+          }
           if result.total == 0 {
             postToast(title: "歌单没有设置随机权重", subtitle: "先在歌曲行的随机权重菜单中设置", kind: "info")
             return

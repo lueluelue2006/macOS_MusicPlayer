@@ -1201,17 +1201,26 @@ final class IPCServer {
             return IPCReply(id: request.id, ok: false, message: "missing target track (path/index/query/current)")
         }
 
-        PlaybackWeights.shared.setLevel(level, for: url, scope: scope)
-        return IPCReply(
-            id: request.id,
-            ok: true,
-            data: [
-                "path": url.path,
-                "scope": weightScopeLabel(scope),
-                "level": "\(level.rawValue)",
-                "multiplier": String(format: "%.3f", level.multiplier)
-            ]
-        )
+        let result = PlaybackWeights.shared.setLevel(level, for: url, scope: scope)
+        switch result {
+        case .applied, .unchanged:
+            return IPCReply(
+                id: request.id,
+                ok: true,
+                data: [
+                    "path": url.path,
+                    "scope": weightScopeLabel(scope),
+                    "level": "\(level.rawValue)",
+                    "multiplier": String(format: "%.3f", level.multiplier)
+                ]
+            )
+        case .rejectedReadOnly(let reason):
+            return IPCReply(
+                id: request.id,
+                ok: false,
+                message: "权重设置被拒绝: \(reason.diagnosticMessage)"
+            )
+        }
     }
 
     @MainActor
@@ -1239,14 +1248,24 @@ final class IPCServer {
     private func handleClearWeights(_ request: IPCRequest) -> IPCReply {
         let scopeRaw = request.arguments?["scope"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if scopeRaw == "all" || (parseBool(request.arguments?["all"]) ?? false) {
-            PlaybackWeights.shared.clearAll()
-            return IPCReply(id: request.id, ok: true, message: "cleared all weight overrides")
+            let result = PlaybackWeights.shared.clearAll()
+            switch result {
+            case .applied, .unchanged:
+                return IPCReply(id: request.id, ok: true, message: "cleared all weight overrides")
+            case .rejectedReadOnly(let reason):
+                return IPCReply(id: request.id, ok: false, message: "清空权重被拒绝: \(reason.diagnosticMessage)")
+            }
         }
         guard let scope = parseWeightScope(arguments: request.arguments) else {
             return IPCReply(id: request.id, ok: false, message: "invalid scope/playlistID")
         }
-        PlaybackWeights.shared.clear(scope: scope)
-        return IPCReply(id: request.id, ok: true, message: "weights cleared", data: ["scope": weightScopeLabel(scope)])
+        let result = PlaybackWeights.shared.clear(scope: scope)
+        switch result {
+        case .applied, .unchanged:
+            return IPCReply(id: request.id, ok: true, message: "weights cleared", data: ["scope": weightScopeLabel(scope)])
+        case .rejectedReadOnly(let reason):
+            return IPCReply(id: request.id, ok: false, message: "清空权重被拒绝: \(reason.diagnosticMessage)")
+        }
     }
 
     @MainActor
@@ -1260,15 +1279,24 @@ final class IPCServer {
         }
 
         let result = PlaybackWeights.shared.syncPlaylistOverridesToQueue(from: playlistID)
-        return IPCReply(
-            id: request.id,
-            ok: true,
-            data: [
-                "playlistID": playlistID.uuidString,
-                "total": "\(result.total)",
-                "changed": "\(result.changed)"
-            ]
-        )
+        switch result.mutationResult {
+        case .applied, .unchanged:
+            return IPCReply(
+                id: request.id,
+                ok: true,
+                data: [
+                    "playlistID": playlistID.uuidString,
+                    "total": "\(result.total)",
+                    "changed": "\(result.changed)"
+                ]
+            )
+        case .rejectedReadOnly(let reason):
+            return IPCReply(
+                id: request.id,
+                ok: false,
+                message: "同步权重被拒绝: \(reason.diagnosticMessage)"
+            )
+        }
     }
 
     @MainActor

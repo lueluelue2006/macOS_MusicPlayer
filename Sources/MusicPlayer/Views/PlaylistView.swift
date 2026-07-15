@@ -315,7 +315,17 @@ struct PlaylistView: View {
                   },
                   weightLevel: weights.level(for: file.url, scope: .queue),
                   onWeightSelect: { newLevel in
-                    weights.setLevel(newLevel, for: file.url, scope: .queue)
+                    let result = weights.setLevel(newLevel, for: file.url, scope: .queue)
+                    switch result {
+                    case .applied, .unchanged:
+                      break
+                    case .rejectedReadOnly(let reason):
+                      NotificationCenter.default.post(
+                        name: .showAppToast,
+                        object: nil,
+                        userInfo: ["title": "无法修改随机权重", "subtitle": reason.diagnosticMessage, "kind": "error", "duration": 4.0]
+                      )
+                    }
                   },
                   weightScopeLabel: "队列"
                     )

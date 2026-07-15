@@ -192,12 +192,21 @@ struct MusicPlayerCommands: Commands {
                             case .playlist(let id): return .playlist(id)
                             }
                         }()
-                        PlaybackWeights.shared.clear(scope: scope)
-                        NotificationCenter.default.post(
-                            name: .showAppToast,
-                            object: nil,
-                            userInfo: ["title": "随机权重已清空", "kind": "success", "duration": 2.0]
-                        )
+                        let result = PlaybackWeights.shared.clear(scope: scope)
+                        switch result {
+                        case .applied, .unchanged:
+                            NotificationCenter.default.post(
+                                name: .showAppToast,
+                                object: nil,
+                                userInfo: ["title": "随机权重已清空", "kind": "success", "duration": 2.0]
+                            )
+                        case .rejectedReadOnly(let reason):
+                            NotificationCenter.default.post(
+                                name: .showAppToast,
+                                object: nil,
+                                userInfo: ["title": "无法清空权重", "subtitle": reason.diagnosticMessage, "kind": "error", "duration": 4.0]
+                            )
+                        }
                     }
                 }
 
@@ -210,12 +219,21 @@ struct MusicPlayerCommands: Commands {
                             cancelTitle: "不清除"
                         )
                         guard confirmed else { return }
-                        PlaybackWeights.shared.clearAll()
-                        NotificationCenter.default.post(
-                            name: .showAppToast,
-                            object: nil,
-                            userInfo: ["title": "全部随机权重已清空", "kind": "success", "duration": 2.0]
-                        )
+                        let result = PlaybackWeights.shared.clearAll()
+                        switch result {
+                        case .applied, .unchanged:
+                            NotificationCenter.default.post(
+                                name: .showAppToast,
+                                object: nil,
+                                userInfo: ["title": "全部随机权重已清空", "kind": "success", "duration": 2.0]
+                            )
+                        case .rejectedReadOnly(let reason):
+                            NotificationCenter.default.post(
+                                name: .showAppToast,
+                                object: nil,
+                                userInfo: ["title": "无法清空权重", "subtitle": reason.diagnosticMessage, "kind": "error", "duration": 4.0]
+                            )
+                        }
                     }
                 }
 

@@ -63,8 +63,8 @@ final class PlaybackWeightsTests: XCTestCase {
             do {
                 let writer = PlaybackWeights(cacheFileURLOverride: cacheURL)
                 for (index, level) in PlaybackWeights.Level.allCases.enumerated() {
-                    writer.setLevel(level, for: queueURLs[index], scope: .queue)
-                    writer.setLevel(level, for: playlistURLs[index], scope: .playlist(playlistID))
+                    _ = writer.setLevel(level, for: queueURLs[index], scope: .queue)
+                    _ = writer.setLevel(level, for: playlistURLs[index], scope: .playlist(playlistID))
                 }
                 writer.flushPersistence()
             }
@@ -94,8 +94,8 @@ final class PlaybackWeightsTests: XCTestCase {
 
             do {
                 let writer = PlaybackWeights(cacheFileURLOverride: cacheURL)
-                writer.setLevel(.white, for: trackURL, scope: .queue)
-                writer.setLevel(.red, for: trackURL, scope: .playlist(playlistID))
+                _ = writer.setLevel(.white, for: trackURL, scope: .queue)
+                _ = writer.setLevel(.red, for: trackURL, scope: .playlist(playlistID))
 
                 XCTAssertEqual(writer.level(for: trackURL, scope: .queue), .white)
                 XCTAssertEqual(writer.level(for: trackURL, scope: .playlist(playlistID)), .red)
@@ -251,10 +251,10 @@ final class PlaybackWeightsTests: XCTestCase {
 
             XCTAssertEqual(weights.level(for: queueURL, scope: .queue), .green)
             XCTAssertEqual(weights.level(for: playlistURL, scope: .playlist(playlistID)), .green)
-            weights.setLevel(.red, for: queueURL, scope: .queue)
-            weights.setLevel(.gold, for: playlistURL, scope: .playlist(playlistID))
-            weights.setLevel(.green, for: queueURL, scope: .queue)
-            weights.setLevel(.green, for: playlistURL, scope: .playlist(playlistID))
+            _ = weights.setLevel(.red, for: queueURL, scope: .queue)
+            _ = weights.setLevel(.gold, for: playlistURL, scope: .playlist(playlistID))
+            _ = weights.setLevel(.green, for: queueURL, scope: .queue)
+            _ = weights.setLevel(.green, for: playlistURL, scope: .playlist(playlistID))
             weights.flushPersistence()
 
             let envelope = try decodeEnvelope(at: cacheURL)
@@ -283,52 +283,133 @@ final class PlaybackWeightsTests: XCTestCase {
         }
     }
 
-    func testUnknownOrMalformedCacheSchemaIsPreservedOnFlush() throws {
-        let fixtures = [
-            Data(#"{"version":99,"futureLevels":["opaque"],"checksum":"keep"}"#.utf8),
+    func testMalformedCacheIsQuarantinedAndReplacedOnMutation() throws {
+        let corruptFixtures = [
             Data(#"{"version":2,"queueLevels":"changed-shape"}"#.utf8),
             Data("not-json".utf8),
         ]
 
-        for originalData in fixtures {
+        for originalData in corruptFixtures {
             try withTemporaryCache { cacheURL, directory in
                 try originalData.write(to: cacheURL, options: .atomic)
                 let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
-                let trackURL = directory.appendingPathComponent("preserved.mp3")
+                let trackURL = directory.appendingPathComponent("track.mp3")
 
-                XCTAssertEqual(weights.level(for: trackURL, scope: .queue), .green)
+                if case .quarantinedCorrupt(let backupURL) = weights.persistenceState {
+                    XCTAssertEqual(try Data(contentsOf: backupURL), originalData)
+                } else {
+                    XCTFail("Expected quarantinedCorrupt for corrupt data")
+                }
+
+                _ = weights.setLevel(.purple, for: trackURL, scope: .queue)
                 weights.flushPersistence()
 
-                XCTAssertEqual(try Data(contentsOf: cacheURL), originalData)
+                let envelope = try decodeEnvelope(at: cacheURL)
+                XCTAssertEqual(envelope.version, 3)
+                XCTAssertEqual(envelope.queueLevels[PlaybackWeights.key(for: trackURL)], PlaybackWeights.Level.purple.rawValue)
             }
         }
     }
 
-    func testExplicitDefaultAndClearAllReplacePreservedCache() throws {
-        let futureData = Data(#"{"version":99,"futureLevels":["opaque"]}"#.utf8)
+    func testFutureSchemaRemainsUnchangedThroughAllMutationsAndFlushes() throws {
+        let futureData = Data(#"{"version":99,"futureLevels":["opaque"],"checksum":"must-keep"}"#.utf8)
 
         try withTemporaryCache { cacheURL, directory in
             try futureData.write(to: cacheURL, options: .atomic)
             let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
-            weights.setLevel(.green, for: directory.appendingPathComponent("default.mp3"), scope: .queue)
-            weights.flushPersistence()
+            let trackURL = directory.appendingPathComponent("track.mp3")
+            let playlistID = UUID()
 
-            let replaced = try decodeEnvelope(at: cacheURL)
-            XCTAssertEqual(replaced.version, 3)
-            XCTAssertTrue(replaced.queueLevels.isEmpty)
-            XCTAssertTrue(replaced.playlistLevels.isEmpty)
+            XCTAssertEqual(weights.persistenceState, .readOnlyPreserved(.unsupportedVersion(99)))
+
+            let setResult = weights.setLevel(.red, for: trackURL, scope: .queue)
+            if case .rejectedReadOnly(let reason) = setResult {
+                XCTAssertEqual(reason, .unsupportedVersion(99))
+            } else {
+                XCTFail("Expected rejectedReadOnly, got \(setResult)")
+            }
+
+            let clearResult = weights.clear(scope: .queue)
+            if case .rejectedReadOnly(let reason) = clearResult {
+                XCTAssertEqual(reason, .unsupportedVersion(99))
+            } else {
+                XCTFail("Expected rejectedReadOnly, got \(clearResult)")
+            }
+
+            let clearAllResult = weights.clearAll()
+            if case .rejectedReadOnly(let reason) = clearAllResult {
+                XCTAssertEqual(reason, .unsupportedVersion(99))
+            } else {
+                XCTFail("Expected rejectedReadOnly, got \(clearAllResult)")
+            }
+
+            let syncResult = weights.syncPlaylistOverridesToQueue(from: playlistID)
+            if case .rejectedReadOnly(let reason) = syncResult.mutationResult {
+                XCTAssertEqual(reason, .unsupportedVersion(99))
+            } else {
+                XCTFail("Expected rejectedReadOnly, got \(syncResult.mutationResult)")
+            }
+
+            weights.flushPersistence()
+            XCTAssertEqual(try Data(contentsOf: cacheURL), futureData)
         }
+    }
 
-        try withTemporaryCache { cacheURL, _ in
-            try futureData.write(to: cacheURL, options: .atomic)
+    func testQuarantineSuccessPreservesOriginalAndAllowsSubsequentWrites() throws {
+        let corruptData = Data("not-json-at-all".utf8)
+
+        try withTemporaryCache { cacheURL, directory in
+            try corruptData.write(to: cacheURL, options: .atomic)
             let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
-            weights.clearAll()
+            let trackURL = directory.appendingPathComponent("track.mp3")
+
+            if case .quarantinedCorrupt(let backupURL) = weights.persistenceState {
+                XCTAssertTrue(FileManager.default.fileExists(atPath: backupURL.path))
+                XCTAssertEqual(try Data(contentsOf: backupURL), corruptData)
+                XCTAssertTrue(backupURL.lastPathComponent.hasPrefix("playback-weights.quarantined-"))
+            } else {
+                XCTFail("Expected quarantinedCorrupt state, got \(weights.persistenceState)")
+            }
+
+            let setResult = weights.setLevel(.blue, for: trackURL, scope: .queue)
+            XCTAssertEqual(setResult, .applied)
+
             weights.flushPersistence()
 
-            let replaced = try decodeEnvelope(at: cacheURL)
-            XCTAssertEqual(replaced.version, 3)
-            XCTAssertTrue(replaced.queueLevels.isEmpty)
-            XCTAssertTrue(replaced.playlistLevels.isEmpty)
+            let envelope = try decodeEnvelope(at: cacheURL)
+            XCTAssertEqual(envelope.version, 3)
+            XCTAssertEqual(envelope.queueLevels[PlaybackWeights.key(for: trackURL)], PlaybackWeights.Level.blue.rawValue)
+
+            let reloaded = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            XCTAssertEqual(reloaded.persistenceState, .ready)
+            XCTAssertEqual(reloaded.level(for: trackURL, scope: .queue), .blue)
+        }
+    }
+
+    func testQuarantineFailureKeepsFileAndEntersReadOnly() throws {
+        let corruptData = Data("corrupt-content".utf8)
+
+        try withTemporaryCache { cacheURL, directory in
+            try corruptData.write(to: cacheURL, options: .atomic)
+
+            let failingMover: (URL, URL) throws -> Void = { _, _ in
+                throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError, userInfo: nil)
+            }
+
+            let weights = PlaybackWeights(cacheFileURLOverride: cacheURL, fileMover: failingMover)
+            let trackURL = directory.appendingPathComponent("track.mp3")
+
+            XCTAssertEqual(weights.persistenceState, .readOnlyPreserved(.quarantineFailed))
+
+            let setResult = weights.setLevel(.gold, for: trackURL, scope: .queue)
+            if case .rejectedReadOnly(let reason) = setResult {
+                XCTAssertEqual(reason, .quarantineFailed)
+            } else {
+                XCTFail("Expected rejectedReadOnly, got \(setResult)")
+            }
+
+            weights.flushPersistence()
+            XCTAssertEqual(try Data(contentsOf: cacheURL), corruptData)
         }
     }
 
@@ -344,7 +425,7 @@ final class PlaybackWeightsTests: XCTestCase {
         let trackURL = directory.appendingPathComponent("flush.mp3")
         let trackKey = PlaybackWeights.key(for: trackURL)
         let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
-        weights.setLevel(.red, for: trackURL, scope: .queue)
+        _ = weights.setLevel(.red, for: trackURL, scope: .queue)
         weights.flushPersistence()
 
         let marker = CacheEnvelope(

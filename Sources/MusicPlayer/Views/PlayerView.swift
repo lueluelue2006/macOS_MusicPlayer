@@ -308,7 +308,17 @@ struct CurrentTrackView: View {
             level: weights.level(for: currentFile.url, scope: weightScope()),
             scopeLabel: weightScopeLabel()
           ) { newLevel in
-            weights.setLevel(newLevel, for: currentFile.url, scope: weightScope())
+            let result = weights.setLevel(newLevel, for: currentFile.url, scope: weightScope())
+            switch result {
+            case .applied, .unchanged:
+              break
+            case .rejectedReadOnly(let reason):
+              NotificationCenter.default.post(
+                name: .showAppToast,
+                object: nil,
+                userInfo: ["title": "无法修改随机权重", "subtitle": reason.diagnosticMessage, "kind": "error", "duration": 4.0]
+              )
+            }
           }
           .fixedSize(horizontal: true, vertical: true)
           .layoutPriority(3)
