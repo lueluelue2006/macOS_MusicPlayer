@@ -79,6 +79,15 @@ final class AudioPlayer: NSObject, ObservableObject {
     var playbackFinishedHandler: ((UInt64, UInt64, URL?, Bool) -> Void)?
     var playbackFailedHandler: ((URL, String, Bool) -> Void)?
     var playbackLoadedHandler: ((URL, Bool) -> Void)?
+    /// Test-only: when true, AVAudioPlayer.volume is forced to 0 to prevent audible output during tests.
+    /// This preserves all playback state transitions while silencing actual audio output.
+    var testModeSilent: Bool = false
+
+    /// Test-only: returns the actual AVAudioPlayer.volume for verification.
+    /// Returns nil if no player is loaded.
+    var testActualPlayerVolume: Float? {
+        player?.volume
+    }
     // 移除未使用且可能干扰的 AVAudioEngine / PlayerNode，避免潜在路由或会话冲突
     // private let audioEngine = AVAudioEngine()
     // private let playerNode = AVAudioPlayerNode()
@@ -420,6 +429,7 @@ final class AudioPlayer: NSObject, ObservableObject {
         disablesVolumeCachePersistence = isTesting
         playbackStateStore = PlaybackStateStore(disablesPersistence: isTesting)
         super.init()
+        testModeSilent = isTesting
         finishInitialization(loadUserPreferences: true)
     }
 
@@ -435,6 +445,7 @@ final class AudioPlayer: NSObject, ObservableObject {
         disablesVolumeCachePersistence = false
         playbackStateStore = PlaybackStateStore(disablesPersistence: true)
         super.init()
+        testModeSilent = Self.isRunningUnderXCTest
         isImmersivePlaybackEnabled = initialImmersivePlaybackEnabled
         finishInitialization(loadUserPreferences: false)
     }
@@ -2081,8 +2092,8 @@ final class AudioPlayer: NSObject, ObservableObject {
         if let currentFile = currentFile {
             let mode: VolumeApplyMode = isPlaying ? .smooth : .immediate
             applyVolumeNormalization(for: currentFile.url, mode: mode)
-        } else {
-            player?.volume = volume
+        } else if let player = player {
+            setAVAudioPlayerVolume(player, volume)
         }
     }
 
@@ -2662,7 +2673,7 @@ extension AudioPlayer {
         volumeRampTask?.cancel()
         let start = player.volume
         if abs(start - targetVolume) < 0.001 {
-            player.volume = targetVolume
+            setAVAudioPlayerVolume(player, targetVolume)
             return
         }
 
@@ -2676,13 +2687,19 @@ extension AudioPlayer {
                 if Task.isCancelled { return }
                 if self.player !== thisPlayer { return }
                 let t = Float(step) / Float(steps)
-                thisPlayer.volume = start + (targetVolume - start) * t
+                self.setAVAudioPlayerVolume(thisPlayer, start + (targetVolume - start) * t)
                 try? await Task.sleep(nanoseconds: stepDurationNs)
             }
             if self.player === thisPlayer {
-                thisPlayer.volume = targetVolume
+                self.setAVAudioPlayerVolume(thisPlayer, targetVolume)
             }
         }
+    }
+
+    /// Sets AVAudioPlayer.volume, respecting testModeSilent flag.
+    /// When testModeSilent is true, forces volume to 0 regardless of requested value.
+    private func setAVAudioPlayerVolume(_ player: AVAudioPlayer, _ volume: Float) {
+        player.volume = testModeSilent ? 0 : volume
     }
 
     private func applyPlayerVolumeOnMain(_ clamped: Float, mode: VolumeApplyMode) {
@@ -2690,12 +2707,12 @@ extension AudioPlayer {
         switch mode {
         case .immediate:
             self.volumeRampTask?.cancel()
-            player.volume = clamped
+            setAVAudioPlayerVolume(player, clamped)
         case .smooth:
             let duration = self.normalizationFadeDuration
             guard duration > 0, self.isPlaying else {
                 self.volumeRampTask?.cancel()
-                player.volume = clamped
+                setAVAudioPlayerVolume(player, clamped)
                 return
             }
             self.startVolumeRamp(on: player, to: clamped, duration: duration)
@@ -2773,8 +2790,8 @@ extension AudioPlayer {
             volumeRampTask?.cancel() // 用户主动调音量时不要被淡入覆盖
 	        if let currentFile = currentFile {
 	            applyVolumeNormalization(for: currentFile.url, mode: .immediate)
-	        } else {
-	            player?.volume = volume
+	        } else if let player = player {
+	            setAVAudioPlayerVolume(player, volume)
 	        }
 	    }
 	    

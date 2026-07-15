@@ -74,6 +74,7 @@ final class ImmersivePlaybackIntegrationTests: XCTestCase {
         player.resume(bypassConfirm: true)
         let started = await waitUntil(timeout: 1) { player.isPlaying }
         XCTAssertTrue(started)
+        XCTAssertEqual(player.testActualPlayerVolume, 0.0, "Test mode should silence actual audio output")
 
         // Move into the coordinator's preload window, then prove that the next
         // AVAudioPlayer is actually prepared before crossing the logical end.

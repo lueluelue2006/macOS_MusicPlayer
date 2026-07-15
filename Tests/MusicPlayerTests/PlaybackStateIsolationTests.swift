@@ -86,6 +86,7 @@ final class PlaybackStateIsolationTests: XCTestCase {
             player.isPlaybackRequested && player.isPlaying
         }
         XCTAssertTrue(didResume)
+        XCTAssertEqual(player.testActualPlayerVolume, 0.0, "Test mode should silence actual audio output")
     }
 
     func testRemovingPendingOnlyTrackContinuesSequentially() async throws {
