@@ -11,7 +11,8 @@ yang-kun.png
   Source: https://www.flickr.com/photos/21884840@N02/4008703456
   License: Creative Commons Attribution-NonCommercial-ShareAlike 2.0
   License URL: https://creativecommons.org/licenses/by-nc-sa/2.0/
-  Changes: cropped; AI-assisted background cleanup and resolution restoration.
+  Changes: tightly cropped; AI-assisted removal of the other performer,
+    background restaging, and resolution restoration.
   This derivative remains under CC BY-NC-SA 2.0.
 
 fei-yu-ching.png
@@ -19,7 +20,8 @@ fei-yu-ching.png
   Source: https://ctrl.chcg.gov.tw/main/main_act/main_print.asp?main_id=2718&act_id=10
   License: Changhua County Government Website Open Information Announcement
   License URL: https://www.chcg.gov.tw/ch2/copyright.aspx
-  Changes: cropped; AI-assisted background cleanup and resolution restoration.
+  Changes: tightly cropped; AI-assisted removal of the other person, background
+    cleanup, and resolution restoration.
 
 stefanie-sun.png
   Source title: 孙燕姿 echo回声嘉年华 (3)
@@ -27,7 +29,8 @@ stefanie-sun.png
   Source: https://commons.wikimedia.org/wiki/File:%E5%AD%99%E7%87%95%E5%A7%BF_echo%E5%9B%9E%E5%A3%B0%E5%98%89%E5%B9%B4%E5%8D%8E_(3).jpg
   License: Creative Commons Attribution 2.5
   License URL: https://creativecommons.org/licenses/by/2.5/
-  Changes: cropped; AI-assisted background cleanup and resolution restoration.
+  Changes: tightly cropped; AI-assisted stage-light enhancement and resolution
+    restoration.
 
 faye-wong.png
   Source title: Faye Wong.jpg
@@ -35,5 +38,6 @@ faye-wong.png
   Source: https://commons.wikimedia.org/wiki/File:Faye_Wong.jpg
   License: Creative Commons Attribution-ShareAlike 2.0
   License URL: https://creativecommons.org/licenses/by-sa/2.0/
-  Changes: cropped; AI-assisted background cleanup and resolution restoration.
+  Changes: tightly cropped and resized from the original photograph; the final
+    cover does not generatively alter the subject.
   This derivative remains under CC BY-SA 2.0.
