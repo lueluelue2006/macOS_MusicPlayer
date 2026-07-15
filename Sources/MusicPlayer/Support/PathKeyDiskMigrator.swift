@@ -118,13 +118,13 @@ enum PathKeyDiskMigrator {
     private static func migrationTasks(baseDirectory: URL) -> [MigrationTask] {
         [
             MigrationTask(fileURL: baseDirectory.appendingPathComponent("metadata-cache.json", isDirectory: false)) { fileURL, cache in
-                migratePathMapFile(at: fileURL, mapKey: "entries", resolverCache: &cache)
+                migratePathMapFile(at: fileURL, mapKey: "entries", maxSupportedVersion: 1, resolverCache: &cache)
             },
             MigrationTask(fileURL: baseDirectory.appendingPathComponent("duration-cache.json", isDirectory: false)) { fileURL, cache in
-                migratePathMapFile(at: fileURL, mapKey: "entries", resolverCache: &cache)
+                migratePathMapFile(at: fileURL, mapKey: "entries", maxSupportedVersion: 2, resolverCache: &cache)
             },
             MigrationTask(fileURL: baseDirectory.appendingPathComponent("volume-cache.json", isDirectory: false)) { fileURL, cache in
-                migratePathMapFile(at: fileURL, mapKey: "loudnessDbByPath", resolverCache: &cache)
+                migratePathMapFile(at: fileURL, mapKey: "loudnessDbByPath", maxSupportedVersion: 3, resolverCache: &cache)
             },
             MigrationTask(fileURL: baseDirectory.appendingPathComponent("playback-weights.json", isDirectory: false)) { fileURL, cache in
                 migratePlaybackWeightsFile(at: fileURL, resolverCache: &cache)
@@ -141,6 +141,7 @@ enum PathKeyDiskMigrator {
     private static func migratePathMapFile(
         at url: URL,
         mapKey: String,
+        maxSupportedVersion: Int,
         resolverCache: inout [String: [String]]
     ) -> MigrationFileResult {
         guard FileManager.default.fileExists(atPath: url.path) else { return .unchanged }
@@ -149,6 +150,11 @@ enum PathKeyDiskMigrator {
               let rawMap = root[mapKey] as? [String: Any]
         else {
             return .failed(fileName: url.lastPathComponent)
+        }
+
+        // Skip future schema versions
+        if let version = root["version"] as? Int, version > maxSupportedVersion {
+            return .unchanged
         }
 
         let (migratedMap, changedEntries) = migratePathMap(rawMap, resolverCache: &resolverCache)
@@ -167,6 +173,11 @@ enum PathKeyDiskMigrator {
               var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else {
             return .failed(fileName: url.lastPathComponent)
+        }
+
+        // Skip future schema versions
+        if let version = root["version"] as? Int, version > 3 {
+            return .unchanged
         }
 
         var changedEntries = 0
@@ -206,17 +217,81 @@ enum PathKeyDiskMigrator {
     ) -> MigrationFileResult {
         guard FileManager.default.fileExists(atPath: url.path) else { return .unchanged }
         guard let data = try? Data(contentsOf: url),
-              var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let paths = root["paths"] as? [String]
+              var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else {
             return .failed(fileName: url.lastPathComponent)
         }
 
-        let (migratedPaths, changes) = migratePathArray(paths, resolverCache: &resolverCache)
-        guard changes > 0 else { return .unchanged }
+        // Skip future schema versions
+        if let version = root["version"] as? Int, version > 1 {
+            return .unchanged
+        }
 
-        root["paths"] = migratedPaths
-        return writeJSON(root, to: url, changedEntries: changes)
+        var changedEntries = 0
+
+        // Migrate tracks if present (v1 schema)
+        if let tracks = root["tracks"] as? [[String: Any]] {
+            var migratedTracks: [[String: Any]] = []
+            migratedTracks.reserveCapacity(tracks.count)
+
+            for var track in tracks {
+                guard let rawPath = track["path"] as? String else {
+                    migratedTracks.append(track)
+                    continue
+                }
+
+                let migratedPath = migratePathKey(rawPath, resolverCache: &resolverCache)
+                var trackChanged = false
+
+                if migratedPath != rawPath {
+                    track["path"] = migratedPath
+                    changedEntries += 1
+                    trackChanged = true
+                }
+
+                // Synchronize signature.pathKey if signature exists
+                if var sig = track["signature"] as? [String: Any],
+                   let sigPathKey = sig["pathKey"] as? String {
+                    if sigPathKey != migratedPath {
+                        sig["pathKey"] = migratedPath
+                        track["signature"] = sig
+                        if !trackChanged {
+                            changedEntries += 1
+                            trackChanged = true
+                        }
+                    }
+                }
+
+                migratedTracks.append(track)
+            }
+
+            if changedEntries > 0 {
+                root["tracks"] = migratedTracks
+            }
+        }
+
+        // Migrate legacy paths array (preserving duplicates and order)
+        if let paths = root["paths"] as? [String] {
+            var migratedPaths: [String] = []
+            migratedPaths.reserveCapacity(paths.count)
+            var pathChanges = 0
+
+            for path in paths {
+                let migratedPath = migratePathKey(path, resolverCache: &resolverCache)
+                if migratedPath != path {
+                    pathChanges += 1
+                }
+                migratedPaths.append(migratedPath)
+            }
+
+            if pathChanges > 0 {
+                root["paths"] = migratedPaths
+                changedEntries += pathChanges
+            }
+        }
+
+        guard changedEntries > 0 else { return .unchanged }
+        return writeJSON(root, to: url, changedEntries: changedEntries)
     }
 
     private static func migrateUserPlaylistsFile(
@@ -225,9 +300,17 @@ enum PathKeyDiskMigrator {
     ) -> MigrationFileResult {
         guard FileManager.default.fileExists(atPath: url.path) else { return .unchanged }
         guard let data = try? Data(contentsOf: url),
-              var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let rawPlaylists = root["playlists"] as? [[String: Any]]
+              var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else {
+            return .failed(fileName: url.lastPathComponent)
+        }
+
+        // Skip future schema versions
+        if let version = root["version"] as? Int, version > 1 {
+            return .unchanged
+        }
+
+        guard let rawPlaylists = root["playlists"] as? [[String: Any]] else {
             return .failed(fileName: url.lastPathComponent)
         }
 
@@ -248,10 +331,27 @@ enum PathKeyDiskMigrator {
                 }
 
                 let migratedPath = migratePathKey(rawPath, resolverCache: &resolverCache)
+                var trackChanged = false
+
                 if migratedPath != rawPath {
                     track["path"] = migratedPath
                     changedEntries += 1
                     playlistChanged = true
+                    trackChanged = true
+                }
+
+                // Synchronize signature.pathKey if signature exists
+                if var sig = track["signature"] as? [String: Any],
+                   let sigPathKey = sig["pathKey"] as? String {
+                    if sigPathKey != migratedPath {
+                        sig["pathKey"] = migratedPath
+                        track["signature"] = sig
+                        if !trackChanged {
+                            changedEntries += 1
+                            playlistChanged = true
+                            trackChanged = true
+                        }
+                    }
                 }
 
                 let dedupKey = PathKey.canonical(path: migratedPath)

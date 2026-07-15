@@ -488,8 +488,10 @@ struct PlaylistsPanelView: View {
         if audioPlayer.currentFile != nil {
           Button("添加正在播放") {
             if let url = audioPlayer.currentFile?.url {
-              playlistsStore.addTracks([url], to: playlist.id)
-              reloadSelectedPlaylist()
+              Task {
+                _ = await playlistsStore.addTracks([url], to: playlist.id)
+                reloadSelectedPlaylist()
+              }
             } else {
               postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
             }
@@ -703,7 +705,16 @@ struct PlaylistsPanelView: View {
       postToast(title: "歌单里没有可播放的歌曲", subtitle: nil, kind: "warning")
       return
     }
-    guard let idx = playlistManager.ensureInQueue(playable, focusURL: file.url),
+
+    // Extract signatures from playlist tracks
+    var signatures: [String: FileSignature] = [:]
+    for track in playlist.tracks {
+      if let sig = track.signature {
+        signatures[track.path] = sig
+      }
+    }
+
+    guard let idx = playlistManager.ensureInQueue(playable, focusURL: file.url, signatures: signatures),
       let selected = playlistManager.selectFile(at: idx)
     else {
       postToast(title: "未能加入播放列表", subtitle: file.url.lastPathComponent, kind: "warning")
@@ -1075,10 +1086,12 @@ struct PlaylistsPanelView: View {
             return
           }
           let urls = selectedFiles.map(\.url)
-          playlistsStore.addTracks(urls, to: targetID)
-          showAddFromQueueSheet = false
-          reloadSelectedPlaylist()
-          postToast(title: "已添加 \(urls.count) 首", subtitle: nil, kind: "success")
+          Task {
+            let added = await playlistsStore.addTracks(urls, to: targetID)
+            showAddFromQueueSheet = false
+            reloadSelectedPlaylist()
+            postToast(title: "已添加 \(added) 首", subtitle: nil, kind: "success")
+          }
         }
         .keyboardShortcut(.defaultAction)
         .disabled(selectedFiles.isEmpty)
@@ -1132,28 +1145,36 @@ struct PlaylistsPanelView: View {
             issueCount: result.issues.count
           )
 
-          await MainActor.run {
-            let trackURLs = snapshot.paths.map { URL(fileURLWithPath: $0) }
-            self.playlistsStore.createPlaylist(name: snapshot.name, trackURLs: trackURLs)
-            self.reloadSelectedPlaylist()
+          let createdID = await self.playlistsStore.createPlaylist(name: snapshot.name, tracks: result.tracks)
 
-            if snapshot.issueCount == 0 {
-              self.postToast(
-                title: "已导入歌单",
-                subtitle: "\(snapshot.paths.count) 首歌曲",
-                kind: "success"
-              )
-            } else if snapshot.paths.isEmpty {
-              self.postToast(
-                title: "导入的歌单为空",
-                subtitle: "没有找到有效的歌曲文件",
-                kind: "warning"
-              )
+          await MainActor.run {
+            if createdID != nil {
+              self.reloadSelectedPlaylist()
+
+              if snapshot.issueCount == 0 {
+                self.postToast(
+                  title: "已导入歌单",
+                  subtitle: "\(snapshot.paths.count) 首歌曲",
+                  kind: "success"
+                )
+              } else if snapshot.paths.isEmpty {
+                self.postToast(
+                  title: "导入的歌单为空",
+                  subtitle: "没有找到有效的歌曲文件",
+                  kind: "warning"
+                )
+              } else {
+                self.postToast(
+                  title: "已导入歌单（部分跳过）",
+                  subtitle: "\(snapshot.paths.count) 首有效，\(snapshot.issueCount) 个问题",
+                  kind: "warning"
+                )
+              }
             } else {
               self.postToast(
-                title: "已导入歌单（部分跳过）",
-                subtitle: "\(snapshot.paths.count) 首有效，\(snapshot.issueCount) 个问题",
-                kind: "warning"
+                title: "导入未写入",
+                subtitle: "歌单可能处于只读保护状态",
+                kind: "error"
               )
             }
           }

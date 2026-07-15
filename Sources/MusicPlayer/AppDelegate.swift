@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private weak var playlistsStore: PlaylistsStore?
     private var keyEventMonitor: Any?
     private var activityEventMonitor: Any?
+    private var isTerminationDrainInProgress = false
 
     func configure(
         audioPlayer: AudioPlayer,
@@ -130,6 +131,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSEvent.removeMonitor(monitor)
             activityEventMonitor = nil
         }
+    }
+
+    func applicationShouldTerminate(_ application: NSApplication) -> NSApplication.TerminateReply {
+        guard !isTerminationDrainInProgress else { return .terminateLater }
+        isTerminationDrainInProgress = true
+
+        Task { @MainActor in
+            await playlistManager?.drainAndFlushForTermination()
+            await playlistsStore?.drainAndFlushForTermination()
+            application.reply(toApplicationShouldTerminate: true)
+        }
+
+        return .terminateLater
     }
 
     // Finder/Dock 图标打开单个文件

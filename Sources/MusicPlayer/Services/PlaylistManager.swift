@@ -48,13 +48,26 @@ final class PlaylistManager: ObservableObject {
 
     private var addFilesTask: Task<Void, Never>?
     private var pendingAddURLs: [URL] = []
+    private var isTerminating: Bool = false
+    private var terminationStartWaiters: [CheckedContinuation<Void, Never>] = []
 
     // MARK: - 不可播放标记（按路径）
     @Published private(set) var unplayableReasons: [String: String] = [:]
 
     private struct SavedPlaylist: Codable {
+        struct TrackRecord: Codable {
+            let path: String
+            let signature: FileSignature?
+        }
+
+        let version: Int?
+        let tracks: [TrackRecord]?
         let paths: [String]
         let currentIndex: Int
+    }
+
+    private struct PlaylistVersionProbe: Codable {
+        let version: Int?
     }
     private let playlistFileName = "playlist.json"
     private let playlistFileURLOverride: URL?
@@ -67,8 +80,14 @@ final class PlaylistManager: ObservableObject {
     private var pendingPlaylistWrite: (revision: UInt64, snapshot: SavedPlaylist)?
     private var isPlaylistWriteDrainScheduled = false
     private let playlistSaveDebounceInterval: TimeInterval
+    private let playlistFormatVersion = 1
+    private var isPlaylistPersistenceReadOnly = false
+    private var fullOrderIndexForAudioFile: [Int?] = []
+    private var retainedMissingWithOriginalIndex: [(originalIndex: Int, record: SavedPlaylist.TrackRecord)] = []
+    private var loadedSignatureByPath: [String: FileSignature] = [:]
     private let metadataGate = ConcurrencyGate(maxConcurrent: 4) // 限制元数据加载并发
     private let durationGate = ConcurrencyGate(maxConcurrent: 2) // 限制时长计算并发（更轻量但也需要控速）
+    private let signatureCaptureService: SignatureCaptureService
 
     // MARK: - Playback scope persistence
     private let userPlaybackScopeKindKey = "userPlaybackScopeKind"
@@ -86,12 +105,14 @@ final class PlaylistManager: ObservableObject {
     init(
         playlistFileURLOverride: URL? = nil,
         disablePersistence: Bool = false,
-        persistenceDebounceInterval: TimeInterval = 0.4
+        persistenceDebounceInterval: TimeInterval = 0.4,
+        signatureCaptureService: SignatureCaptureService? = nil
     ) {
         self.playlistFileURLOverride = playlistFileURLOverride
         self.playlistSaveDebounceInterval = max(0, persistenceDebounceInterval)
         self.isRunningRegressionTests = disablePersistence
             || ProcessInfo.processInfo.environment["MUSICPLAYER_RUN_REGRESSION_TESTS"] == "1"
+        self.signatureCaptureService = signatureCaptureService ?? SignatureCaptureService()
         playlistIOQueue.setSpecific(key: playlistIOQueueKey, value: ())
         if !isRunningRegressionTests {
             loadScanSubfoldersPreference()
@@ -212,6 +233,14 @@ final class PlaylistManager: ObservableObject {
                 return
             }
 
+            // Extract signatures from playlist tracks
+            var signatures: [String: FileSignature] = [:]
+            for track in playlist.tracks {
+                if let sig = track.signature {
+                    signatures[track.path] = sig
+                }
+            }
+
             // Ensure playlist tracks exist in queue, but keep it lightweight:
             // - Prefer disk caches (duration/metadata)
             // - Fall back to filename-only placeholder (no AVAsset scan on startup)
@@ -248,9 +277,10 @@ final class PlaylistManager: ObservableObject {
             }
 
             let filesToAppend = toAppend
+            let signaturesSnapshot = signatures
             if !filesToAppend.isEmpty {
                 await MainActor.run { [weak self] in
-                    _ = self?.ensureInQueue(filesToAppend, focusURL: nil)
+                    _ = self?.ensureInQueue(filesToAppend, focusURL: nil, signatures: signaturesSnapshot)
                 }
             }
 
@@ -404,44 +434,73 @@ final class PlaylistManager: ObservableObject {
     @MainActor
     func enqueueAddFiles(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
+        guard !isTerminating else { return }
         pendingAddURLs.append(contentsOf: urls)
         startNextAddBatchIfNeeded()
     }
 
     @MainActor
     func cancelAddFiles() {
-        addFilesTask?.cancel()
-        addFilesTask = nil
+        let taskToCancel = addFilesTask
         pendingAddURLs.removeAll()
         resetAddFilesProgress()
+        taskToCancel?.cancel()
     }
 
     @MainActor
     private func startNextAddBatchIfNeeded() {
         guard addFilesTask == nil else { return }
         guard !pendingAddURLs.isEmpty else { return }
+        guard !isTerminating else { return }
 
         let batch = pendingAddURLs
         pendingAddURLs.removeAll()
         isAddingFiles = true
 
-        addFilesTask = Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else { return }
             await self.addFilesBatch(batch)
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.addFilesTask = nil
-                if Task.isCancelled {
-                    self.pendingAddURLs.removeAll()
+
+                if self.isTerminating {
                     self.resetAddFilesProgress()
                     return
                 }
-                if self.pendingAddURLs.isEmpty {
-                    self.resetAddFilesProgress()
-                } else {
+
+                if !self.pendingAddURLs.isEmpty {
                     self.startNextAddBatchIfNeeded()
+                } else {
+                    self.resetAddFilesProgress()
                 }
             }
+        }
+        addFilesTask = task
+    }
+
+    @MainActor
+    func drainAndFlushForTermination() async {
+        isTerminating = true
+
+        let startWaiters = terminationStartWaiters
+        terminationStartWaiters.removeAll()
+        for waiter in startWaiters {
+            waiter.resume()
+        }
+
+        pendingAddURLs.removeAll()
+        let taskToWait = addFilesTask
+        taskToWait?.cancel()
+        await taskToWait?.value
+        flushPlaylistPersistence()
+    }
+
+    @MainActor
+    func waitUntilTerminationStartedForTesting() async {
+        guard !isTerminating else { return }
+        await withCheckedContinuation { continuation in
+            terminationStartWaiters.append(continuation)
         }
     }
 
@@ -490,6 +549,13 @@ final class PlaylistManager: ObservableObject {
     func addFiles(_ urls: [URL]) async {
         await MainActor.run {
             self.enqueueAddFiles(urls)
+        }
+    }
+
+    @MainActor
+    func waitForAddFilesCompletionForTesting() async {
+        while let task = addFilesTask {
+            await task.value
         }
     }
 
@@ -556,11 +622,27 @@ final class PlaylistManager: ObservableObject {
 
         await updateUI(phase: "读取元数据…", detail: "", current: 0, total: fileURLs.count, force: true)
 
+        // Deduplicate input URLs by canonical and legacy path before worker pool
+        let dedupedFileURLs: [URL] = {
+            var seen = Set<String>()
+            var seenLegacy = Set<String>()
+            var result: [URL] = []
+            for url in fileURLs {
+                let key = PathKey.canonical(for: url)
+                let legacy = PathKey.legacy(for: url)
+                if seen.contains(key) || seenLegacy.contains(legacy) { continue }
+                seen.insert(key)
+                seenLegacy.insert(legacy)
+                result.append(url)
+            }
+            return result
+        }()
+
         let progress = MetadataProgressTracker()
         let results = await BoundedWorkerPool.map(
-            items: fileURLs,
+            items: dedupedFileURLs,
             maxConcurrent: 4
-        ) { [weak self] url -> AudioFile? in
+        ) { [weak self] url -> (AudioFile, FileSignature?)? in
             guard let self else { return nil }
             if Task.isCancelled { return nil }
             let metadata = await self.loadCachedMetadata(from: url)
@@ -568,9 +650,12 @@ final class PlaylistManager: ObservableObject {
             let duration = await DurationCache.shared.cachedDurationIfValid(for: url)
             if Task.isCancelled { return nil }
 
+            // Capture file signature (sequentially in worker)
+            let signature = await self.signatureCaptureService.captureSignature(for: url)
+
             let audioFile = AudioFile(url: url, metadata: metadata, duration: duration)
 
-            if let snapshot = await progress.recordCompleted(url: url, total: fileURLs.count) {
+            if let snapshot = await progress.recordCompleted(url: url, total: dedupedFileURLs.count) {
                 if Task.isCancelled { return nil }
                 await MainActor.run {
                     self.isAddingFiles = true
@@ -581,42 +666,33 @@ final class PlaylistManager: ObservableObject {
                 }
             }
 
-            return audioFile
+            return (audioFile, signature)
         }
 
-        let built: [AudioFile] = results.compactMap { $0 }
+        let built: [(AudioFile, FileSignature?)] = results.compactMap { $0 }
 
         if Task.isCancelled { return }
 
-        // 去重（路径粒度）：仅保留首次出现的路径
-        let newFilesDedupWithinBatch: [AudioFile] = {
-            var seen = Set<String>()
-            var seenLegacy = Set<String>()
-            var result: [AudioFile] = []
-            for f in built {
-                let key = self.pathKey(f.url)
-                let legacy = PathKey.legacy(for: f.url)
-                if seen.contains(key) || seenLegacy.contains(legacy) { continue }
-                seen.insert(key)
-                seenLegacy.insert(legacy)
-                result.append(f)
-            }
-            return result
-        }()
-
         await MainActor.run {
+            // Re-check cancellation after async work
+            guard !Task.isCancelled else { return }
+
             let wasEmpty = self.audioFiles.isEmpty
             // 与现有列表去重：若重复路径已存在，保留已有（更早）的条目，丢弃新增重复
             var existing = Set(self.audioFiles.map { self.pathKey($0.url) })
             var existingLegacy = Set(self.audioFiles.map { PathKey.legacy(for: $0.url) })
             var toAppend: [AudioFile] = []
-            for f in newFilesDedupWithinBatch {
+            for (f, sig) in built {
                 let key = self.pathKey(f.url)
                 let legacy = PathKey.legacy(for: f.url)
                 if existing.contains(key) || existingLegacy.contains(legacy) { continue }
                 existing.insert(key)
                 existingLegacy.insert(legacy)
                 toAppend.append(f)
+                // Store signature only for files that are actually appended to queue
+                if let signature = sig {
+                    self.loadedSignatureByPath[f.url.path] = signature
+                }
             }
             let oldCount = self.audioFiles.count
             self.audioFiles.append(contentsOf: toAppend)
@@ -804,6 +880,7 @@ final class PlaylistManager: ObservableObject {
         guard audioFiles.indices.contains(index) else { return nil }
         let removedFile = audioFiles[index]
         let removedURL = removedFile.url
+        let removedPath = removedURL.path
         let scopeBeforeRemoval = playbackScope
         let playlistPositionBeforeRemoval: Int?
         switch scopeBeforeRemoval {
@@ -819,17 +896,29 @@ final class PlaylistManager: ObservableObject {
             playlistPosition: playlistPositionBeforeRemoval
         )
         audioFiles.remove(at: index)
+
+        // Remove corresponding full-order index slot
+        if index < fullOrderIndexForAudioFile.count {
+            fullOrderIndexForAudioFile.remove(at: index)
+        }
+
+        // Clear loaded signature only if no other item with same path remains
+        let remainingPathCount = audioFiles.filter { $0.url.path == removedPath }.count
+        if remainingPathCount == 0 {
+            loadedSignatureByPath.removeValue(forKey: removedPath)
+        }
+
         invalidateQueueIndexCache()
         unplayableReasons.removeValue(forKey: pathKey(removedURL))
 
         if audioFiles.isEmpty {
             setPlaybackScopeQueue()
         }
-        
+
         if currentIndex >= index {
             currentIndex = max(0, currentIndex - 1)
         }
-        
+
         updateFilteredFiles()
         resetShuffleQueue()
         savePlaylist() // 保存播放列表
@@ -885,6 +974,9 @@ final class PlaylistManager: ObservableObject {
         unplayableReasons.removeAll()
         resetShuffleQueue()
         setPlaybackScopeQueue()
+        retainedMissingWithOriginalIndex.removeAll()
+        fullOrderIndexForAudioFile.removeAll()
+        loadedSignatureByPath.removeAll()
         savePlaylist() // 清空后保存
     }
     
@@ -912,7 +1004,7 @@ final class PlaylistManager: ObservableObject {
     /// - Note: Dedup is by normalized path key.
     /// - Returns: The index of `focusURL` in the queue after ensuring, if provided.
     @MainActor
-    func ensureInQueue(_ files: [AudioFile], focusURL: URL? = nil) -> Int? {
+    func ensureInQueue(_ files: [AudioFile], focusURL: URL? = nil, signatures: [String: FileSignature] = [:]) -> Int? {
         guard !files.isEmpty else { return nil }
 
         var indexByKey: [String: Int] = [:]
@@ -941,6 +1033,13 @@ final class PlaylistManager: ObservableObject {
         }
 
         guard !toAppend.isEmpty else { return focusIndex }
+
+        // Store signatures only for files that are actually appended
+        for f in toAppend {
+            if let sig = signatures[f.url.path] {
+                loadedSignatureByPath[f.url.path] = sig
+            }
+        }
 
         let oldCount = audioFiles.count
         audioFiles.append(contentsOf: toAppend)
@@ -1688,10 +1787,7 @@ final class PlaylistManager: ObservableObject {
 
             // Capture the latest queue only when the debounce drains, so rapid
             // navigation does not repeatedly allocate O(queue-size) path arrays.
-            let snapshot = SavedPlaylist(
-                paths: self.audioFiles.map { $0.url.path },
-                currentIndex: self.currentIndex
-            )
+            let snapshot = self.buildPlaylistSnapshot()
             self.debugLog(
                 "保存播放列表: \(snapshot.paths.count) 个文件, 当前索引: \(snapshot.currentIndex)"
             )
@@ -1709,10 +1805,23 @@ final class PlaylistManager: ObservableObject {
     func flushPlaylistPersistence() {
         guard !isRunningRegressionTests else { return }
 
+        playlistSaveStateLock.lock()
+        let readOnly = isPlaylistPersistenceReadOnly
+        playlistSaveStateLock.unlock()
+
+        if readOnly {
+            // Read-only mode: drain pending writes but do not generate new snapshots
+            if DispatchQueue.getSpecific(key: playlistIOQueueKey) != nil {
+                return
+            }
+            playlistIOQueue.sync {}
+            return
+        }
+
         // Publish the flush snapshot through the same bounded, serial drain as
         // debounced saves. A flush can therefore never overtake an older write
         // or overwrite a newer snapshot that the active drain already picked up.
-        let snapshot = SavedPlaylist(paths: audioFiles.map { $0.url.path }, currentIndex: currentIndex)
+        let snapshot = buildPlaylistSnapshot()
         playlistSaveStateLock.lock()
         playlistSaveRevision &+= 1
         let pending = playlistSaveWorkItem
@@ -1768,24 +1877,126 @@ final class PlaylistManager: ObservableObject {
             _ = savePlaylistToDisk(pending.snapshot)
         }
     }
-    
+
+    private func buildPlaylistSnapshot() -> SavedPlaylist {
+        // Build entries with stable sorting keys
+        struct Entry {
+            let sortKey: Int
+            let record: SavedPlaylist.TrackRecord
+            let runtimeIndex: Int?
+        }
+
+        var entries: [Entry] = []
+        var nextNewItemSortKey = 0
+
+        // Collect all original-index items (both active and missing)
+        if !fullOrderIndexForAudioFile.isEmpty {
+            nextNewItemSortKey = fullOrderIndexForAudioFile.compactMap { $0 }.max().map { $0 + 1 } ?? 0
+        }
+        for (originalIndex, _) in retainedMissingWithOriginalIndex {
+            nextNewItemSortKey = max(nextNewItemSortKey, originalIndex + 1)
+        }
+
+        // Add active files with their original or new indices
+        for (runtimeIndex, file) in audioFiles.enumerated() {
+            let path = file.url.path
+            let sig = loadedSignatureByPath[path]
+            let record = SavedPlaylist.TrackRecord(path: path, signature: sig)
+
+            let sortKey: Int
+            if runtimeIndex < fullOrderIndexForAudioFile.count, let originalIndex = fullOrderIndexForAudioFile[runtimeIndex] {
+                sortKey = originalIndex
+            } else {
+                sortKey = nextNewItemSortKey
+                nextNewItemSortKey += 1
+            }
+
+            entries.append(Entry(sortKey: sortKey, record: record, runtimeIndex: runtimeIndex))
+        }
+
+        // Add retained missing records
+        for (originalIndex, record) in retainedMissingWithOriginalIndex {
+            entries.append(Entry(sortKey: originalIndex, record: record, runtimeIndex: nil))
+        }
+
+        // Sort by original index to restore interleaved order
+        entries.sort { $0.sortKey < $1.sortKey }
+
+        let finalRecords = entries.map { $0.record }
+        let paths = finalRecords.map { $0.path }
+
+        // Map currentIndex from runtime to full-order position
+        let fullOrderCurrentIndex: Int
+        if currentIndex >= 0 && currentIndex < audioFiles.count {
+            if let position = entries.firstIndex(where: { $0.runtimeIndex == currentIndex }) {
+                fullOrderCurrentIndex = position
+            } else {
+                fullOrderCurrentIndex = 0
+            }
+        } else {
+            fullOrderCurrentIndex = 0
+        }
+
+        return SavedPlaylist(
+            version: playlistFormatVersion,
+            tracks: finalRecords,
+            paths: paths,
+            currentIndex: fullOrderCurrentIndex
+        )
+    }
+
     func loadSavedPlaylist(audioPlayer: AudioPlayer? = nil) async {
         guard let saved = loadSavedPlaylistSnapshot() else {
             debugLog("没有找到保存的播放列表")
             return
         }
 
-        let fileManager = FileManager.default
-        let validEntries: [(url: URL, snapshot: FileValidationSnapshot)] = saved.paths.compactMap { path in
-            let url = URL(fileURLWithPath: path)
-            let snapshot = FileValidationSnapshot.load(for: url, fileManager: fileManager)
-            guard snapshot.exists else { return nil }
-            return (url, snapshot)
+        // Parse TrackRecords from v1 schema or fall back to legacy paths
+        let records: [SavedPlaylist.TrackRecord]
+        if let tracks = saved.tracks {
+            records = tracks
+        } else {
+            records = saved.paths.map { SavedPlaylist.TrackRecord(path: $0, signature: nil) }
         }
+
+        let fileManager = FileManager.default
+        var validEntries: [(url: URL, snapshot: FileValidationSnapshot, signature: FileSignature?, originalIndex: Int)] = []
+        var missingWithIndex: [(originalIndex: Int, record: SavedPlaylist.TrackRecord)] = []
+
+        for (originalIndex, record) in records.enumerated() {
+            let url = URL(fileURLWithPath: record.path)
+            let snapshot = FileValidationSnapshot.load(for: url, fileManager: fileManager)
+            if snapshot.exists {
+                validEntries.append((url, snapshot, record.signature, originalIndex))
+            } else {
+                missingWithIndex.append((originalIndex, record))
+            }
+        }
+
+        // Build signature cache with last-wins for duplicate paths
+        let signatureMap = validEntries.reduce(into: [String: FileSignature]()) { map, entry in
+            if let sig = entry.signature {
+                map[entry.url.path] = sig
+            }
+        }
+        let missingSignatureMap = missingWithIndex.reduce(into: [String: FileSignature]()) { map, item in
+            if let sig = item.record.signature {
+                map[item.record.path] = sig
+            }
+        }
+        let combinedSignatureMap = signatureMap.merging(missingSignatureMap) { _, missing in missing }
+
         let validURLs = validEntries.map(\.url)
 
         if validURLs.isEmpty {
             debugLog("保存的播放列表中没有任何仍然存在的文件")
+            let missingSnapshot = missingWithIndex
+            let sigMapSnapshot = combinedSignatureMap
+            await MainActor.run {
+                self.retainedMissingWithOriginalIndex = missingSnapshot
+                self.fullOrderIndexForAudioFile = []
+                self.loadedSignatureByPath = sigMapSnapshot
+            }
             return
         }
 
@@ -1837,12 +2048,42 @@ final class PlaylistManager: ObservableObject {
         }
         debugLog("恢复播放列表元数据缓存命中: \(cacheHits)/\(validURLs.count)")
 
+        // Build full-order index mapping for runtime files
+        var fullOrderIndices: [Int?] = []
+        fullOrderIndices.reserveCapacity(restoredFiles.count)
+        for entry in validEntries {
+            fullOrderIndices.append(entry.originalIndex)
+        }
+
+        // Map saved currentIndex from full list to runtime available files
+        let runtimeCurrentIndex: Int
+        if let runtimeIdx = validEntries.firstIndex(where: { $0.originalIndex == saved.currentIndex }) {
+            runtimeCurrentIndex = runtimeIdx
+        } else if saved.currentIndex < records.count {
+            // Saved current item is missing: prefer first valid item after it
+            if let nextIdx = validEntries.firstIndex(where: { $0.originalIndex > saved.currentIndex }) {
+                runtimeCurrentIndex = nextIdx
+            } else if let lastIdx = validEntries.lastIndex(where: { $0.originalIndex < saved.currentIndex }) {
+                runtimeCurrentIndex = lastIdx
+            } else {
+                runtimeCurrentIndex = 0
+            }
+        } else {
+            runtimeCurrentIndex = 0
+        }
+
         let restoredFilesSnapshot = restoredFiles
         let durationPrefetchURLs = missingDurationURLs
+        let sigMapSnapshot = combinedSignatureMap
+        let missingSnapshot = missingWithIndex
+        let fullOrderSnapshot = fullOrderIndices
         await MainActor.run {
+            self.retainedMissingWithOriginalIndex = missingSnapshot
+            self.fullOrderIndexForAudioFile = fullOrderSnapshot
+            self.loadedSignatureByPath = sigMapSnapshot
             self.audioFiles = restoredFilesSnapshot
             self.invalidateQueueIndexCache()
-            self.currentIndex = min(max(saved.currentIndex, 0), restoredFilesSnapshot.count - 1)
+            self.currentIndex = min(max(runtimeCurrentIndex, 0), restoredFilesSnapshot.count - 1)
             self.updateFilteredFiles()
             self.resetShuffleQueue()
             self.enqueueDurationPrefetch(for: durationPrefetchURLs)
@@ -1921,15 +2162,24 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func loadSavedPlaylistSnapshot() -> SavedPlaylist? {
-        // 优先从磁盘读取
-        if let disk = loadSavedPlaylistFromDisk() {
-            return disk
+        let diskOutcome = loadSavedPlaylistFromDisk()
+
+        switch diskOutcome {
+        case .loaded(let snapshot):
+            return snapshot
+        case .protectedFuture, .protectedCorrupt, .protectedUnreadable:
+            // Disk file exists but is protected; do not fall back to UserDefaults
+            return nil
+        case .missing:
+            // Only fall back to UserDefaults when disk file is truly absent
+            break
         }
+
         // 兼容旧版 UserDefaults：读取后迁移到磁盘
         let d = UserDefaults.standard
         if let filePaths = d.stringArray(forKey: "savedPlaylistPaths"), !filePaths.isEmpty {
             let savedIndex = d.integer(forKey: "savedPlaylistIndex")
-            let snapshot = SavedPlaylist(paths: filePaths, currentIndex: savedIndex)
+            let snapshot = SavedPlaylist(version: nil, tracks: nil, paths: filePaths, currentIndex: savedIndex)
             if savePlaylistToDisk(snapshot) {
                 d.removeObject(forKey: "savedPlaylistPaths")
                 d.removeObject(forKey: "savedPlaylistIndex")
@@ -1939,15 +2189,111 @@ final class PlaylistManager: ObservableObject {
         return nil
     }
 
-    private func loadSavedPlaylistFromDisk() -> SavedPlaylist? {
-        guard let url = playlistFileURL(), FileManager.default.fileExists(atPath: url.path) else { return nil }
+    private enum PlaylistLoadOutcome {
+        case missing
+        case loaded(SavedPlaylist)
+        case protectedFuture
+        case protectedCorrupt
+        case protectedUnreadable
+    }
+
+    private func loadSavedPlaylistFromDisk() -> PlaylistLoadOutcome {
+        guard let url = playlistFileURL() else { return .missing }
+        guard FileManager.default.fileExists(atPath: url.path) else { return .missing }
+
+        let data: Data
         do {
-            let data = try Data(contentsOf: url)
-            return try JSONDecoder().decode(SavedPlaylist.self, from: data)
+            data = try Data(contentsOf: url)
         } catch {
-            debugLog("读取保存的播放列表失败: \(error)，将删除损坏的文件")
-            try? FileManager.default.removeItem(at: url)
-            return nil
+            debugLog("无法读取队列文件: \(error)")
+            setPlaylistPersistenceReadOnly(true)
+            PersistenceLogger.log("队列文件无法读取: \(url.path), 错误: \(error)")
+            DispatchQueue.main.async {
+                PersistenceLogger.notifyUser(title: "队列文件无法读取", subtitle: "已进入保护模式")
+            }
+            return .protectedUnreadable
+        }
+
+        // Probe version before full decode
+        let probeVersion: Int?
+        do {
+            let probe = try JSONDecoder().decode(PlaylistVersionProbe.self, from: data)
+            probeVersion = probe.version
+        } catch {
+            probeVersion = nil
+        }
+
+        if let v = probeVersion, v > playlistFormatVersion {
+            debugLog("队列文件版本 \(v) 高于当前支持版本 \(playlistFormatVersion)，进入只读模式")
+            setPlaylistPersistenceReadOnly(true)
+            PersistenceLogger.log("检测到未来队列版本 \(v)（当前支持 \(playlistFormatVersion)），进入只读模式保护数据")
+            DispatchQueue.main.async {
+                PersistenceLogger.notifyUser(
+                    title: "队列文件版本过新",
+                    subtitle: "可能由新版本创建，当前版本只读保护"
+                )
+            }
+            return .protectedFuture
+        }
+
+        do {
+            let snapshot = try JSONDecoder().decode(SavedPlaylist.self, from: data)
+            return .loaded(snapshot)
+        } catch {
+            debugLog("队列文件损坏: \(error)，将隔离原文件")
+            setPlaylistPersistenceReadOnly(true)
+            quarantineCorruptedPlaylist(at: url, originalData: data)
+            return .protectedCorrupt
+        }
+    }
+
+    private func setPlaylistPersistenceReadOnly(_ value: Bool) {
+        playlistSaveStateLock.lock()
+        isPlaylistPersistenceReadOnly = value
+        if value {
+            // Cancel pending debounced saves and clear pending write
+            playlistSaveWorkItem?.cancel()
+            playlistSaveWorkItem = nil
+            pendingPlaylistWrite = nil
+            playlistSaveRevision &+= 1
+        }
+        playlistSaveStateLock.unlock()
+    }
+
+    private func isPlaylistPersistenceWritable() -> Bool {
+        playlistSaveStateLock.lock()
+        defer { playlistSaveStateLock.unlock() }
+        return !isPlaylistPersistenceReadOnly
+    }
+
+    private func quarantineCorruptedPlaylist(at url: URL, originalData: Data) {
+        let parent = url.deletingLastPathComponent()
+        let baseName = url.deletingPathExtension().lastPathComponent
+        let ext = url.pathExtension
+        let uuid = UUID().uuidString
+
+        let quarantineName: String
+        if ext.isEmpty {
+            quarantineName = "\(baseName).corrupted.\(uuid)"
+        } else {
+            quarantineName = "\(baseName).corrupted.\(uuid).\(ext)"
+        }
+        let quarantineURL = parent.appendingPathComponent(quarantineName)
+
+        do {
+            try originalData.write(to: quarantineURL, options: .atomic)
+            try FileManager.default.removeItem(at: url)
+            debugLog("已隔离损坏队列文件至: \(quarantineName)")
+            PersistenceLogger.log("已隔离损坏的队列文件到: \(quarantineURL.path)")
+            DispatchQueue.main.async {
+                PersistenceLogger.notifyUser(
+                    title: "队列文件已损坏",
+                    subtitle: "原文件已保护并隔离"
+                )
+            }
+        } catch {
+            debugLog("隔离损坏文件失败: \(error)，保留原文件")
+            PersistenceLogger.log("隔离损坏队列文件失败: \(error)，原文件: \(url.path)")
         }
     }
 
@@ -1956,8 +2302,14 @@ final class PlaylistManager: ObservableObject {
             return true
         }
         guard let url = playlistFileURL() else { return false }
+
+        // Check write protection before entering IO queue
+        guard isPlaylistPersistenceWritable() else { return false }
+
         let isOnIOQueue = DispatchQueue.getSpecific(key: playlistIOQueueKey) != nil
         let write = {
+            // Final write protection check on IO thread
+            guard self.isPlaylistPersistenceWritable() else { return false }
             do {
                 try self.writePlaylistSnapshot(snapshot, to: url)
                 return true

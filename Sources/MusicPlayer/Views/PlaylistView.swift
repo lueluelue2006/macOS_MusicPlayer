@@ -531,7 +531,7 @@ struct PlaylistView: View {
       okTitle: "创建",
       cancelTitle: "取消"
     )
-    playlistsStore.createPlaylist(name: name ?? "")
+    _ = playlistsStore.createEmptyPlaylist(name: name ?? "")
   }
 
   private func showMetadataEditWindow(for file: AudioFile) {

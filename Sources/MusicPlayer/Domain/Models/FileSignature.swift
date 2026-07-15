@@ -2,7 +2,7 @@ import Foundation
 
 /// Comprehensive file signature for cache invalidation.
 /// Pure value type capturing multiple identity dimensions to detect file changes reliably.
-struct FileSignature: Codable, Equatable, Sendable {
+struct FileSignature: Codable, Equatable, Hashable, Sendable {
     /// Canonical path key (NFD-normalized, symlink-resolved, standardized)
     let pathKey: String
 

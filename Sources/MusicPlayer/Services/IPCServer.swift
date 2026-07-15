@@ -883,24 +883,48 @@ final class IPCServer {
         )
     }
 
+    internal static func makeReadOnlyRejection(requestID: String) -> IPCReply {
+        IPCReply(id: requestID, ok: false, message: "playlists store is read-only")
+    }
+
+    @MainActor
+    private func checkPlaylistsStoreWritable(_ request: IPCRequest) async -> IPCReply? {
+        await playlistsStore.ensureLoaded()
+        guard !playlistsStore.isPersistenceReadOnly else {
+            return Self.makeReadOnlyRejection(requestID: request.id)
+        }
+        return nil
+    }
+
     @MainActor
     private func handleCreatePlaylist(_ request: IPCRequest) async -> IPCReply {
-        await playlistsStore.ensureLoaded()
+        if let rejection = await checkPlaylistsStoreWritable(request) {
+            return rejection
+        }
         let name = request.arguments?["name"] ?? ""
         let urls: [URL] = (request.paths ?? []).map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
-        playlistsStore.createPlaylist(name: name, trackURLs: urls)
-        let createdID = playlistsStore.selectedPlaylistID?.uuidString ?? ""
-        return IPCReply(
-            id: request.id,
-            ok: true,
-            message: "playlist created",
-            data: ["playlistID": createdID]
-        )
+        let createdID = await playlistsStore.createPlaylist(name: name, trackURLs: urls)
+        if let id = createdID {
+            return IPCReply(
+                id: request.id,
+                ok: true,
+                message: "playlist created",
+                data: ["playlistID": id.uuidString]
+            )
+        } else {
+            return IPCReply(
+                id: request.id,
+                ok: false,
+                message: "create failed (read-only or terminating)"
+            )
+        }
     }
 
     @MainActor
     private func handleRenamePlaylist(_ request: IPCRequest) async -> IPCReply {
-        await playlistsStore.ensureLoaded()
+        if let rejection = await checkPlaylistsStoreWritable(request) {
+            return rejection
+        }
         guard let playlistID = resolvePlaylistID(arguments: request.arguments, allowSelected: false) else {
             return IPCReply(id: request.id, ok: false, message: "missing/invalid playlistID")
         }
@@ -916,7 +940,9 @@ final class IPCServer {
 
     @MainActor
     private func handleDeletePlaylist(_ request: IPCRequest) async -> IPCReply {
-        await playlistsStore.ensureLoaded()
+        if let rejection = await checkPlaylistsStoreWritable(request) {
+            return rejection
+        }
         guard let playlistID = resolvePlaylistID(arguments: request.arguments, allowSelected: false) else {
             return IPCReply(id: request.id, ok: false, message: "missing/invalid playlistID")
         }
@@ -945,11 +971,13 @@ final class IPCServer {
 
     @MainActor
     private func handleAddTracksToPlaylist(_ request: IPCRequest) async -> IPCReply {
-        await playlistsStore.ensureLoaded()
+        if let rejection = await checkPlaylistsStoreWritable(request) {
+            return rejection
+        }
         guard let playlistID = resolvePlaylistID(arguments: request.arguments, allowSelected: false) else {
             return IPCReply(id: request.id, ok: false, message: "missing/invalid playlistID")
         }
-        guard let playlist = playlistsStore.playlist(for: playlistID) else {
+        guard playlistsStore.playlist(for: playlistID) != nil else {
             return IPCReply(id: request.id, ok: false, message: "playlist not found")
         }
 
@@ -964,9 +992,11 @@ final class IPCServer {
         }
 
         let urls = pathList.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
-        let before = playlist.tracks.count
-        playlistsStore.addTracks(urls, to: playlistID)
-        let after = playlistsStore.playlist(for: playlistID)?.tracks.count ?? before
+        let added = await playlistsStore.addTracks(urls, to: playlistID)
+
+        guard let updatedPlaylist = playlistsStore.playlist(for: playlistID) else {
+            return IPCReply(id: request.id, ok: false, message: "playlist was deleted during add")
+        }
 
         if playlistManager.playbackScope == .playlist(playlistID) {
             refreshPlaybackScopePlaylistTracks(playlistID)
@@ -978,15 +1008,17 @@ final class IPCServer {
             message: "tracks added",
             data: [
                 "playlistID": playlistID.uuidString,
-                "addedCount": "\(max(0, after - before))",
-                "trackCount": "\(after)"
+                "addedCount": "\(added)",
+                "trackCount": "\(updatedPlaylist.tracks.count)"
             ]
         )
     }
 
     @MainActor
     private func handleRemoveTracksFromPlaylist(_ request: IPCRequest) async -> IPCReply {
-        await playlistsStore.ensureLoaded()
+        if let rejection = await checkPlaylistsStoreWritable(request) {
+            return rejection
+        }
         guard let playlistID = resolvePlaylistID(arguments: request.arguments, allowSelected: false) else {
             return IPCReply(id: request.id, ok: false, message: "missing/invalid playlistID")
         }
@@ -1123,7 +1155,14 @@ final class IPCServer {
             return AudioFile(url: url, metadata: metadata, duration: nil)
         }
 
-        guard let selectedIndex = playlistManager.ensureInQueue(playableFiles, focusURL: targetURL),
+        var signatures: [String: FileSignature] = [:]
+        for track in playlist.tracks {
+            if let sig = track.signature {
+                signatures[track.path] = sig
+            }
+        }
+
+        guard let selectedIndex = playlistManager.ensureInQueue(playableFiles, focusURL: targetURL, signatures: signatures),
               let selected = playlistManager.selectFile(at: selectedIndex) else {
             return IPCReply(id: request.id, ok: false, message: "failed to queue playlist track")
         }
