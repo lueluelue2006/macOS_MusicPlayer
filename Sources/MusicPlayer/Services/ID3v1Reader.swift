@@ -44,6 +44,7 @@ enum ID3v1Reader {
             var track: UInt8? = nil
             if rawComment.count == 30 && rawComment[28] == 0x00 {
                 track = rawComment[29]
+                rawComment = rawComment.prefix(28) // ID3v1.1: only first 28 bytes are comment
             }
             rawComment = trim(rawComment)
             let genre = data[127]
