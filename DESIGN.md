@@ -41,9 +41,10 @@ and perpetual motion.
   can override its cover with a local image, and the vector monogram remains the
   fallback. Track rows never decode or display artwork.
 - Built-in artist portraits use face-led crops that remain recognizable at 32
-  points. Their visual identities stay deliberately separate: copper stage light
-  for Yang Kun, formal emerald for Fei Yu-ching, electric blue-violet for Stefanie
-  Sun, and cool cyan for Faye Wong. Do not normalize them onto one shared gradient.
+  points. Their visual identities stay deliberately separate: mature 2024–25-era
+  Yang Kun in copper stage light, formal emerald for Fei Yu-ching, electric
+  blue-violet for Stefanie Sun, and cool cyan for Faye Wong. Do not normalize
+  them onto one shared gradient.
 - Track rows use 01/02/03 numbering for the current visible order, a narrow
   coral active rail, visible six-level weights, a fixed duration column, and
   hover-only management actions.

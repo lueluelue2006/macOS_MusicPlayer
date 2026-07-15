@@ -1,18 +1,22 @@
 BUILT-IN PLAYLIST COVER ATTRIBUTIONS
 
 These image assets are distributed under the licenses listed below, separately
-from the MusicPlayer source-code license. Each image was square-cropped and
-received AI-assisted background cleanup and resolution restoration for use as
-a playlist cover. No watermark was present in any source image.
+from the MusicPlayer source-code license. Each image was adapted for use as a
+playlist cover. AI-assisted changes and source-mark removal are disclosed for
+the individual image where applicable.
 
 yang-kun.png
-  Source title: _MG_1957
-  Creator: 水御龙神
-  Source: https://www.flickr.com/photos/21884840@N02/4008703456
+  Source title: _DSC5913
+  Creator: 天山小河
+  Source: https://www.flickr.com/photos/66813753@N02/8247023480
   License: Creative Commons Attribution-NonCommercial-ShareAlike 2.0
   License URL: https://creativecommons.org/licenses/by-nc-sa/2.0/
-  Changes: tightly cropped; AI-assisted removal of the other performer,
-    background restaging, and resolution restoration.
+  Changes: tightly cropped; AI-assisted removal of the source watermark,
+    identity-preserving maturation, background restaging, and resolution
+    restoration.
+  Visual reference only (no pixels embedded): Zhejiang STV, Yang Kun performing
+    “老男孩” on 天赐的声音6 (2025),
+    https://www.youtube.com/watch?v=0A4nOhiERso
   This derivative remains under CC BY-NC-SA 2.0.
 
 fei-yu-ching.png
