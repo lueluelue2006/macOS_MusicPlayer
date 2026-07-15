@@ -556,36 +556,35 @@ final class PlaylistManager: ObservableObject {
 
         await updateUI(phase: "读取元数据…", detail: "", current: 0, total: fileURLs.count, force: true)
 
-        var built: [AudioFile] = []
-        built.reserveCapacity(fileURLs.count)
+        let progress = MetadataProgressTracker()
+        let results = await BoundedWorkerPool.map(
+            items: fileURLs,
+            maxConcurrent: 4
+        ) { [weak self] url -> AudioFile? in
+            guard let self else { return nil }
+            if Task.isCancelled { return nil }
+            let metadata = await self.loadCachedMetadata(from: url)
+            if Task.isCancelled { return nil }
+            let duration = await DurationCache.shared.cachedDurationIfValid(for: url)
+            if Task.isCancelled { return nil }
 
-        var processed = 0
-        await withTaskGroup(of: AudioFile?.self) { group in
-            for url in fileURLs {
-                group.addTask { [weak self] in
-                    guard let self else { return nil }
-                    if Task.isCancelled { return nil }
-                    let metadata = await self.loadCachedMetadata(from: url)
-                    if Task.isCancelled { return nil }
-                    let duration = await DurationCache.shared.cachedDurationIfValid(for: url)
-                    return AudioFile(url: url, metadata: metadata, duration: duration)
+            let audioFile = AudioFile(url: url, metadata: metadata, duration: duration)
+
+            if let snapshot = await progress.recordCompleted(url: url, total: fileURLs.count) {
+                if Task.isCancelled { return nil }
+                await MainActor.run {
+                    self.isAddingFiles = true
+                    self.addFilesPhase = "读取元数据…"
+                    self.addFilesDetail = snapshot.detail
+                    self.addFilesProgressCurrent = snapshot.current
+                    self.addFilesProgressTotal = snapshot.total
                 }
             }
 
-            for await item in group {
-                if Task.isCancelled { break }
-                processed += 1
-                if let f = item { built.append(f) }
-                if processed % 8 == 0 || processed == fileURLs.count {
-                    await updateUI(
-                        phase: "读取元数据…",
-                        detail: item?.url.lastPathComponent ?? "",
-                        current: processed,
-                        total: fileURLs.count
-                    )
-                }
-            }
+            return audioFile
         }
+
+        let built: [AudioFile] = results.compactMap { $0 }
 
         if Task.isCancelled { return }
 
@@ -2020,6 +2019,38 @@ extension Notification.Name {
 }
 
 import AVFoundation
+
+// 元数据加载进度跟踪，用于节流 UI 更新
+private actor MetadataProgressTracker {
+    struct Snapshot {
+        let current: Int
+        let detail: String
+        let total: Int
+    }
+
+    private var processed = 0
+    private var lastUIUpdate = Date.distantPast
+
+    func recordCompleted(url: URL, total: Int) -> Snapshot? {
+        processed += 1
+        let current = processed
+        let isFinalItem = (current == total)
+
+        // Final item always publishes; others throttle at 0.15s and every 8 items
+        let shouldPublish = isFinalItem || (current % 8 == 0 && Date().timeIntervalSince(lastUIUpdate) >= 0.15)
+
+        guard shouldPublish else {
+            return nil
+        }
+
+        lastUIUpdate = Date()
+        return Snapshot(
+            current: current,
+            detail: url.lastPathComponent,
+            total: total
+        )
+    }
+}
 
 // 轻量级并发闸，用于限制异步任务并发数
 actor ConcurrencyGate {
