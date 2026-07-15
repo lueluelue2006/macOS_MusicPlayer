@@ -125,7 +125,7 @@ final class AudioPlayer: NSObject, ObservableObject {
     private let volumeCacheFileName = "volume-cache.json"
     private let volumeCacheFileURLOverride: URL?
     private let disablesVolumeCachePersistence: Bool
-    private let disablesPlaybackStatePersistence: Bool
+    private let playbackStateStore: PlaybackStateStore
     private let volumeCacheFormatVersion = 3
     private let maxVolumeCacheEntries = 5_000
     private let maxVolumeCacheEncodedBytes = 8 * 1_024 * 1_024
@@ -418,7 +418,7 @@ final class AudioPlayer: NSObject, ObservableObject {
             : ImmersivePlaybackAnalyzer()
         volumeCacheFileURLOverride = nil
         disablesVolumeCachePersistence = isTesting
-        disablesPlaybackStatePersistence = isTesting
+        playbackStateStore = PlaybackStateStore(disablesPersistence: isTesting)
         super.init()
         finishInitialization(loadUserPreferences: true)
     }
@@ -433,7 +433,7 @@ final class AudioPlayer: NSObject, ObservableObject {
         )
         self.volumeCacheFileURLOverride = volumeCacheFileURLOverride
         disablesVolumeCachePersistence = false
-        disablesPlaybackStatePersistence = true
+        playbackStateStore = PlaybackStateStore(disablesPersistence: true)
         super.init()
         isImmersivePlaybackEnabled = initialImmersivePlaybackEnabled
         finishInitialization(loadUserPreferences: false)
@@ -1855,10 +1855,8 @@ final class AudioPlayer: NSObject, ObservableObject {
         artworkLoadTask = nil
 	        playbackClock.duration = 0
         // 可选：清理最近播放缓存，避免清空后再次自动恢复
-        if clearLastPlayed, !disablesPlaybackStatePersistence {
-            let userDefaults = UserDefaults.standard
-            userDefaults.removeObject(forKey: "lastPlayedFilePath")
-            userDefaults.removeObject(forKey: "lastPlayedFileTime")
+        if clearLastPlayed {
+            playbackStateStore.clearAll()
         }
     }
     
@@ -2339,52 +2337,38 @@ final class AudioPlayer: NSObject, ObservableObject {
     
     // MARK: - 保存和加载上次播放的歌曲
     private func saveLastPlayedFile(_ file: AudioFile, initialTime: TimeInterval? = nil) {
-        guard !disablesPlaybackStatePersistence else { return }
-        let userDefaults = UserDefaults.standard
-        userDefaults.set(file.url.path, forKey: "lastPlayedFilePath")
-        // 注意：仅在“真正开始播放”时才传入 initialTime，避免恢复（autostart=false）时把旧进度覆盖为 0。
-        if let t = initialTime {
-            userDefaults.set(max(0, t), forKey: "lastPlayedFileTime")
-        }
+        playbackStateStore.saveFile(file.url, initialTime: initialTime)
     }
 
     private func clearLastPlayedFileIfMatching(_ url: URL) {
-        guard !disablesPlaybackStatePersistence else { return }
-        let defaults = UserDefaults.standard
-        guard let path = defaults.string(forKey: "lastPlayedFilePath"),
-              PathKey.canonical(path: path) == PathKey.canonical(for: url) else { return }
-        defaults.removeObject(forKey: "lastPlayedFilePath")
-        defaults.removeObject(forKey: "lastPlayedFileTime")
+        playbackStateStore.clearIfMatching(url)
     }
     
 		    private func saveCurrentProgress() {
-		        guard !disablesPlaybackStatePersistence else { return }
 		        guard currentFile != nil else { return }
 		        // 临时播放（不持久化）时不保存播放进度
 		        guard persistPlaybackState else { return }
 		        let time = playbackClock.currentTime
-		        UserDefaults.standard.set(time, forKey: "lastPlayedFileTime")
+		        playbackStateStore.saveProgress(time)
 		        debugLog("保存播放进度: \(time) 秒")
 		    }
     
 	    func loadLastPlayedFile() {
-	        let userDefaults = UserDefaults.standard
-	        guard let filePath = userDefaults.string(forKey: "lastPlayedFilePath") else {
+	        guard let state = playbackStateStore.loadState() else {
 	            debugLog("没有找到上次播放的文件路径")
 	            return
 	        }
-	        debugLog("尝试加载上次播放的文件: \(filePath)")
-	        if FileManager.default.fileExists(atPath: filePath) {
-	            let url = URL(fileURLWithPath: filePath)
-	            let lastPlayedTime = userDefaults.double(forKey: "lastPlayedFileTime")
-	            debugLog("文件存在，发送加载通知，播放时间: \(lastPlayedTime)")
+	        debugLog("尝试加载上次播放的文件: \(state.filePath)")
+	        if FileManager.default.fileExists(atPath: state.filePath) {
+	            let url = URL(fileURLWithPath: state.filePath)
+	            debugLog("文件存在，发送加载通知，播放时间: \(state.lastPlayedTime)")
 	            NotificationCenter.default.post(
 	                name: .loadLastPlayedFile,
 	                object: nil,
-                userInfo: ["url": url, "time": lastPlayedTime]
+                userInfo: ["url": url, "time": state.lastPlayedTime]
             )
 	        } else {
-	            debugLog("文件不存在: \(filePath)")
+	            debugLog("文件不存在: \(state.filePath)")
 	        }
 	    }
     // MARK: - 歌词加载
