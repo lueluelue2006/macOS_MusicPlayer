@@ -387,6 +387,31 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
         XCTAssertEqual(returnedBounds, bounds)
     }
 
+    func testAggressiveLeadingPaddingWithGeneratedAudio() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent("long-silence-before-onset.wav")
+
+        // 2 seconds silence, then 4 seconds audio (total 6s)
+        try writeWAV(
+            to: audioURL,
+            duration: 6,
+            audibleRange: 2.0 ..< 6.0
+        )
+
+        let analyzer = ImmersivePlaybackAnalyzer(
+            cacheFileURL: nil,
+            configuration: ImmersivePlaybackAnalyzer.Configuration()
+        )
+        let bounds = await analyzer.bounds(for: audioURL)
+
+        // Should trim to ~0.10s before 2.0s onset = ~1.90s
+        XCTAssertEqual(bounds.audibleStart, 1.90, accuracy: 0.15)
+        // Trailing should extend to physical end
+        XCTAssertEqual(bounds.audibleEnd, 6.0, accuracy: 0.15)
+        XCTAssertEqual(bounds.physicalDuration, 6.0, accuracy: 0.01)
+    }
+
     func testAnalyzerKeepsAudioPresentInOnlyOneStereoChannel() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -467,6 +492,102 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
         XCTAssertEqual(replacement.physicalDuration, 5, accuracy: 0.01)
         XCTAssertLessThan(replacement.audibleStart, original.audibleStart)
         XCTAssertGreaterThan(replacement.audibleEnd, original.audibleEnd)
+    }
+
+    func testAggressiveLeadingEntryWithLongSilence() {
+        // Long leading silence should trim to ~0.10s before onset (new default padding)
+        let configuration = ImmersivePlaybackAnalyzer.Configuration()
+        let head = metrics(
+            from: 0,
+            through: 5,
+            audibleRanges: [3.0 ..< 5.1]
+        )
+        let tail = metrics(
+            from: 8,
+            through: 10,
+            audibleRanges: [8.0 ..< 10.1]
+        )
+
+        let bounds = ImmersivePlaybackAnalyzer.detectBounds(
+            physicalDuration: 10,
+            headMetrics: head,
+            tailMetrics: tail,
+            configuration: configuration
+        )
+
+        // 3.0s onset - 0.10s padding = 2.90s start
+        XCTAssertEqual(bounds.audibleStart, 2.90, accuracy: 0.01)
+        // Tail extends to physical end
+        XCTAssertEqual(bounds.audibleEnd, 10.0, accuracy: 0.01)
+    }
+
+    func testIsolatedWeakAnacrusisPreserved() {
+        // Single weak pickup note before main onset must not be trimmed
+        let configuration = ImmersivePlaybackAnalyzer.Configuration()
+        var head = metrics(
+            from: 0,
+            through: 5,
+            audibleRanges: [2.0 ..< 5.1]
+        )
+        // Replace window at exactly 1.8s with protected-level anacrusis (RMS -70 dBFS)
+        guard let index = head.firstIndex(where: { abs($0.startTime - 1.8) < 0.001 }) else {
+            XCTFail("Test setup failed: no metric window at 1.8s")
+            return
+        }
+        head[index] = ImmersivePlaybackAnalyzer.WindowMetric(
+            startTime: head[index].startTime,
+            duration: head[index].duration,
+            rmsDBFS: -70,
+            peakDBFS: -60
+        )
+
+        let tail = metrics(from: 8, through: 10, audibleRanges: [8.0 ..< 10.1])
+
+        let bounds = ImmersivePlaybackAnalyzer.detectBounds(
+            physicalDuration: 10,
+            headMetrics: head,
+            tailMetrics: tail,
+            configuration: configuration
+        )
+
+        // Must include the 1.8s anacrusis - 0.10s padding = 1.70s
+        XCTAssertEqual(bounds.audibleStart, 1.70, accuracy: 0.001)
+    }
+
+    func testSustainedFadeInPreserved() {
+        // Gradual fade-in spanning 1.0-2.0s must not be trimmed
+        let configuration = ImmersivePlaybackAnalyzer.Configuration()
+        let silence = metrics(from: 0, through: 1.0, audibleRanges: [])
+
+        // Protected-level content 1.0-2.0s
+        var fadeIn: [ImmersivePlaybackAnalyzer.WindowMetric] = []
+        var time = 1.0
+        while time < 2.0 {
+            fadeIn.append(
+                ImmersivePlaybackAnalyzer.WindowMetric(
+                    startTime: time,
+                    duration: 0.05,
+                    rmsDBFS: -70,
+                    peakDBFS: -60
+                )
+            )
+            time += 0.05
+        }
+
+        // Main content from 2.0s
+        let main = metrics(from: 2.0, through: 5, audibleRanges: [2.0 ..< 5.1])
+        let head = silence + fadeIn + main
+        let tail = metrics(from: 8, through: 10, audibleRanges: [8.0 ..< 9.0])
+
+        let bounds = ImmersivePlaybackAnalyzer.detectBounds(
+            physicalDuration: 10,
+            headMetrics: head,
+            tailMetrics: tail,
+            configuration: configuration
+        )
+
+        // Must include the 1.0s fade-in start - 0.10s padding = ~0.90s
+        XCTAssertEqual(bounds.audibleStart, 0.90, accuracy: 0.01)
     }
 
     private func detectorConfiguration() -> ImmersivePlaybackAnalyzer.Configuration {

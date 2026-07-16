@@ -45,7 +45,7 @@ struct PlaybackBounds: Codable, Equatable, Sendable {
 /// and tail. Actor isolation intentionally keeps analysis and cache mutations
 /// serial without allocating a decoded PCM cache.
 actor ImmersivePlaybackAnalyzer {
-    static let algorithmVersion = 3
+    static let algorithmVersion = 4
     private static let cacheFormatVersion = 1
     private static let cacheFileName = "immersive-boundaries.json"
     private static let maximumCacheEntries = 5_000
@@ -60,7 +60,7 @@ actor ImmersivePlaybackAnalyzer {
         var protectionPeakDBFS: Double = -60
         var minimumConsecutiveAudibleWindows: Int = 2
         var minimumSustainedAudibleDuration: TimeInterval = 0.12
-        var leadingSafetyPadding: TimeInterval = 0.25
+        var leadingSafetyPadding: TimeInterval = 0.10
         var trailingSafetyPadding: TimeInterval = 0.35
         var trailingReferencePercentile: Double = 0.90
         var trailingRelativeDropDB: Double = 32
