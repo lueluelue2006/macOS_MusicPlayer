@@ -118,6 +118,7 @@ final class AudioPlayer: NSObject, ObservableObject {
     private var volumeAnalysisRetryAfter: [String: TimeInterval] = [:]
     private var volumeCacheEpoch: UInt64 = 0
     private var volumeCacheEntryCapacity: Int?
+    private var isVolumeCacheReadOnly = false
     private let volumeCacheLock = NSLock()
     private let volumeCacheSaveLock = NSLock()
     private let volumeCachePersistenceQueue = DispatchQueue(
@@ -138,6 +139,7 @@ final class AudioPlayer: NSObject, ObservableObject {
     private let volumeCacheFormatVersion = 3
     private let maxVolumeCacheEntries = 5_000
     private let maxVolumeCacheEncodedBytes = 8 * 1_024 * 1_024
+    private let maxVolumeCacheProbeBytes = 16 * 1_024 * 1_024
     private let failedVolumeAnalysisRetryDelay: TimeInterval = 15 * 60
     private let maxVolumeAnalysisRetryEntries = 5_000
     private struct VolumeCacheFile: Codable {
@@ -157,6 +159,9 @@ final class AudioPlayer: NSObject, ObservableObject {
             self.storageConstrained = storageConstrained
             self.entryCapacity = entryCapacity
         }
+    }
+    private struct VolumeCacheVersionProbe: Codable {
+        let version: Int?
     }
     private struct LegacyVolumeCacheFile: Codable {
         let version: Int
@@ -2896,7 +2901,8 @@ extension AudioPlayer {
         invalidateScheduledVolumeCacheSave()
         volumeCachePersistenceQueue.sync { [weak self] in
             guard let self else { return }
-            if let url = self.volumeCacheURL() {
+            let readOnly = withVolumeCacheLock { self.isVolumeCacheReadOnly }
+            if !readOnly, let url = self.volumeCacheURL() {
                 try? FileManager.default.removeItem(at: url)
             }
             _ = self.writeVolumeCacheNow()
@@ -2905,75 +2911,148 @@ extension AudioPlayer {
     
     /// 加载持久化的音量缓存
     private func loadVolumeCache() {
-        if let url = volumeCacheURL(),
-           let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
-           let fileSize = values.fileSize,
-           fileSize > maxVolumeCacheEncodedBytes {
-            // This is a derived cache, so discarding an oversized/corrupt file is
-            // safer than allocating it during a low-memory launch.
-            try? FileManager.default.removeItem(at: url)
-            debugLog("丢弃超过上限的响度缓存：\(fileSize) bytes")
+        guard let url = volumeCacheURL() else { return }
+
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else {
+            // Disk cache file does not exist: fall back to UserDefaults migration if applicable
+            loadVolumeCacheFromUserDefaultsFallback()
+            return
+        }
+
+        // File exists: stat size
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+              let fileSize = values.fileSize else {
+            // File exists but cannot stat: enter read-only and preserve
+            withVolumeCacheLock {
+                isVolumeCacheReadOnly = true
+            }
+            PersistenceLogger.log("音量缓存文件存在但无法读取属性，进入只读模式保护数据")
+            return
+        }
+
+        if fileSize > maxVolumeCacheProbeBytes {
+            // File too large to safely probe: conservatively enter read-only and preserve
+            withVolumeCacheLock {
+                isVolumeCacheReadOnly = true
+            }
+            PersistenceLogger.log("音量缓存文件超过探测上限 (\(fileSize) bytes)，无法安全判定版本，进入只读模式保护数据")
+            return
+        }
+
+        // Read full data within probe limit
+        guard let data = try? Data(contentsOf: url) else {
+            // File exists but cannot read: enter read-only and preserve
+            withVolumeCacheLock {
+                isVolumeCacheReadOnly = true
+            }
+            PersistenceLogger.log("音量缓存文件存在但无法读取内容，进入只读模式保护数据")
+            return
+        }
+
+        // Probe version first to detect future schemas
+        if let probe = try? JSONDecoder().decode(VolumeCacheVersionProbe.self, from: data),
+           let version = probe.version,
+           version > volumeCacheFormatVersion {
+            withVolumeCacheLock {
+                isVolumeCacheReadOnly = true
+            }
+            PersistenceLogger.log("检测到未来音量缓存版本 \(version)（当前支持 \(volumeCacheFormatVersion)），进入只读模式保护数据")
+            DispatchQueue.main.async {
+                PersistenceLogger.notifyUser(
+                    title: "音量缓存版本过新",
+                    subtitle: "可能由新版本创建，当前版本只读保护"
+                )
+            }
+            return
         }
 
         // 优先从磁盘读取带文件指纹的 v3 JSON 缓存。
-        if let url = volumeCacheURL(), let data = try? Data(contentsOf: url) {
-            if let decoded = try? JSONDecoder().decode(VolumeCacheFile.self, from: data),
-               decoded.version == volumeCacheFormatVersion {
-                let normalized = prunedVolumeCacheEntries(
-                    normalizeVolumeCacheEntries(decoded.entriesByPath),
-                    limit: maxVolumeCacheEntries
-                )
-                withVolumeCacheLock {
-                    fileLoudnessCache = normalized
-                    if let persistedCapacity = decoded.entryCapacity {
-                        volumeCacheEntryCapacity = max(
-                            normalized.count,
-                            min(maxVolumeCacheEntries, persistedCapacity)
-                        )
-                    } else if decoded.storageConstrained == true {
-                        volumeCacheEntryCapacity = normalized.count
-                    } else {
-                        volumeCacheEntryCapacity = nil
-                    }
-                }
-                volumeNormalizationCacheCount = normalized.count
-                debugLog("加载了 \(normalized.count) 个文件的响度缓存")
-                if normalized != decoded.entriesByPath || data.count > maxVolumeCacheEncodedBytes {
-                    // 统一键格式并去重后回写，避免后续因路径格式差异导致缓存 miss。
-                    saveVolumeCache()
-                }
+        if let decoded = try? JSONDecoder().decode(VolumeCacheFile.self, from: data),
+           decoded.version == volumeCacheFormatVersion {
+            // Confirmed v3: safe to apply oversized derived cache policy
+            if fileSize > maxVolumeCacheEncodedBytes {
+                try? FileManager.default.removeItem(at: url)
+                debugLog("丢弃超过上限的响度缓存：\(fileSize) bytes")
                 return
             }
 
-            // v2 文件只有响度字典。先无损迁移；首次命中时再补文件指纹，
-            // 避免启动阶段对整个曲库逐个 stat。
-            if let legacyFile = try? JSONDecoder().decode(LegacyVolumeCacheFile.self, from: data),
-               legacyFile.version == 2 {
-                let migrated = volumeCacheEntries(
-                    fromLoudnessValues: legacyFile.loudnessDbByPath
-                )
-                withVolumeCacheLock {
-                    fileLoudnessCache = migrated
+            let normalized = prunedVolumeCacheEntries(
+                normalizeVolumeCacheEntries(decoded.entriesByPath),
+                limit: maxVolumeCacheEntries
+            )
+            withVolumeCacheLock {
+                fileLoudnessCache = normalized
+                if let persistedCapacity = decoded.entryCapacity {
+                    volumeCacheEntryCapacity = max(
+                        normalized.count,
+                        min(maxVolumeCacheEntries, persistedCapacity)
+                    )
+                } else if decoded.storageConstrained == true {
+                    volumeCacheEntryCapacity = normalized.count
+                } else {
+                    volumeCacheEntryCapacity = nil
                 }
-                volumeNormalizationCacheCount = migrated.count
-                saveVolumeCache()
-                debugLog("已迁移 v2 音量缓存文件：\(migrated.count) 项")
-                return
             }
-
-            // 更早版本可能直接保存“增益字典”或“响度字典”。
-            if let legacy = try? JSONDecoder().decode([String: Float].self, from: data) {
-                let migrated = volumeCacheEntries(fromLegacyValues: legacy)
-                withVolumeCacheLock {
-                    fileLoudnessCache = migrated
-                }
-                volumeNormalizationCacheCount = migrated.count
+            volumeNormalizationCacheCount = normalized.count
+            debugLog("加载了 \(normalized.count) 个文件的响度缓存")
+            if normalized != decoded.entriesByPath || data.count > maxVolumeCacheEncodedBytes {
+                // 统一键格式并去重后回写，避免后续因路径格式差异导致缓存 miss。
                 saveVolumeCache()
-                debugLog("已迁移旧版音量缓存文件：\(migrated.count) 项")
-                return
             }
+            return
         }
 
+        // v2 文件只有响度字典。先无损迁移；首次命中时再补文件指纹，
+        // 避免启动阶段对整个曲库逐个 stat。
+        if let legacyFile = try? JSONDecoder().decode(LegacyVolumeCacheFile.self, from: data),
+           legacyFile.version == 2 {
+            // Confirmed v2: safe to apply oversized derived cache policy
+            if fileSize > maxVolumeCacheEncodedBytes {
+                try? FileManager.default.removeItem(at: url)
+                debugLog("丢弃超过上限的响度缓存：\(fileSize) bytes")
+                return
+            }
+
+            let migrated = volumeCacheEntries(
+                fromLoudnessValues: legacyFile.loudnessDbByPath
+            )
+            withVolumeCacheLock {
+                fileLoudnessCache = migrated
+            }
+            volumeNormalizationCacheCount = migrated.count
+            saveVolumeCache()
+            debugLog("已迁移 v2 音量缓存文件：\(migrated.count) 项")
+            return
+        }
+
+        // 更早版本可能直接保存“增益字典”或“响度字典”。
+        if let legacy = try? JSONDecoder().decode([String: Float].self, from: data) {
+            // Confirmed legacy dict: safe to apply oversized derived cache policy
+            if fileSize > maxVolumeCacheEncodedBytes {
+                try? FileManager.default.removeItem(at: url)
+                debugLog("丢弃超过上限的响度缓存：\(fileSize) bytes")
+                return
+            }
+
+            let migrated = volumeCacheEntries(fromLegacyValues: legacy)
+            withVolumeCacheLock {
+                fileLoudnessCache = migrated
+            }
+            volumeNormalizationCacheCount = migrated.count
+            saveVolumeCache()
+            debugLog("已迁移旧版音量缓存文件：\(migrated.count) 项")
+            return
+        }
+
+        // Unknown or corrupted format: enter read-only to preserve
+        withVolumeCacheLock {
+            isVolumeCacheReadOnly = true
+        }
+        PersistenceLogger.log("音量缓存文件格式未知或损坏，进入只读模式保护数据")
+    }
+
+    private func loadVolumeCacheFromUserDefaultsFallback() {
         // Tests and isolated callers using an explicit cache URL must not read or
         // mutate the real app's legacy UserDefaults cache.
         if volumeCacheFileURLOverride != nil || disablesVolumeCachePersistence {
@@ -3119,6 +3198,8 @@ extension AudioPlayer {
 
     @discardableResult
     private func writeVolumeCacheNow() -> Bool {
+        let readOnly = withVolumeCacheLock { isVolumeCacheReadOnly }
+        guard !readOnly else { return false }
         guard let url = volumeCacheURL() else { return false }
 
         do {

@@ -17,10 +17,15 @@ actor DurationCache {
 
     private let cacheFileName = "duration-cache.json"
     private let formatVersion = 2
+    private var isReadOnly = false
 
     private struct CacheFile: Codable {
         let version: Int
         let entries: [String: Entry]
+    }
+
+    private struct CacheVersionProbe: Codable {
+        let version: Int?
     }
 
     private struct Entry: Codable, Equatable {
@@ -137,8 +142,40 @@ actor DurationCache {
         guard !isLoaded else { return }
         isLoaded = true
 
-        guard let url = cacheFileURL(), let data = try? Data(contentsOf: url) else { return }
-        guard let decoded = try? JSONDecoder().decode(CacheFile.self, from: data), decoded.version == formatVersion else { return }
+        guard let url = cacheFileURL() else { return }
+
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else { return }
+
+        guard let data = try? Data(contentsOf: url) else {
+            // File exists but cannot read: enter read-only and preserve
+            isReadOnly = true
+            PersistenceLogger.log("时长缓存文件存在但无法读取，进入只读模式保护数据")
+            return
+        }
+
+        // Probe version first to detect future schemas
+        if let probe = try? JSONDecoder().decode(CacheVersionProbe.self, from: data),
+           let version = probe.version,
+           version > formatVersion {
+            isReadOnly = true
+            PersistenceLogger.log("检测到未来时长缓存版本 \(version)（当前支持 \(formatVersion)），进入只读模式保护数据")
+            DispatchQueue.main.async {
+                PersistenceLogger.notifyUser(
+                    title: "时长缓存版本过新",
+                    subtitle: "可能由新版本创建，当前版本只读保护"
+                )
+            }
+            return
+        }
+
+        guard let decoded = try? JSONDecoder().decode(CacheFile.self, from: data),
+              decoded.version == formatVersion else {
+            // Unknown or corrupted format: enter read-only to preserve
+            isReadOnly = true
+            PersistenceLogger.log("时长缓存文件格式未知或损坏，进入只读模式保护数据")
+            return
+        }
 
         let normalized = normalizeKeys(decoded.entries)
         entries = normalized
@@ -161,7 +198,14 @@ actor DurationCache {
         }
     }
 
+    internal func flushForTesting() {
+        pendingSaveTask?.cancel()
+        pendingSaveTask = nil
+        saveNow()
+    }
+
     private func saveNow() {
+        guard !isReadOnly else { return }
         guard let url = cacheFileURL() else { return }
         let payload = CacheFile(version: formatVersion, entries: entries)
         do {

@@ -220,6 +220,74 @@ final class VolumeNormalizationCacheTests: XCTestCase {
         return condition()
     }
 
+    func testFutureVersionPreservesOriginalBytes() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-volume-cache-future-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let cacheURL = directory.appendingPathComponent("volume-cache.json")
+        let audioURL = directory.appendingPathComponent("fixture.wav")
+        try writeWAV(to: audioURL, amplitude: 0.5)
+
+        // Create future version cache file missing current required fields
+        let futureCache = """
+        {
+            "version": 999,
+            "futureField": "must-preserve"
+        }
+        """
+        let originalBytes = Data(futureCache.utf8)
+        try originalBytes.write(to: cacheURL, options: .atomic)
+
+        let player = AudioPlayer(volumeCacheFileURLOverride: cacheURL)
+
+        // Attempt write operation
+        _ = player.calculateNormalizedVolume(for: audioURL, persist: true)
+        player.flushVolumeCachePersistence()
+
+        let afterWriteBytes = try Data(contentsOf: cacheURL)
+        XCTAssertEqual(afterWriteBytes, originalBytes, "Future version file must survive write")
+
+        // Attempt clear operation
+        player.clearVolumeCache()
+
+        let afterClearBytes = try Data(contentsOf: cacheURL)
+        XCTAssertEqual(afterClearBytes, originalBytes, "Future version file must survive clear")
+    }
+
+    func testUnknownFormatPreservesOriginalBytes() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-volume-cache-unknown-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let cacheURL = directory.appendingPathComponent("volume-cache.json")
+        let audioURL = directory.appendingPathComponent("fixture.wav")
+        try writeWAV(to: audioURL, amplitude: 0.5)
+
+        // Create corrupted/unknown format
+        let corruptedCache = Data("not valid json".utf8)
+        try corruptedCache.write(to: cacheURL, options: .atomic)
+
+        let player = AudioPlayer(volumeCacheFileURLOverride: cacheURL)
+
+        _ = player.calculateNormalizedVolume(for: audioURL, persist: true)
+        player.flushVolumeCachePersistence()
+
+        let afterWriteBytes = try Data(contentsOf: cacheURL)
+        XCTAssertEqual(afterWriteBytes, corruptedCache, "Unknown format file must survive write")
+
+        player.clearVolumeCache()
+
+        let afterClearBytes = try Data(contentsOf: cacheURL)
+        XCTAssertEqual(afterClearBytes, corruptedCache, "Unknown format file must survive clear")
+    }
+
     private func writeWAV(
         to url: URL,
         amplitude: Float,

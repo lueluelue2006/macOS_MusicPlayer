@@ -286,6 +286,87 @@ final class MetadataCacheTests: XCTestCase {
         }
     }
 
+    func testFutureVersionPreservesOriginalBytes() async throws {
+        try await withTemporaryCache { cacheURL, directory in
+            let url = directory.appendingPathComponent("track.mp3")
+            try Data("audio".utf8).write(to: url)
+
+            // Create future version cache file missing current required fields
+            let futureCache = """
+            {
+                "version": 999,
+                "futureField": "must-preserve"
+            }
+            """
+            let originalBytes = Data(futureCache.utf8)
+            try originalBytes.write(to: cacheURL, options: .atomic)
+
+            let cache = MetadataCache(cacheFileURLOverride: cacheURL)
+
+            // Attempt normal operations
+            let metadata = AudioMetadata(
+                title: "New Song",
+                artist: "New Artist",
+                album: "New Album",
+                year: nil,
+                genre: nil,
+                artwork: nil
+            )
+            await cache.storeBasicMetadata(metadata, for: url)
+            await cache.flushForTesting()
+
+            let afterBytes = try Data(contentsOf: cacheURL)
+            XCTAssertEqual(afterBytes, originalBytes, "Future version file must remain unchanged")
+        }
+    }
+
+    func testUnknownFormatPreservesOriginalBytes() async throws {
+        try await withTemporaryCache { cacheURL, directory in
+            let url = directory.appendingPathComponent("track.mp3")
+            try Data("audio".utf8).write(to: url)
+
+            // Create corrupted/unknown format
+            let corruptedCache = Data("not valid json".utf8)
+            try corruptedCache.write(to: cacheURL, options: .atomic)
+
+            let cache = MetadataCache(cacheFileURLOverride: cacheURL)
+
+            let metadata = AudioMetadata(
+                title: "New Song",
+                artist: "New Artist",
+                album: "New Album",
+                year: nil,
+                genre: nil,
+                artwork: nil
+            )
+            await cache.storeBasicMetadata(metadata, for: url)
+            await cache.flushForTesting()
+
+            let afterBytes = try Data(contentsOf: cacheURL)
+            XCTAssertEqual(afterBytes, corruptedCache, "Unknown format file must remain unchanged")
+        }
+    }
+
+    func testFutureVersionPreservesAfterRemoveAll() async throws {
+        try await withTemporaryCache { cacheURL, directory in
+            let futureCache = """
+            {
+                "version": 999,
+                "futureField": "must-preserve"
+            }
+            """
+            let originalBytes = Data(futureCache.utf8)
+            try originalBytes.write(to: cacheURL, options: .atomic)
+
+            let cache = MetadataCache(cacheFileURLOverride: cacheURL)
+            await cache.removeAll()
+            await cache.flushForTesting()
+
+            let afterBytes = try Data(contentsOf: cacheURL)
+            XCTAssertEqual(afterBytes, originalBytes, "Future version file must survive removeAll")
+        }
+    }
+
     private func withTemporaryCache(
         _ body: (URL, URL) async throws -> Void
     ) async throws {
