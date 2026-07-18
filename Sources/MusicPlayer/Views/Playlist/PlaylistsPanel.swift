@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-struct PlaylistsPanelView: View {
+struct PlaylistsPanel: View {
   @ObservedObject var audioPlayer: AudioPlayer
   @ObservedObject var playlistManager: PlaylistManager
   @ObservedObject var playlistsStore: PlaylistsStore
@@ -276,7 +276,7 @@ struct PlaylistsPanelView: View {
               List {
                 ForEach(visibleTracks.indices, id: \.self) { index in
                   let file = visibleTracks[index]
-                  PlaylistItemView(
+                  TrackRowView(
                   trackNumber: index + 1,
                   file: file,
                   isCurrentTrack: currentHighlightedURL == file.url,
@@ -305,12 +305,7 @@ struct PlaylistsPanelView: View {
                   weightLevel: weights.level(for: file.url, scope: .playlist(playlist.id)),
                   onWeightSelect: { newLevel in
                     let result = weights.setLevel(newLevel, for: file.url, scope: .playlist(playlist.id))
-                    switch result {
-                    case .applied, .unchanged:
-                      break
-                    case .rejectedReadOnly(let reason):
-                      postToast(title: "无法修改随机权重", subtitle: reason.diagnosticMessage, kind: "error")
-                    }
+                    WeightCommands.handleSetWeightResult(result)
                   }
                 )
                   .id(file.id)

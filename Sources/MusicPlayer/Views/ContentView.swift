@@ -7,26 +7,120 @@ struct ContentView: View {
     @ObservedObject var playlistManager: PlaylistManager
     @ObservedObject var playlistsStore: PlaylistsStore
     @Environment(\.colorScheme) private var colorScheme
-
-    // 缓存清理提示
-    @State private var showAlert = false
-    @State private var alertMessage = ""
-    @State private var showVolumeNormalizationAnalysis = false
-    // 播放失败提示（非阻塞）
-    @State private var toastTitle: String = ""
-    @State private var toastSubtitle: String? = nil
-    @State private var toastKind: ToastKind = .info
-    @State private var showToast: Bool = false
-    @State private var toastTask: Task<Void, Never>?
-
-    // 更新检查（自动：启动后，在播放列表成功加载完歌曲后执行一次；延迟执行避免与加载/恢复抢占资源）
     @Environment(\.openURL) private var openURL
-    @State private var didAutoCheckForUpdatesThisLaunch: Bool = false
-    @State private var updateCheckTask: Task<Void, Never>?
-    @State private var toastTapURL: URL?
-    @State private var toastTapUpdate: UpdateChecker.UpdateInfo?
+
+    @StateObject private var toastState = ToastState()
+    @StateObject private var updateCheckState = UpdateCheckState()
+
+    @State private var alertMessage = ""
+    @State private var showAlert = false
+    @State private var showVolumeNormalizationAnalysis = false
 
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+    private var currentVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "4.0.0"
+    }
+
+    var body: some View {
+        layoutView
+            .background(theme.libraryBackground)
+            .tint(theme.accent)
+            .onAppear {
+                NotificationCenter.default.post(name: .blurSearchField, object: nil)
+                playlistManager.performInitialRestoreIfNeeded(
+                    audioPlayer: audioPlayer,
+                    playlistsStore: playlistsStore
+                )
+                triggerAutoUpdateCheck()
+            }
+            .onDisappear {
+                playlistManager.savePlaylist()
+            }
+            .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+                handleGlobalDrop(providers: providers)
+                return true
+            }
+            .sheet(isPresented: $showVolumeNormalizationAnalysis) {
+                VolumeNormalizationAnalysisView(
+                    audioPlayer: audioPlayer,
+                    playlistManager: playlistManager
+                )
+            }
+            .alert(alertMessage, isPresented: $showAlert) {
+                Button("确定", role: .cancel) { }
+            }
+            .overlay(alignment: .topTrailing) {
+                if toastState.isVisible {
+                    ToastBanner(
+                        title: toastState.title,
+                        subtitle: toastState.subtitle,
+                        kind: toastState.kind,
+                        onTap: toastState.hasTapAction ? { handleToastTap() } : nil,
+                        onClose: { toastState.dismiss() }
+                    )
+                    .padding(.top, 12)
+                    .padding(.trailing, 12)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .alert("通过扬声器播放？", isPresented: Binding(
+                get: { audioPlayer.showSpeakerConfirm },
+                set: { audioPlayer.showSpeakerConfirm = $0 }
+            )) {
+                Button("取消", role: .cancel) {
+                    audioPlayer.speakerConfirmProceed = nil
+                }
+                Button("继续播放") {
+                    let proceed = audioPlayer.speakerConfirmProceed
+                    audioPlayer.speakerConfirmProceed = nil
+                    audioPlayer.showSpeakerConfirm = false
+                    proceed?()
+                }
+            } message: {
+                Text("当前输出设备：\(audioPlayer.currentOutputDeviceName)\n为了避免误外放，请确认是否通过扬声器播放。")
+            }
+            .onChange(of: playlistManager.audioFiles.count) { _ in triggerAutoUpdateCheck() }
+            .onChange(of: playlistManager.isAddingFiles) { _ in triggerAutoUpdateCheck() }
+            .onChange(of: playlistManager.isRestoringPlaylist) { _ in triggerAutoUpdateCheck() }
+            .onReceive(NotificationCenter.default.publisher(for: .loadLastPlayedFile)) { notification in
+                handleLoadLastPlayedFile(notification)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showVolumeCacheClearedAlert)) { _ in
+                showAlert("音量均衡缓存已清空")
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showDurationCacheClearedAlert)) { _ in
+                showAlert("时长缓存已清空")
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showArtworkCacheClearedAlert)) { _ in
+                showAlert("封面缩略图（内存）已清空")
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showLyricsCacheClearedAlert)) { _ in
+                showAlert("歌词缓存已清空")
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showAllCachesClearedAlert)) { _ in
+                showAlert("所有缓存已清空")
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showVolumeNormalizationAnalysis)) { _ in
+                showVolumeNormalizationAnalysis = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .requestDismissAllSheets)) { _ in
+                showVolumeNormalizationAnalysis = false
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .manualCheckForUpdates)) { _ in
+                updateCheckState.manualCheck(currentVersion: currentVersion, onOutcome: handleUpdateOutcome)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .audioPlayerDidFailToPlay)) { notification in
+                let raw = (notification.userInfo?["message"] as? String) ?? "播放失败"
+                let firstLine = raw
+                    .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true)
+                    .first
+                    .map(String.init) ?? raw
+                toastState.show(firstLine, kind: .error)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showAppToast)) { notification in
+                handleShowAppToast(notification)
+            }
+    }
 
     private var layoutView: some View {
         GeometryReader { geometry in
@@ -40,9 +134,13 @@ struct ContentView: View {
                         .fill(theme.paneDivider)
                         .frame(height: 1)
 
-                    PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
-                        .frame(minHeight: 200)
-                        .background(theme.libraryBackground)
+                    PlaylistView(
+                        audioPlayer: audioPlayer,
+                        playlistManager: playlistManager,
+                        playlistsStore: playlistsStore
+                    )
+                    .frame(minHeight: 200)
+                    .background(theme.libraryBackground)
                 }
             } else {
                 HStack(spacing: 0) {
@@ -54,256 +152,118 @@ struct ContentView: View {
                         .fill(theme.paneDivider)
                         .frame(width: 1)
 
-                    PlaylistView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
-                        .frame(minWidth: 480)
-                        .background(theme.libraryBackground)
-                }
-            }
-        }
-    }
-
-    var body: some View {
-        let withChrome = layoutView
-            .background(theme.libraryBackground)
-            .onAppear {
-                // 启动时确保搜索框不自动聚焦
-                NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                // 一次性恢复逻辑移动到持久化的 PlaylistManager（避免窗口重开导致重复）
-                playlistManager.performInitialRestoreIfNeeded(audioPlayer: audioPlayer, playlistsStore: playlistsStore)
-                maybeAutoCheckForUpdates()
-            }
-            .onDisappear {
-                // 应用关闭时保存播放列表（不会影响后台播放）
-                playlistManager.savePlaylist()
-                updateCheckTask?.cancel()
-                updateCheckTask = nil
-            }
-            .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-                handleGlobalDrop(providers: providers)
-                return true
-            }
-            .sheet(isPresented: $showVolumeNormalizationAnalysis) {
-                VolumeNormalizationAnalysisView(audioPlayer: audioPlayer, playlistManager: playlistManager)
-            }
-            .alert(alertMessage, isPresented: $showAlert) {
-                Button("确定", role: .cancel) { }
-            }
-            .overlay(alignment: .topTrailing) {
-                if showToast {
-                    ToastBanner(
-                        title: toastTitle,
-                        subtitle: toastSubtitle,
-                        kind: toastKind,
-                        onTap: (toastTapURL == nil && toastTapUpdate == nil) ? nil : {
-                            if let info = toastTapUpdate {
-                                Task { await startSelfUpdate(info) }
-                            } else if let url = toastTapURL {
-                                openURL(url)
-                            }
-                        },
-                        onClose: { dismissToast() }
+                    PlaylistView(
+                        audioPlayer: audioPlayer,
+                        playlistManager: playlistManager,
+                        playlistsStore: playlistsStore
                     )
-                    .padding(.top, 12)
-                    .padding(.trailing, 12)
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .frame(minWidth: 480)
+                    .background(theme.libraryBackground)
                 }
             }
-
-        // 扬声器播放确认弹窗（仅在“耳机→扬声器”后，用户显式点击开始时出现一次）
-        let withSpeakerConfirm = withChrome.alert("通过扬声器播放？", isPresented: Binding(
-            get: { audioPlayer.showSpeakerConfirm },
-            set: { audioPlayer.showSpeakerConfirm = $0 }
-        )) {
-            Button("取消", role: .cancel) {
-                audioPlayer.speakerConfirmProceed = nil
-            }
-            Button("继续播放") {
-                let proceed = audioPlayer.speakerConfirmProceed
-                audioPlayer.speakerConfirmProceed = nil
-                audioPlayer.showSpeakerConfirm = false
-                proceed?()
-            }
-        } message: {
-            Text("当前输出设备：\(audioPlayer.currentOutputDeviceName)\n为了避免误外放，请确认是否通过扬声器播放。")
         }
-
-        let withUpdateTriggers = withSpeakerConfirm
-            .onChange(of: playlistManager.audioFiles.count) { _ in
-                maybeAutoCheckForUpdates()
-            }
-            .onChange(of: playlistManager.isAddingFiles) { _ in
-                maybeAutoCheckForUpdates()
-            }
-            .onChange(of: playlistManager.isRestoringPlaylist) { _ in
-                maybeAutoCheckForUpdates()
-            }
-
-        let withReceivers = withUpdateTriggers
-            .onReceive(NotificationCenter.default.publisher(for: .loadLastPlayedFile)) { notification in
-                if let userInfo = notification.userInfo,
-                   let url = userInfo["url"] as? URL,
-                   let time = userInfo["time"] as? TimeInterval {
-                    if let file = playlistManager.audioFiles.first(where: { $0.url == url }),
-                       let index = playlistManager.audioFiles.firstIndex(where: { $0.url == url }) {
-                        playlistManager.currentIndex = index
-                        playlistManager.savePlaylist()
-                        // 恢复到上次曲目与进度，但默认不自动播放
-                        audioPlayer.prepareInitialSeekForRestore(to: time, for: url)
-                        audioPlayer.play(file, autostart: false, bypassConfirm: true)
-                    } else {
-                        showToastMessage("未能在播放列表中找到上次播放文件", kind: .warning)
-                    }
-                }
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .showVolumeCacheClearedAlert)) { _ in
-                alertMessage = "音量均衡缓存已清空"
-                showAlert = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .showDurationCacheClearedAlert)) { _ in
-                alertMessage = "时长缓存已清空"
-                showAlert = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .showArtworkCacheClearedAlert)) { _ in
-                alertMessage = "封面缩略图（内存）已清空"
-                showAlert = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .showLyricsCacheClearedAlert)) { _ in
-                alertMessage = "歌词缓存已清空"
-                showAlert = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .showAllCachesClearedAlert)) { _ in
-                alertMessage = "所有缓存已清空"
-                showAlert = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .showVolumeNormalizationAnalysis)) { _ in
-                showVolumeNormalizationAnalysis = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .requestDismissAllSheets)) { _ in
-                showVolumeNormalizationAnalysis = false
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .manualCheckForUpdates)) { _ in
-                manualCheckForUpdates()
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .audioPlayerDidFailToPlay)) { notification in
-                let raw = (notification.userInfo?["message"] as? String) ?? "播放失败"
-                let firstLine =
-                    raw
-                    .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true)
-                    .first
-                    .map(String.init) ?? raw
-                showToastMessage(firstLine, kind: .error)
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .showAppToast)) { notification in
-                guard let userInfo = notification.userInfo else { return }
-
-                let title = (userInfo["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                let subtitle = (userInfo["subtitle"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-                let duration = (userInfo["duration"] as? TimeInterval) ?? 2.8
-                let tapURL =
-                    (userInfo["url"] as? URL)
-                    ?? ((userInfo["url"] as? String).flatMap { URL(string: $0) })
-                let kindRaw = (userInfo["kind"] as? String) ?? "info"
-                let kind = ToastKind(rawValue: kindRaw) ?? .info
-
-                guard !title.isEmpty else { return }
-                showToastMessage(title, subtitle: subtitle, kind: kind, duration: duration, tapURL: tapURL)
-            }
-
-        return withReceivers
     }
 
-    private func maybeAutoCheckForUpdates() {
-        let ready =
-            !playlistManager.audioFiles.isEmpty &&
-            !playlistManager.isAddingFiles &&
-            !playlistManager.isRestoringPlaylist
+    private func triggerAutoUpdateCheck() {
+        updateCheckState.maybeAutoCheck(
+            currentVersion: currentVersion,
+            playlistManager: playlistManager,
+            onOutcome: handleUpdateOutcome
+        )
+    }
 
-        // 若用户正在导入/恢复或播放列表为空：取消任何“待执行”的更新检查，避免与加载抢占资源
-        guard ready else {
-            updateCheckTask?.cancel()
-            updateCheckTask = nil
+    private func handleUpdateOutcome(_ outcome: UpdateChecker.CheckOutcome) {
+        switch outcome {
+        case .updateAvailable(let info):
+            if info.assetURL != nil && info.checksumAssetURL != nil {
+                toastState.show(
+                    "发现新版本 \(info.latestVersion)",
+                    subtitle: "点击自动更新（下载并校验后安装）",
+                    kind: .update,
+                    duration: 10.0,
+                    tapUpdate: info
+                )
+            } else if info.assetURL != nil {
+                toastState.show(
+                    "发现新版本 \(info.latestVersion)",
+                    subtitle: "未找到 SHA256 校验文件，点击打开 Releases 手动下载",
+                    kind: .warning,
+                    duration: 10.0,
+                    tapURL: info.releaseURL
+                )
+            } else {
+                toastState.show(
+                    "发现新版本 \(info.latestVersion)",
+                    subtitle: "点击打开 GitHub Releases 下载",
+                    kind: .update,
+                    duration: 10.0,
+                    tapURL: info.releaseURL
+                )
+            }
+        case .upToDate(let current, let latest, let url):
+            if latest == current {
+                toastState.show("已是最新版本 \(current)", kind: .success, duration: 2.0, tapURL: url)
+            } else {
+                toastState.show(
+                    "已是最新版本 \(current)",
+                    subtitle: "线上最新：\(latest)",
+                    kind: .success,
+                    duration: 2.0,
+                    tapURL: url
+                )
+            }
+        case .failed(let message, let url):
+            toastState.show(message, subtitle: "点击打开 GitHub Releases", kind: .warning, duration: 2.0, tapURL: url)
+        }
+    }
+
+    private func handleToastTap() {
+        if let info = toastState.tapUpdate {
+            updateCheckState.startSelfUpdate(info, toastState: toastState)
+        } else if let url = toastState.tapURL {
+            openURL(url)
+        }
+    }
+
+    private func showAlert(_ message: String) {
+        alertMessage = message
+        showAlert = true
+    }
+
+    private func handleLoadLastPlayedFile(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let url = userInfo["url"] as? URL,
+              let time = userInfo["time"] as? TimeInterval else { return }
+
+        guard let index = playlistManager.audioFiles.firstIndex(where: { $0.url == url }) else {
+            toastState.show("未能在播放列表中找到上次播放文件", kind: .warning)
             return
         }
 
-        guard !didAutoCheckForUpdatesThisLaunch else { return }
-
-        // 已经排队等待执行，则不重复创建任务
-        guard updateCheckTask == nil else { return }
-
-        let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "4.0.0"
-        updateCheckTask = Task(priority: .background) {
-            // 启动前几秒优先让 UI、恢复与缓存任务跑完，更新检查延后到用户已可稳定交互之后。
-            do {
-                try await Task.sleep(nanoseconds: 12_000_000_000)
-            } catch {
-                return
-            }
-            await runUpdateCheck(currentVersion: currentVersion, markLaunchChecked: true)
+        playlistManager.currentIndex = index
+        playlistManager.savePlaylist()
+        audioPlayer.prepareInitialSeekForRestore(to: time, for: url)
+        if let file = playlistManager.selectFile(at: index) {
+            audioPlayer.play(file, autostart: false, bypassConfirm: true)
         }
     }
 
-    @MainActor
-    private func manualCheckForUpdates() {
-        updateCheckTask?.cancel()
-        updateCheckTask = nil
+    private func handleShowAppToast(_ notification: Notification) {
+        guard let userInfo = notification.userInfo else { return }
 
-        let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "4.0.0"
-        showToastMessage("正在检查更新…", kind: .update, duration: 2.0)
-        updateCheckTask = Task(priority: .userInitiated) {
-            await runUpdateCheck(currentVersion: currentVersion, markLaunchChecked: true)
-        }
+        let title = (userInfo["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let subtitle = (userInfo["subtitle"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let duration = (userInfo["duration"] as? TimeInterval) ?? 2.8
+        let tapURL =
+            (userInfo["url"] as? URL)
+            ?? ((userInfo["url"] as? String).flatMap { URL(string: $0) })
+        let kindRaw = (userInfo["kind"] as? String) ?? "info"
+        let kind = ToastKind(rawValue: kindRaw) ?? .info
+
+        guard !title.isEmpty else { return }
+        toastState.show(title, subtitle: subtitle, kind: kind, duration: duration, tapURL: tapURL)
     }
 
-    private func runUpdateCheck(currentVersion: String, markLaunchChecked: Bool) async {
-        if Task.isCancelled { return }
-        let outcome = await UpdateChecker.shared.check(currentVersion: currentVersion)
-        if Task.isCancelled { return }
-        await MainActor.run {
-            if markLaunchChecked {
-                didAutoCheckForUpdatesThisLaunch = true
-            }
-            updateCheckTask = nil
-            switch outcome {
-            case .updateAvailable(let info):
-                if info.assetURL != nil {
-                    if info.checksumAssetURL != nil {
-                        showToastMessage(
-                            "发现新版本 \(info.latestVersion)",
-                            subtitle: "点击自动更新（下载并校验后安装）",
-                            kind: .update,
-                            duration: 10.0,
-                            tapUpdate: info
-                        )
-                    } else {
-                        showToastMessage(
-                            "发现新版本 \(info.latestVersion)",
-                            subtitle: "未找到 SHA256 校验文件，点击打开 Releases 手动下载",
-                            kind: .warning,
-                            duration: 10.0,
-                            tapURL: info.releaseURL
-                        )
-                    }
-                } else {
-                    showToastMessage(
-                        "发现新版本 \(info.latestVersion)",
-                        subtitle: "点击打开 GitHub Releases 下载",
-                        kind: .update,
-                        duration: 10.0,
-                        tapURL: info.releaseURL
-                    )
-                }
-            case .upToDate(let current, let latest, let url):
-                if latest == current {
-                    showToastMessage("已是最新版本 \(current)", kind: .success, duration: 2.0, tapURL: url)
-                } else {
-                    showToastMessage("已是最新版本 \(current)", subtitle: "线上最新：\(latest)", kind: .success, duration: 2.0, tapURL: url)
-                }
-            case .failed(let message, let url):
-                showToastMessage(message, subtitle: "点击打开 GitHub Releases", kind: .warning, duration: 2.0, tapURL: url)
-            }
-        }
-    }
-    
     private func handleGlobalDrop(providers: [NSItemProvider]) {
         Task {
             let urls: [URL] = await withTaskGroup(of: URL?.self) { group in
@@ -314,9 +274,7 @@ struct ContentView: View {
                 }
                 var results: [URL] = []
                 for await url in group {
-                    if let url {
-                        results.append(url)
-                    }
+                    if let url { results.append(url) }
                 }
                 return results
             }
@@ -325,175 +283,5 @@ struct ContentView: View {
                 playlistManager.enqueueAddFiles(urls)
             }
         }
-    }
-
-    @MainActor
-    private func showToastMessage(
-        _ message: String,
-        subtitle: String? = nil,
-        kind: ToastKind = .info,
-        duration: TimeInterval = 2.8,
-        tapURL: URL? = nil,
-        tapUpdate: UpdateChecker.UpdateInfo? = nil
-    ) {
-        toastTask?.cancel()
-        toastTitle = message
-        toastSubtitle = subtitle
-        toastKind = kind
-        toastTapURL = tapURL
-        toastTapUpdate = tapUpdate
-        withAnimation(.easeInOut(duration: 0.2)) {
-            showToast = true
-        }
-        toastTask = Task {
-            try? await Task.sleep(nanoseconds: UInt64(max(0, duration) * 1_000_000_000))
-            await MainActor.run {
-                dismissToast()
-            }
-        }
-    }
-
-    @MainActor
-    private func dismissToast() {
-        toastTask?.cancel()
-        toastTask = nil
-        toastTapURL = nil
-        toastTapUpdate = nil
-        withAnimation(.easeInOut(duration: 0.2)) {
-            showToast = false
-        }
-    }
-
-    @MainActor
-    private func startSelfUpdate(_ info: UpdateChecker.UpdateInfo) async {
-        showToastMessage(
-            "正在下载并安装 \(info.latestVersion)…",
-            subtitle: "将自动覆盖安装到 /Applications 并重启",
-            kind: .update,
-            duration: 60.0
-        )
-        do {
-            try await SelfUpdater.shared.startUpdateIfPossible(info: info)
-        } catch {
-            showToastMessage(
-                "自动更新失败",
-                subtitle: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription,
-                kind: .error,
-                duration: 4.0,
-                tapURL: info.releaseURL
-            )
-        }
-    }
-}
-
-private enum ToastKind: String, Sendable {
-    case info
-    case success
-    case warning
-    case error
-    case update
-}
-
-private struct ToastBanner: View {
-    let title: String
-    let subtitle: String?
-    let kind: ToastKind
-    let onTap: (() -> Void)?
-    let onClose: () -> Void
-
-    @Environment(\.colorScheme) private var colorScheme
-    private var theme: AppTheme { AppTheme(scheme: colorScheme) }
-
-    var body: some View {
-        ZStack(alignment: .topTrailing) {
-            contentBody
-
-            Button(action: onClose) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundColor(theme.mutedText)
-                    .padding(10)
-            }
-            .buttonStyle(PlainButtonStyle())
-            .help("关闭")
-        }
-        .background(backgroundShape)
-        .clipShape(RoundedRectangle(cornerRadius: 14))
-        .shadow(color: theme.subtleShadow, radius: 14, x: 0, y: 8)
-        .fixedSize(horizontal: false, vertical: true)
-    }
-
-    private var bannerContent: some View {
-        HStack(alignment: .top, spacing: 12) {
-            RoundedRectangle(cornerRadius: 2)
-                .fill(indicatorStyle)
-                .frame(width: 4)
-                .padding(.vertical, 2)
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundColor(theme.stagePrimaryText)
-                    .lineLimit(2)
-
-                if let subtitle, !subtitle.isEmpty {
-                    Text(subtitle)
-                        .font(.system(size: 13))
-                        .foregroundColor(theme.mutedText)
-                        .lineLimit(2)
-                }
-            }
-
-            Spacer(minLength: 0)
-        }
-        .padding(.leading, 14)
-        .padding(.trailing, 30)
-        .padding(.vertical, 14)
-        .frame(minWidth: 320, maxWidth: 420, alignment: .leading)
-    }
-
-    private var contentBody: some View {
-        Group {
-            if let onTap {
-                Button(action: onTap) { bannerContent }
-                    .buttonStyle(PlainButtonStyle())
-                    .help("点击打开")
-            } else {
-                bannerContent
-            }
-        }
-        .contentShape(RoundedRectangle(cornerRadius: 14))
-    }
-
-    private var indicatorStyle: AnyShapeStyle {
-        switch kind {
-        case .update:
-            return AnyShapeStyle(theme.accent)
-        case .success:
-            return AnyShapeStyle(theme.success)
-        case .error:
-            return AnyShapeStyle(theme.destructive)
-        case .warning:
-            return AnyShapeStyle(theme.warning)
-        case .info:
-            return AnyShapeStyle(theme.info)
-        }
-    }
-
-    private var backgroundShape: some View {
-        RoundedRectangle(cornerRadius: 14)
-            .fill(backgroundFill)
-            .overlay(
-                RoundedRectangle(cornerRadius: 14)
-                    .stroke(borderColor, lineWidth: 1)
-            )
-    }
-
-    private var backgroundFill: Color {
-        theme.elevatedSurface
-    }
-
-    private var borderColor: Color {
-        theme.stroke
     }
 }

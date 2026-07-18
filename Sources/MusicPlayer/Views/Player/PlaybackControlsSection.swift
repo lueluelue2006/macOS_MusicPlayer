@@ -1,23 +1,23 @@
 import SwiftUI
 
-struct PlaybackControlsView: View {
-  @ObservedObject var audioPlayer: AudioPlayer
-  @ObservedObject var playlistManager: PlaylistManager
+struct PlaybackControlsSection: View {
+  @ObservedObject var viewModel: PlayerViewModel
   @Environment(\.colorScheme) private var colorScheme
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
-  private var isEphemeralPlayback: Bool { audioPlayer.persistPlaybackState == false }
+
+  private var isEphemeralPlayback: Bool { viewModel.audioPlayer.persistPlaybackState == false }
   private var playbackModeBinding: Binding<AudioPlayer.PlaybackMode> {
     Binding(
-      get: { audioPlayer.playbackMode },
-      set: { audioPlayer.setPlaybackMode($0) }
+      get: { viewModel.audioPlayer.playbackMode },
+      set: { viewModel.audioPlayer.setPlaybackMode($0) }
     )
   }
 
   var body: some View {
-    let playableCount = playlistManager.playbackScopePlayableCount()
+    let playableCount = viewModel.playlistManager.playbackScopePlayableCount()
     let canChangeTrack = playableCount > 0 && !isEphemeralPlayback
-    let isPlaybackActive = audioPlayer.isPlaybackRequested || audioPlayer.isPlaying
-    let canTogglePlayback = audioPlayer.canTogglePlayback
+    let isPlaybackActive = viewModel.audioPlayer.isPlaybackRequested || viewModel.audioPlayer.isPlaying
+    let canTogglePlayback = viewModel.audioPlayer.canTogglePlayback
 
     HStack(spacing: 0) {
       PlaybackModeToggle(
@@ -35,10 +35,10 @@ struct PlaybackControlsView: View {
           isDisabled: !canChangeTrack,
           help: "上一首"
         ) {
-          previousTrack()
+          viewModel.playPrevious()
         }
 
-        Button(action: togglePlayback) {
+        Button(action: { viewModel.togglePlayPause() }) {
           ZStack {
             Circle()
               .fill(theme.accent)
@@ -62,7 +62,7 @@ struct PlaybackControlsView: View {
           isDisabled: !canChangeTrack,
           help: "下一首"
         ) {
-          nextTrack()
+          viewModel.playNext()
         }
       }
 
@@ -72,32 +72,14 @@ struct PlaybackControlsView: View {
         systemName: "infinity",
         accessibilityLabel: "沉浸播放",
         isOn: Binding(
-          get: { audioPlayer.isImmersivePlaybackEnabled },
-          set: { audioPlayer.setImmersivePlaybackEnabled($0) }
+          get: { viewModel.audioPlayer.isImmersivePlaybackEnabled },
+          set: { viewModel.audioPlayer.setImmersivePlaybackEnabled($0) }
         ),
         help: "沉浸播放：自动跳过歌曲前后的静音，让下一首更快接上"
       )
       .frame(width: 76)
     }
     .frame(maxWidth: .infinity)
-  }
-
-  private func togglePlayback() {
-    audioPlayer.togglePlayPause()
-  }
-
-  private func nextTrack() {
-    guard !isEphemeralPlayback else { return }
-    if let nextFile = playlistManager.nextFile(isShuffling: audioPlayer.isShuffling) {
-      audioPlayer.play(nextFile)
-    }
-  }
-
-  private func previousTrack() {
-    guard !isEphemeralPlayback else { return }
-    if let previousFile = playlistManager.previousFile(isShuffling: audioPlayer.isShuffling) {
-      audioPlayer.play(previousFile)
-    }
   }
 }
 
@@ -285,7 +267,7 @@ private struct TransportIconToggle: View {
   }
 }
 
-private struct TransportIconButton: View {
+struct TransportIconButton: View {
   let systemName: String
   var size: CGFloat = 15
   var isActive: Bool = false
@@ -317,75 +299,9 @@ private struct TransportIconButton: View {
   }
 }
 
-private struct TransportPressButtonStyle: ButtonStyle {
+struct TransportPressButtonStyle: ButtonStyle {
   func makeBody(configuration: Configuration) -> some View {
     configuration.label
       .opacity(configuration.isPressed ? 0.62 : 1)
-  }
-}
-
-struct AudioControlsView: View {
-  @ObservedObject var audioPlayer: AudioPlayer
-  @Environment(\.colorScheme) private var colorScheme
-  private var theme: AppTheme { AppTheme(scheme: colorScheme) }
-
-  var body: some View {
-    HStack(spacing: 10) {
-      Image(systemName: volumeIconName)
-        .font(.system(size: 12, weight: .medium))
-        .foregroundStyle(theme.stageSecondaryText)
-        .frame(width: 18)
-
-      Slider(
-        value: Binding(
-          get: { Double(audioPlayer.volume) },
-          set: { audioPlayer.setVolume(Float($0)) }
-        ),
-        in: 0...1
-      )
-      .controlSize(.small)
-      .tint(theme.accent)
-      .accessibilityLabel("音量")
-      .accessibilityValue("\(Int(audioPlayer.volume * 100))%")
-
-      Text("\(Int(audioPlayer.volume * 100))%")
-        .font(.system(size: 10, weight: .medium))
-        .foregroundStyle(theme.stageTertiaryText)
-        .monospacedDigit()
-        .frame(width: 30, alignment: .trailing)
-
-      Rectangle()
-        .fill(theme.stroke)
-        .frame(width: 1, height: 20)
-        .padding(.horizontal, 3)
-
-      Button {
-        audioPlayer.toggleNormalization()
-      } label: {
-        Image(systemName: "waveform.badge.magnifyingglass")
-          .font(.system(size: 14, weight: .medium))
-          .foregroundStyle(
-            audioPlayer.isNormalizationEnabled ? theme.accent : theme.stageSecondaryText
-          )
-          .frame(width: 28, height: 28)
-          .contentShape(Rectangle())
-      }
-      .buttonStyle(TransportPressButtonStyle())
-      .help(audioPlayer.isNormalizationEnabled ? "音量均衡已开启" : "音量均衡已关闭")
-      .accessibilityLabel("音量均衡")
-      .accessibilityValue(audioPlayer.isNormalizationEnabled ? "已开启" : "已关闭")
-    }
-  }
-
-  private var volumeIconName: String {
-    if audioPlayer.volume == 0 {
-      return "speaker.slash.fill"
-    } else if audioPlayer.volume < 0.33 {
-      return "speaker.wave.1.fill"
-    } else if audioPlayer.volume < 0.66 {
-      return "speaker.wave.2.fill"
-    } else {
-      return "speaker.wave.3.fill"
-    }
   }
 }
