@@ -29,17 +29,23 @@ and perpetual motion.
 ## Composition
 
 - At 980 points and wider, use one asymmetric split: a 430–540 point listening
-  stage and a flexible library. Narrower windows stack the two regions.
+  stage and a flexible library. Narrower windows stack the two regions when at
+  least 700 points tall; shorter windows show one region at a time behind a
+  compact “正在播放 / 音乐库” switch so neither workflow is crushed.
 - The current cover is the dominant object. It receives the only large shadow
   and a subtle sleeve/backing layer made from static vector shapes.
 - The left-side reading order is orientation, sleeve, song identity, progress,
-  playback utilities, transport, volume, next-up preview, lyrics, and output.
+  playback utilities, next-up preview, and lyrics. Transport, volume, and output
+  remain in a pinned listening dock so they never scroll out of reach.
 - The right-side reading order is collection title, panel tabs/actions, search,
   selected-playlist identity, column labels, and track index.
 - A playlist has one identity cover shared by its header and sidebar row. The
   four built-in artist playlists use bundled editorial portraits; any playlist
   can override its cover with a local image, and the vector monogram remains the
   fallback. Track rows never decode or display artwork.
+- When the playlist detail cannot fit beside the 188-point directory, the same
+  playlist identities move into one horizontally scrollable strip above the
+  detail. This is a responsive rearrangement, not another navigation model.
 - Built-in artist portraits use face-led crops that remain recognizable at 32
   points. Their visual identities stay deliberately separate: mature 2024–25-era
   Yang Kun in copper stage light, formal emerald for Fei Yu-ching, electric
@@ -92,6 +98,9 @@ and perpetual motion.
   the same enabled/disabled color semantics.
 - **Transport:** previous, play/pause, and next stay centered. Only play/pause is
   a solid primary circle.
+- **Listening dock:** transport, volume, and current output are always reachable
+  at the bottom of the listening stage. The dock uses one fine top rule and a
+  tonal surface step; it is not a floating card or translucent material.
 - **Random weight:** every current-track and track-row picker permanently shows
   six independent squares for 0.5×, 1.0×, 1.6×, 3.2×, 4.8×, and 6.4×. The
   second level is the default. Picker padding and gaps never trigger playback.
@@ -108,8 +117,9 @@ and perpetual motion.
 
 - Keep SwiftUI, AppKit, AVFoundation, CoreAudio, SF Symbols, and native control
   semantics. Add no UI, animation, image, or typography dependency.
-- Keep lazy row creation and stable path-based identity. Never wrap an entire
-  track row around its weight or management controls.
+- Keep lazy row creation and stable path-based identity; displayed numbering is
+  never row identity. Never wrap an entire track row around its weight or
+  management controls.
 - Use only downsampled artwork. Current-track artwork stays capped at 600 pixels;
   playlist covers decode on demand at their display size, with a 16-item / 8 MiB
   cache. Custom cover imports are normalized once to at most 1,024 pixels. Do no
@@ -124,8 +134,9 @@ and perpetual motion.
 
 ## Visual QA
 
-Verify light and dark appearance, wide and stacked layouts, long Chinese titles,
-real and fallback artwork, empty and large collections, row hover/focus, six
-weight hit regions, shuffle/repeat switching, immersion state, lyrics follow,
-and Reduce Motion. Capture the real app through its built-in screenshot command
-and compare it against the three approved mockups before release.
+Verify light and dark appearance; 600×400 compact, 760×700 stacked, 979/980-point
+boundary, and wide layouts; long Chinese titles; real and fallback artwork;
+empty and large collections; row hover/focus; six weight hit regions;
+shuffle/repeat switching; immersion state; lyrics follow; and Reduce Motion.
+Capture the real app through its built-in screenshot command and compare it
+against the three approved mockups before release.

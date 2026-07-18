@@ -77,6 +77,7 @@ struct SyncedLyricsView: View {
   @State private var activeLineID: Int? = nil
 
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
   var body: some View {
@@ -85,9 +86,7 @@ struct SyncedLyricsView: View {
         HStack(spacing: 8) {
           Button {
             if let activeLineID {
-              withAnimation(.easeInOut(duration: 0.25)) {
-                proxy.scrollTo(activeLineID, anchor: .center)
-              }
+              scrollToLine(activeLineID, using: proxy)
             }
             autoFollowEnabled = true
             isUserScrolling = false
@@ -111,7 +110,7 @@ struct SyncedLyricsView: View {
                 if isEnabled {
                   isUserScrolling = false
                   if let activeLineID {
-                    proxy.scrollTo(activeLineID, anchor: .center)
+                    scrollToLine(activeLineID, using: proxy)
                   }
                 }
               }
@@ -192,9 +191,7 @@ struct SyncedLyricsView: View {
           guard autoFollowEnabled, let id = newActiveLineID else { return }
           if id != lastScrolledLineID {
             lastScrolledLineID = id
-            withAnimation(.easeInOut(duration: 0.25)) {
-              proxy.scrollTo(id, anchor: .center)
-            }
+            scrollToLine(id, using: proxy)
           }
         }
         .onAppear {
@@ -208,6 +205,16 @@ struct SyncedLyricsView: View {
       }
     }
     .frame(maxWidth: .infinity, minHeight: 180, maxHeight: 260)
+  }
+
+  private func scrollToLine(_ id: Int, using proxy: ScrollViewProxy) {
+    if reduceMotion {
+      proxy.scrollTo(id, anchor: .center)
+    } else {
+      withAnimation(.easeInOut(duration: 0.25)) {
+        proxy.scrollTo(id, anchor: .center)
+      }
+    }
   }
 
   private func activeLineIDForTime(_ time: TimeInterval) -> Int? {

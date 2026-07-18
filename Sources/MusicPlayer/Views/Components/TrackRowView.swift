@@ -15,6 +15,7 @@ struct TrackRowView: View {
   var weightScopeLabel: String = "歌单"
   @State private var isHovered = false
   @State private var isPlaybackRegionHovered = false
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
@@ -25,84 +26,84 @@ struct TrackRowView: View {
         .frame(width: 3, height: 34)
         .padding(.trailing, 11)
 
-      HStack(spacing: 11) {
-        Button {
-          playAction(file)
-        } label: {
-          HStack(spacing: 11) {
-            Group {
-              if unplayableReason != nil {
-                Image(systemName: "exclamationmark.triangle.fill")
-                  .font(.system(size: 11, weight: .semibold))
-              } else if isPlaybackRegionHovered {
-                Image(systemName: "play.fill")
-                  .font(.system(size: 11, weight: .semibold))
-              } else {
-                Text(String(format: "%02d", trackNumber))
-                  .font(.system(size: 11, weight: .medium, design: .rounded))
-                  .monospacedDigit()
-              }
+      Button {
+        playAction(file)
+      } label: {
+        HStack(spacing: 11) {
+          Group {
+            if unplayableReason != nil {
+              Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11, weight: .semibold))
+            } else if isPlaybackRegionHovered {
+              Image(systemName: "play.fill")
+                .font(.system(size: 11, weight: .semibold))
+            } else {
+              Text(String(format: "%02d", trackNumber))
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .monospacedDigit()
             }
-            .foregroundStyle(leadingColor)
-            .frame(width: 24, height: 24)
-
-            VStack(alignment: .leading, spacing: 3) {
-              HStack(spacing: 7) {
-                Text(highlightedText(file.metadata.title, searchText: searchText))
-                  .font(.system(size: 13, weight: .semibold))
-                  .lineLimit(1)
-                  .foregroundStyle(unplayableReason == nil ? Color.primary : Color.secondary)
-
-                if isVolumeAnalyzed {
-                  Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(theme.mutedText.opacity(0.72))
-                    .help("音量均衡已分析")
-                    .accessibilityLabel("音量均衡已分析")
-                }
-              }
-
-              Text(
-                "\(highlightedText(file.metadata.artist, searchText: searchText)) · \(highlightedText(file.metadata.album, searchText: searchText))"
-              )
-              .font(.system(size: 11))
-              .foregroundColor(theme.mutedText)
-              .lineLimit(1)
-              .help(file.url.lastPathComponent)
-            }
-
-            Spacer(minLength: 10)
           }
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(trackAccessibilityLabel)
-        .accessibilityHint(unplayableReason.map { "不可播放：\($0)" } ?? "播放歌曲")
-        .accessibilityAddTraits(isCurrentTrack ? .isSelected : [])
-        .onHover { hovering in
-          isPlaybackRegionHovered = hovering
-        }
+          .foregroundStyle(leadingColor)
+          .frame(width: 24, height: 24)
 
-        WeightBlocksCompact(
-          level: weightLevel,
-          scopeLabel: weightScopeLabel,
-          itemLabel: file.metadata.title
-        ) { newLevel in
-          onWeightSelect(newLevel)
-        }
-        .padding(.horizontal, 4)
-        .fixedSize(horizontal: true, vertical: true)
-        .layoutPriority(2)
+          VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 7) {
+              Text(highlightedText(file.metadata.title, searchText: searchText))
+                .font(.system(size: 13, weight: .semibold))
+                .lineLimit(1)
+                .foregroundStyle(
+                  unplayableReason == nil ? theme.stagePrimaryText : theme.stageSecondaryText
+                )
 
-        Text(durationLabel)
-          .font(.system(size: 11, weight: .medium))
-          .monospacedDigit()
-          .foregroundColor(theme.mutedText.opacity(file.duration == nil ? 0.55 : 0.9))
-          .frame(width: 42, alignment: .trailing)
-          .accessibilityLabel(file.duration == nil ? "时长加载中" : "时长 \(durationLabel)")
+              if isVolumeAnalyzed {
+                Image(systemName: "checkmark.circle.fill")
+                  .font(.system(size: 9, weight: .semibold))
+                  .foregroundStyle(theme.stageTertiaryText)
+                  .help("音量均衡已分析")
+                  .accessibilityLabel("音量均衡已分析")
+              }
+            }
+
+            Text(
+              "\(highlightedText(file.metadata.artist, searchText: searchText)) · \(highlightedText(file.metadata.album, searchText: searchText))"
+            )
+            .font(.system(size: 11))
+            .foregroundStyle(theme.stageSecondaryText)
+            .lineLimit(1)
+            .help(file.url.lastPathComponent)
+          }
+
+          Spacer(minLength: 10)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
       }
-      .frame(maxWidth: .infinity, alignment: .leading)
+      .buttonStyle(.plain)
+      .accessibilityLabel(trackAccessibilityLabel)
+      .accessibilityHint(unplayableReason.map { "不可播放：\($0)" } ?? "播放歌曲")
+      .accessibilityAddTraits(isCurrentTrack ? .isSelected : [])
+      .onHover { hovering in
+        isPlaybackRegionHovered = hovering
+      }
+
+      // Keep the complete picker column, including all inter-button gaps,
+      // outside the playback button's hit region and aligned with its header.
+      WeightBlocksView(
+        level: weightLevel,
+        scopeLabel: weightScopeLabel,
+        itemLabel: file.metadata.title
+      ) { newLevel in
+        onWeightSelect(newLevel)
+      }
+      .frame(width: 116, alignment: .center)
+      .layoutPriority(2)
+
+      Text(durationLabel)
+        .font(.system(size: 11, weight: .medium))
+        .monospacedDigit()
+        .foregroundStyle(theme.stageSecondaryText.opacity(file.duration == nil ? 0.55 : 0.9))
+        .frame(width: 42, alignment: .trailing)
+        .accessibilityLabel(file.duration == nil ? "时长加载中" : "时长 \(durationLabel)")
 
       HStack(spacing: 2) {
         Button(action: { editAction(file) }) {
@@ -126,10 +127,10 @@ struct TrackRowView: View {
         .buttonStyle(.plain)
         .help("从列表移除")
       }
-      .padding(.leading, 4)
+      .frame(width: 66, alignment: .trailing)
       .opacity(isHovered ? 1 : 0)
       .allowsHitTesting(isHovered)
-      .animation(AppTheme.smoothTransition, value: isHovered)
+      .animation(reduceMotion ? nil : AppTheme.smoothTransition, value: isHovered)
     }
     .padding(.horizontal, 8)
     .frame(minHeight: 54)
@@ -258,7 +259,7 @@ struct TrackRowView: View {
       if let attributedRange = Range(nsRange, in: attributedString) {
         attributedString[attributedRange].backgroundColor = theme.accent.opacity(
           theme.scheme == .dark ? 0.28 : 0.18)
-        attributedString[attributedRange].foregroundColor = Color.primary
+        attributedString[attributedRange].foregroundColor = theme.stagePrimaryText
       }
     }
 

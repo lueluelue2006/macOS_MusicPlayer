@@ -8,6 +8,7 @@ struct PlaylistsPanel: View {
   @ObservedObject var playlistsStore: PlaylistsStore
 
   let locateNowPlayingRequestID: Int
+  let isCompactRoot: Bool
   let onRequestEditMetadata: (AudioFile) -> Void
 
   @ObservedObject private var weights = PlaybackWeights.shared
@@ -34,6 +35,7 @@ struct PlaylistsPanel: View {
   @State private var addFromQueueSelectedKeys: Set<String> = []
 
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
   private var selectedPlaylist: UserPlaylist? {
@@ -51,18 +53,22 @@ struct PlaylistsPanel: View {
   }
 
   var body: some View {
-    HStack(spacing: 22) {
-      playlistsSidebar
-        .frame(width: 188)
+    Group {
+      if isCompactRoot {
+        compactPlaylistLayout
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else {
+        ViewThatFits(in: .horizontal) {
+          widePlaylistLayout
+            .frame(minWidth: 660, maxWidth: .infinity, maxHeight: .infinity)
 
-      Rectangle()
-        .fill(theme.paneDivider)
-        .frame(width: 1)
-
-      playlistDetail
+          compactPlaylistLayout
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+      }
     }
-    .padding(.horizontal, 24)
-    .padding(.bottom, 16)
+    .padding(.horizontal, isCompactRoot ? 16 : 24)
+    .padding(.bottom, isCompactRoot ? 8 : 16)
     .sheet(isPresented: $showAddFromQueueSheet) {
       addFromQueueSheet
     }
@@ -71,6 +77,12 @@ struct PlaylistsPanel: View {
       reloadSelectedPlaylist()
       refreshVisibleTracks()
       handlePendingLocateNowPlayingRequest()
+    }
+    .onDisappear {
+      loadTask?.cancel()
+      loadTask = nil
+      playlistScrollTask?.cancel()
+      playlistScrollTask = nil
     }
     .onChange(of: playlistsStore.selectedPlaylistID) { _ in
       reloadSelectedPlaylist()
@@ -101,23 +113,37 @@ struct PlaylistsPanel: View {
     }
   }
 
+  private var widePlaylistLayout: some View {
+    HStack(spacing: 22) {
+      playlistsSidebar
+        .frame(width: 188)
+
+      Rectangle()
+        .fill(theme.paneDivider)
+        .frame(width: 1)
+
+      playlistDetail
+    }
+  }
+
+  private var compactPlaylistLayout: some View {
+    VStack(alignment: .leading, spacing: isCompactRoot ? 8 : 12) {
+      compactPlaylistsStrip
+
+      Rectangle()
+        .fill(theme.paneDivider)
+        .frame(height: 1)
+
+      playlistDetail
+    }
+  }
+
   private var playlistsSidebar: some View {
     VStack(alignment: .leading, spacing: 12) {
       HStack {
         EditorialSectionLabel(index: "A", title: "歌单目录")
         Spacer()
-        Button {
-          importM3U8Playlist()
-        } label: {
-          Image(systemName: "square.and.arrow.down")
-            .font(.system(size: 11))
-            .frame(width: 28, height: 28)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(!playlistsStore.isReady)
-        .help("导入 M3U8 歌单")
-        .accessibilityLabel("导入 M3U8 歌单")
+        importPlaylistButton
       }
 
       if !playlistsStore.isReady {
@@ -200,23 +226,7 @@ struct PlaylistsPanel: View {
             .listRowSeparator(.hidden)
             .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
             .contextMenu {
-              Button("设置歌单封面…") {
-                choosePlaylistArtwork(playlist)
-              }
-              Button("恢复默认封面") {
-                resetPlaylistArtwork(playlist)
-              }
-              Divider()
-              Button("重命名…") {
-                renamePlaylist(playlist)
-              }
-              Button("导出 M3U8…") {
-                exportPlaylistAsM3U8(playlist)
-              }
-              Divider()
-              Button("删除歌单", role: .destructive) {
-                deletePlaylist(playlist)
-              }
+              playlistContextMenu(for: playlist)
             }
           }
         }
@@ -227,189 +237,348 @@ struct PlaylistsPanel: View {
     }
   }
 
+  private var compactPlaylistsStrip: some View {
+    VStack(alignment: .leading, spacing: isCompactRoot ? 4 : 8) {
+      HStack {
+        EditorialSectionLabel(index: "A", title: "歌单目录")
+        Spacer()
+        importPlaylistButton
+      }
+
+      if !playlistsStore.isReady {
+        HStack(spacing: 8) {
+          ProgressView()
+            .controlSize(.small)
+          Text("正在加载歌单…")
+            .font(.caption)
+            .foregroundColor(theme.mutedText)
+        }
+        .frame(height: isCompactRoot ? 42 : 56)
+      } else if playlistsStore.playlists.isEmpty {
+        Text("还没有歌单，点击上方“新建”开始使用。")
+          .font(.caption)
+          .foregroundColor(theme.mutedText)
+          .frame(height: isCompactRoot ? 42 : 56, alignment: .leading)
+      } else {
+        ScrollView(.horizontal, showsIndicators: false) {
+          LazyHStack(spacing: 8) {
+            ForEach(playlistsStore.playlists) { playlist in
+              compactPlaylistButton(for: playlist)
+            }
+          }
+          .padding(.vertical, 1)
+        }
+        .frame(height: isCompactRoot ? 44 : 58)
+      }
+    }
+  }
+
+  private var importPlaylistButton: some View {
+    Button {
+      importM3U8Playlist()
+    } label: {
+      Image(systemName: "square.and.arrow.down")
+        .font(.system(size: 11))
+        .frame(width: 28, height: 28)
+        .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .disabled(!playlistsStore.isReady)
+    .help("导入 M3U8 歌单")
+    .accessibilityLabel("导入 M3U8 歌单")
+  }
+
+  private func compactPlaylistButton(for playlist: UserPlaylist) -> some View {
+    let isSelected = playlistsStore.selectedPlaylistID == playlist.id
+    let isActive = audioPlayer.playbackTargetURL != nil
+      && audioPlayer.persistPlaybackState
+      && playlistManager.playbackScope == .playlist(playlist.id)
+    let artworkSize: CGFloat = isCompactRoot ? 34 : 42
+    let buttonWidth: CGFloat = isCompactRoot ? 142 : 156
+    let buttonHeight: CGFloat = isCompactRoot ? 44 : 56
+
+    return Button {
+      playlistsStore.selectedPlaylistID = playlist.id
+    } label: {
+      HStack(spacing: 8) {
+        PlaylistArtworkView(
+          playlist: playlist,
+          isActive: isActive,
+          targetPixelSize: isCompactRoot ? 72 : 96,
+          revision: artworkRevisions[playlist.id] ?? 0
+        )
+        .frame(width: artworkSize, height: artworkSize)
+
+        VStack(alignment: .leading, spacing: 3) {
+          Text(playlist.name)
+            .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+            .foregroundStyle(theme.stagePrimaryText)
+            .lineLimit(1)
+          Text("\(playlist.tracks.count) 首")
+            .font(.system(size: 10))
+            .foregroundColor(theme.stageTertiaryText)
+        }
+
+        Spacer(minLength: 0)
+
+        if isActive {
+          ActivePlaybackScopeIndicator(
+            systemName: audioPlayer.isLooping ? "repeat" : "shuffle",
+            isPlaying: audioPlayer.isPlaying
+          )
+        }
+      }
+      .padding(.horizontal, 7)
+      .frame(width: buttonWidth, height: buttonHeight, alignment: .leading)
+      .background(
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+          .fill(isSelected ? theme.selectedSurface : theme.surface)
+      )
+      .overlay {
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+          .stroke(isSelected ? theme.accent.opacity(0.65) : theme.stroke, lineWidth: 1)
+      }
+      .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+    .buttonStyle(.plain)
+    .accessibilityLabel("\(playlist.name)，\(playlist.tracks.count) 首")
+    .accessibilityAddTraits(isSelected ? .isSelected : [])
+    .contextMenu {
+      playlistContextMenu(for: playlist)
+    }
+  }
+
+  @ViewBuilder
+  private func playlistContextMenu(for playlist: UserPlaylist) -> some View {
+    Button("设置歌单封面…") {
+      choosePlaylistArtwork(playlist)
+    }
+    Button("恢复默认封面") {
+      resetPlaylistArtwork(playlist)
+    }
+    Divider()
+    Button("重命名…") {
+      renamePlaylist(playlist)
+    }
+    Button("导出 M3U8…") {
+      exportPlaylistAsM3U8(playlist)
+    }
+    Divider()
+    Button("删除歌单", role: .destructive) {
+      deletePlaylist(playlist)
+    }
+  }
+
   @ViewBuilder
   private var playlistDetail: some View {
     if let playlist = selectedPlaylist {
-      VStack(alignment: .leading, spacing: 14) {
-        header(for: playlist)
-
-        SearchBarView(
-          searchText: $trackSearchText,
-          onSearchChanged: { q in
-            trackSearchText = q
-          }, focusTarget: .playlists)
-
-        if !trackSearchText.isEmpty {
-          HStack {
-            Text("找到 \(visibleTracks.count) / \(loadedTracks.count) 首歌曲")
-              .font(.caption)
-              .foregroundColor(.secondary)
-            Spacer()
-          }
-        }
-
-        if !isLoadingTracks && !visibleTracks.isEmpty {
-          TrackListColumnHeader()
-        }
-
-        ScrollViewReader { proxy in
-          Group {
-            if isLoadingTracks {
-              VStack(spacing: 10) {
-                ProgressView()
-                Text("加载歌单…")
-                  .font(.caption)
-                  .foregroundColor(theme.mutedText)
-              }
-              .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if visibleTracks.isEmpty {
-              VStack(spacing: 10) {
-                Text(playlist.tracks.isEmpty ? "歌单为空" : "未找到匹配歌曲")
-                  .font(.subheadline)
-                  .foregroundColor(theme.mutedText)
-                Text(playlist.tracks.isEmpty ? "可在右上角点击“从队列添加”。" : "试试更短的关键词。")
-                  .font(.caption)
-                  .foregroundColor(theme.mutedText.opacity(0.9))
-              }
-              .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-              List {
-                ForEach(visibleTracks.indices, id: \.self) { index in
-                  let file = visibleTracks[index]
-                  TrackRowView(
-                  trackNumber: index + 1,
-                  file: file,
-                  isCurrentTrack: currentHighlightedURL == file.url,
-                  isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
-                  unplayableReason: trackUnplayableReasons[pathKey(file.url)],
-                  searchText: trackSearchText,
-                  playAction: { selectedFile in
-                    NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                    playTrackInPlaylist(selectedFile, playlist: playlist)
-                  },
-                  deleteAction: { fileToDelete in
-                    NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                    playlistsStore.removeTrack(path: fileToDelete.url.path, from: playlist.id)
-                    reloadSelectedPlaylist()
-                  },
-                  editAction: { fileToEdit in
-                    NotificationCenter.default.post(name: .blurSearchField, object: nil)
-                    if trackUnplayableReasons[pathKey(fileToEdit.url)] != nil {
-                      postToast(
-                        title: "文件不存在，无法编辑", subtitle: fileToEdit.url.lastPathComponent,
-                        kind: "warning")
-                      return
-                    }
-                    onRequestEditMetadata(fileToEdit)
-                  },
-                  weightLevel: weights.level(for: file.url, scope: .playlist(playlist.id)),
-                  onWeightSelect: { newLevel in
-                    let result = weights.setLevel(newLevel, for: file.url, scope: .playlist(playlist.id))
-                    WeightCommands.handleSetWeightResult(result)
-                  }
-                )
-                  .id(file.id)
-                  .listRowBackground(Color.clear)
-                  .listRowSeparator(.hidden)
-                  .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-                }
-              }
-              .listStyle(PlainListStyle())
-              .scrollContentBackground(.hidden)
-              .background(Color.clear)
-              .background(
-                ListTableViewAccessor { tableView in
-                  let currentID = playlistTableView.map(ObjectIdentifier.init)
-                  let newID = tableView.map(ObjectIdentifier.init)
-                  if currentID != newID {
-                    playlistTableView = tableView
-                  }
-                }
-              )
-            }
-          }
-          .onChange(of: playlistScrollTargetID) { target in
-            guard let target else { return }
-            performPlaylistScrollSequence(targetID: target, proxy: proxy)
-          }
-          .onChange(of: visibleTracksRevision) { _ in
-            guard let target = playlistScrollTargetID else { return }
-            performPlaylistScrollSequence(targetID: target, proxy: proxy)
-          }
-          .onChange(of: trackSearchText) { _ in
-            guard let target = playlistScrollTargetID else { return }
-            performPlaylistScrollSequence(targetID: target, proxy: proxy)
-          }
-          .onAppear {
-            guard let target = playlistScrollTargetID else { return }
-            performPlaylistScrollSequence(targetID: target, proxy: proxy)
-          }
-        }
-      }
-      .contentShape(Rectangle())
-      .onTapGesture {
-        NotificationCenter.default.post(name: .blurSearchField, object: nil)
-      }
+      playlistDetailContent(for: playlist)
     } else {
+      noPlaylistSelectedView
+    }
+  }
+
+  private func playlistDetailContent(for playlist: UserPlaylist) -> some View {
+    VStack(alignment: .leading, spacing: isCompactRoot ? 8 : 14) {
+      header(for: playlist)
+
+      SearchBarView(searchText: $trackSearchText, focusTarget: .playlists)
+
+      if !trackSearchText.isEmpty {
+        playlistSearchStats
+      }
+
+      if !isCompactRoot && !isLoadingTracks && !visibleTracks.isEmpty {
+        TrackListColumnHeader()
+      }
+
+      playlistTrackRegion(for: playlist)
+    }
+    .contentShape(Rectangle())
+    .onTapGesture {
+      NotificationCenter.default.post(name: .blurSearchField, object: nil)
+    }
+  }
+
+  private var playlistSearchStats: some View {
+    HStack {
+      Text("找到 \(visibleTracks.count) / \(loadedTracks.count) 首歌曲")
+        .font(.caption)
+        .foregroundStyle(theme.stageSecondaryText)
+      Spacer()
+    }
+  }
+
+  private var noPlaylistSelectedView: some View {
+    VStack(spacing: 10) {
+      Text("请选择一个歌单")
+        .font(.headline)
+        .foregroundColor(theme.stagePrimaryText)
+      Text("在歌单目录选择一个歌单，或新建一个歌单开始使用。")
+        .font(.caption)
+        .foregroundColor(theme.mutedText)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+
+  private func playlistTrackRegion(for playlist: UserPlaylist) -> some View {
+    ScrollViewReader { proxy in
+      playlistTrackContent(for: playlist)
+        .onChange(of: playlistScrollTargetID) { target in
+          guard let target else { return }
+          performPlaylistScrollSequence(targetID: target, proxy: proxy)
+        }
+        .onChange(of: visibleTracksRevision) { _ in
+          guard let target = playlistScrollTargetID else { return }
+          performPlaylistScrollSequence(targetID: target, proxy: proxy)
+        }
+        .onChange(of: trackSearchText) { _ in
+          guard let target = playlistScrollTargetID else { return }
+          performPlaylistScrollSequence(targetID: target, proxy: proxy)
+        }
+        .onAppear {
+          guard let target = playlistScrollTargetID else { return }
+          performPlaylistScrollSequence(targetID: target, proxy: proxy)
+        }
+    }
+  }
+
+  @ViewBuilder
+  private func playlistTrackContent(for playlist: UserPlaylist) -> some View {
+    if isLoadingTracks {
       VStack(spacing: 10) {
-        Text("请选择一个歌单")
-          .font(.headline)
-          .foregroundColor(.primary)
-        Text("在左侧选择歌单，或新建一个歌单开始使用。")
+        ProgressView()
+        Text("加载歌单…")
           .font(.caption)
           .foregroundColor(theme.mutedText)
       }
       .frame(maxWidth: .infinity, maxHeight: .infinity)
+    } else if visibleTracks.isEmpty {
+      VStack(spacing: 10) {
+        Text(playlist.tracks.isEmpty ? "歌单为空" : "未找到匹配歌曲")
+          .font(.subheadline)
+          .foregroundColor(theme.mutedText)
+        Text(playlist.tracks.isEmpty ? "可在歌单标题旁点击“从队列添加”。" : "试试更短的关键词。")
+          .font(.caption)
+          .foregroundColor(theme.mutedText.opacity(0.9))
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+    } else {
+      playlistTracksList(for: playlist)
     }
   }
 
-  private func header(for playlist: UserPlaylist) -> some View {
-    let isActive = playlistManager.playbackScope == .playlist(playlist.id)
-      && audioPlayer.playbackTargetURL != nil
-
-    return HStack(spacing: 14) {
-      Button {
-        choosePlaylistArtwork(playlist)
-      } label: {
-        PlaylistArtworkView(
-          playlist: playlist,
-          isActive: isActive,
-          targetPixelSize: 160,
-          revision: artworkRevisions[playlist.id] ?? 0
+  private func playlistTracksList(for playlist: UserPlaylist) -> some View {
+    List {
+      ForEach(visibleTracks.numberedTracks) { numberedTrack in
+        playlistTrackRow(
+          file: numberedTrack.file,
+          number: numberedTrack.number,
+          playlist: playlist
         )
-        .frame(width: 64, height: 64)
-        .overlay(alignment: .bottomTrailing) {
-          ZStack {
-            Image(systemName: "photo")
-              .font(.system(size: 9, weight: .semibold))
-            Image(systemName: "plus.circle.fill")
-              .font(.system(size: 7, weight: .bold))
-              .offset(x: 5, y: 5)
-          }
-            .foregroundStyle(theme.stagePrimaryText)
-            .frame(width: 20, height: 20)
-            .background(theme.elevatedSurface, in: Circle())
-            .overlay {
-              Circle().stroke(theme.stroke, lineWidth: 1)
-            }
-            .offset(x: 4, y: 4)
+      }
+    }
+    .listStyle(PlainListStyle())
+    .scrollContentBackground(.hidden)
+    .background(Color.clear)
+    .background(
+      ListTableViewAccessor { tableView in
+        let currentID = playlistTableView.map(ObjectIdentifier.init)
+        let newID = tableView.map(ObjectIdentifier.init)
+        if currentID != newID {
+          playlistTableView = tableView
         }
       }
-      .buttonStyle(.plain)
-      .help("更换“\(playlist.name)”的歌单封面")
-      .accessibilityLabel("更换“\(playlist.name)”的歌单封面")
-      .contextMenu {
-        Button("选择图片…") {
-          choosePlaylistArtwork(playlist)
-        }
-        Button("恢复默认封面") {
-          resetPlaylistArtwork(playlist)
-        }
-      }
+    )
+  }
 
-      VStack(alignment: .leading, spacing: 5) {
+  private func playlistTrackRow(
+    file: AudioFile,
+    number: Int,
+    playlist: UserPlaylist
+  ) -> some View {
+    TrackRowView(
+      trackNumber: number,
+      file: file,
+      isCurrentTrack: currentHighlightedURL == file.url,
+      isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
+      unplayableReason: trackUnplayableReasons[pathKey(file.url)],
+      searchText: trackSearchText,
+      playAction: { selectedFile in
+        NotificationCenter.default.post(name: .blurSearchField, object: nil)
+        playTrackInPlaylist(selectedFile, playlist: playlist)
+      },
+      deleteAction: { fileToDelete in
+        NotificationCenter.default.post(name: .blurSearchField, object: nil)
+        playlistsStore.removeTrack(path: fileToDelete.url.path, from: playlist.id)
+        reloadSelectedPlaylist()
+      },
+      editAction: { fileToEdit in
+        NotificationCenter.default.post(name: .blurSearchField, object: nil)
+        if trackUnplayableReasons[pathKey(fileToEdit.url)] != nil {
+          postToast(
+            title: "文件不存在，无法编辑",
+            subtitle: fileToEdit.url.lastPathComponent,
+            kind: "warning"
+          )
+          return
+        }
+        onRequestEditMetadata(fileToEdit)
+      },
+      weightLevel: weights.level(for: file.url, scope: .playlist(playlist.id)),
+      onWeightSelect: { newLevel in
+        let result = weights.setLevel(newLevel, for: file.url, scope: .playlist(playlist.id))
+        WeightCommands.handleSetWeightResult(result)
+      }
+    )
+    .id(file.id)
+    .listRowBackground(Color.clear)
+    .listRowSeparator(.hidden)
+    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+  }
+
+  @ViewBuilder
+  private func header(for playlist: UserPlaylist) -> some View {
+    if isCompactRoot {
+      HStack(spacing: 10) {
+        playlistHeaderIdentity(for: playlist, compact: true)
+        Spacer(minLength: 8)
+        playlistHeaderActions(for: playlist)
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+    } else {
+      ViewThatFits(in: .horizontal) {
+        HStack(spacing: 14) {
+          playlistHeaderIdentity(for: playlist)
+          Spacer(minLength: 12)
+          playlistHeaderActions(for: playlist)
+        }
+        .frame(minWidth: 560, maxWidth: .infinity, alignment: .leading)
+
+        VStack(alignment: .leading, spacing: 10) {
+          playlistHeaderIdentity(for: playlist)
+          HStack {
+            Spacer(minLength: 0)
+            playlistHeaderActions(for: playlist)
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+      }
+      .padding(.top, 6)
+      .padding(.bottom, 2)
+    }
+  }
+
+  private func playlistHeaderIdentity(
+    for playlist: UserPlaylist,
+    compact: Bool = false
+  ) -> some View {
+    HStack(spacing: compact ? 10 : 14) {
+      playlistArtworkButton(for: playlist, size: compact ? 44 : 64)
+
+      VStack(alignment: .leading, spacing: compact ? 2 : 5) {
         Text(playlist.name)
-          .font(AppTheme.musicDisplayFont(size: 24, weight: .bold))
+          .font(AppTheme.musicDisplayFont(size: compact ? 19 : 24, weight: .bold))
           .foregroundColor(theme.stagePrimaryText)
           .lineLimit(1)
 
@@ -423,9 +592,55 @@ struct PlaylistsPanel: View {
         .font(.system(size: 11, weight: .medium))
         .foregroundColor(theme.stageTertiaryText)
       }
+    }
+  }
 
-      Spacer(minLength: 12)
+  private func playlistArtworkButton(for playlist: UserPlaylist, size: CGFloat = 64) -> some View {
+    let isActive = playlistManager.playbackScope == .playlist(playlist.id)
+      && audioPlayer.playbackTargetURL != nil
 
+    return Button {
+      choosePlaylistArtwork(playlist)
+    } label: {
+      PlaylistArtworkView(
+        playlist: playlist,
+        isActive: isActive,
+        targetPixelSize: size <= 44 ? 112 : 160,
+        revision: artworkRevisions[playlist.id] ?? 0
+      )
+      .frame(width: size, height: size)
+      .overlay(alignment: .bottomTrailing) {
+        ZStack {
+          Image(systemName: "photo")
+            .font(.system(size: 9, weight: .semibold))
+          Image(systemName: "plus.circle.fill")
+            .font(.system(size: 7, weight: .bold))
+            .offset(x: 5, y: 5)
+        }
+        .foregroundStyle(theme.stagePrimaryText)
+        .frame(width: 20, height: 20)
+        .background(theme.elevatedSurface, in: Circle())
+        .overlay {
+          Circle().stroke(theme.stroke, lineWidth: 1)
+        }
+        .offset(x: 4, y: 4)
+      }
+    }
+    .buttonStyle(.plain)
+    .help("更换“\(playlist.name)”的歌单封面")
+    .accessibilityLabel("更换“\(playlist.name)”的歌单封面")
+    .contextMenu {
+      Button("选择图片…") {
+        choosePlaylistArtwork(playlist)
+      }
+      Button("恢复默认封面") {
+        resetPlaylistArtwork(playlist)
+      }
+    }
+  }
+
+  private func playlistHeaderActions(for playlist: UserPlaylist) -> some View {
+    HStack(spacing: 8) {
       Button {
         guard
           let firstPlayable = loadedTracks.first(where: {
@@ -471,60 +686,7 @@ struct PlaylistsPanel: View {
       .help(playlistManager.audioFiles.isEmpty ? "队列为空：先在“队列”里导入一些歌曲" : "")
 
       Menu {
-        Button("设置歌单封面…") {
-          choosePlaylistArtwork(playlist)
-        }
-        Button("恢复默认封面") {
-          resetPlaylistArtwork(playlist)
-        }
-
-        Divider()
-
-        if audioPlayer.currentFile != nil {
-          Button("添加正在播放") {
-            if let url = audioPlayer.currentFile?.url {
-              Task {
-                _ = await playlistsStore.addTracks([url], to: playlist.id)
-                reloadSelectedPlaylist()
-              }
-            } else {
-              postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
-            }
-          }
-        }
-
-        if nowPlayingIDInPlaylist(playlist) != nil {
-          Button("定位正在播放") {
-            requestScrollToNowPlayingInPlaylist(playlist)
-          }
-        }
-
-        Divider()
-
-        Button("同步随机权重给队列") {
-          let result = weights.syncPlaylistOverridesToQueue(from: playlist.id)
-          if case .rejectedReadOnly(let reason) = result.mutationResult {
-            postToast(title: "无法同步随机权重", subtitle: reason.diagnosticMessage, kind: "error")
-            return
-          }
-          if result.total == 0 {
-            postToast(title: "歌单没有设置随机权重", subtitle: "先在歌曲行的随机权重菜单中设置", kind: "info")
-            return
-          }
-          if result.changed == 0 {
-            postToast(title: "队列权重已是最新", subtitle: "无需同步（\(result.total) 条权重一致）", kind: "info")
-            return
-          }
-          postToast(
-            title: "已同步权重到队列", subtitle: "应用了 \(result.changed)/\(result.total) 条权重",
-            kind: "success")
-        }
-
-        Divider()
-
-        Button("导出 M3U8…") {
-          exportPlaylistAsM3U8(playlist)
-        }
+        playlistOverflowMenu(for: playlist)
       } label: {
         Image(systemName: "ellipsis")
           .font(.system(size: 14, weight: .semibold))
@@ -535,8 +697,74 @@ struct PlaylistsPanel: View {
       .menuIndicator(.hidden)
       .help("歌单操作")
     }
-    .padding(.top, 6)
-    .padding(.bottom, 2)
+  }
+
+  @ViewBuilder
+  private func playlistOverflowMenu(for playlist: UserPlaylist) -> some View {
+    Button("设置歌单封面…") {
+      choosePlaylistArtwork(playlist)
+    }
+    Button("恢复默认封面") {
+      resetPlaylistArtwork(playlist)
+    }
+
+    Divider()
+
+    if audioPlayer.currentFile != nil {
+      Button("添加正在播放") {
+        addCurrentTrack(to: playlist)
+      }
+    }
+
+    if nowPlayingIDInPlaylist(playlist) != nil {
+      Button("定位正在播放") {
+        requestScrollToNowPlayingInPlaylist(playlist)
+      }
+    }
+
+    Divider()
+
+    Button("同步随机权重给队列") {
+      syncPlaylistWeightsToQueue(playlist)
+    }
+
+    Divider()
+
+    Button("导出 M3U8…") {
+      exportPlaylistAsM3U8(playlist)
+    }
+  }
+
+  private func addCurrentTrack(to playlist: UserPlaylist) {
+    guard let url = audioPlayer.currentFile?.url else {
+      postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
+      return
+    }
+    Task {
+      _ = await playlistsStore.addTracks([url], to: playlist.id)
+      reloadSelectedPlaylist()
+    }
+  }
+
+  private func syncPlaylistWeightsToQueue(_ playlist: UserPlaylist) {
+    let result = weights.syncPlaylistOverridesToQueue(from: playlist.id)
+    if case .rejectedReadOnly(let reason) = result.mutationResult {
+      postToast(title: "无法同步随机权重", subtitle: reason.diagnosticMessage, kind: "error")
+      return
+    }
+    if result.total == 0 {
+      postToast(title: "歌单没有设置随机权重", subtitle: "先在歌曲行的随机权重菜单中设置", kind: "info")
+      return
+    }
+    if result.changed == 0 {
+      postToast(title: "队列权重已是最新", subtitle: "无需同步（\(result.total) 条权重一致）", kind: "info")
+      return
+    }
+    postToast(
+      title: "已同步权重到队列",
+      subtitle: "应用了 \(result.changed)/\(result.total) 条权重",
+      kind: "success"
+    )
   }
 
   private static func formatCollectionDuration(_ duration: TimeInterval) -> String {
@@ -584,7 +812,13 @@ struct PlaylistsPanel: View {
           continue
         }
         if let tableView = playlistTableView, tableView.numberOfRows > targetIndex {
-          centerListRow(targetIndex, in: tableView)
+          if reduceMotion {
+            centerPlaylistRowWithoutAnimation(targetIndex, in: tableView)
+          } else {
+            centerListRow(targetIndex, in: tableView)
+          }
+        } else if reduceMotion {
+          proxy.scrollTo(targetID, anchor: .center)
         } else {
           withAnimation(.easeInOut(duration: 0.2)) {
             proxy.scrollTo(targetID, anchor: .center)
@@ -597,6 +831,24 @@ struct PlaylistsPanel: View {
         playlistScrollTargetID = nil
       }
     }
+  }
+
+  @MainActor
+  private func centerPlaylistRowWithoutAnimation(_ row: Int, in tableView: NSTableView) {
+    guard row >= 0, row < tableView.numberOfRows else { return }
+
+    tableView.scrollRowToVisible(row)
+    guard let scrollView = tableView.enclosingScrollView else { return }
+
+    tableView.layoutSubtreeIfNeeded()
+    let rowRect = tableView.rect(ofRow: row)
+    guard !rowRect.isEmpty else { return }
+
+    let viewportHeight = scrollView.contentView.bounds.height
+    let maxOffsetY = max(0, tableView.bounds.height - viewportHeight)
+    let desiredOffsetY = min(max(0, rowRect.midY - viewportHeight / 2), maxOffsetY)
+    scrollView.contentView.setBoundsOrigin(NSPoint(x: 0, y: desiredOffsetY))
+    scrollView.reflectScrolledClipView(scrollView.contentView)
   }
 
   // MARK: - Actions
@@ -813,8 +1065,11 @@ struct PlaylistsPanel: View {
         }
       }
 
+      guard !Task.isCancelled else { return }
+
       // Build unplayable reasons for missing files.
       for (idx, path) in paths.enumerated() {
+        guard !Task.isCancelled else { return }
         let url = URL(fileURLWithPath: path)
         if missingFileIndices.contains(idx) {
           reasons[key(for: url)] = "文件不存在"
@@ -827,6 +1082,7 @@ struct PlaylistsPanel: View {
         }
       }
 
+      guard !Task.isCancelled else { return }
       let finalTracks = results.compactMap { $0 }
       let finalReasons = reasons
       let knownDurations = finalTracks.compactMap(\.duration).filter { $0.isFinite && $0 > 0 }
@@ -971,15 +1227,15 @@ struct PlaylistsPanel: View {
 
       SearchBarView(
         searchText: $addFromQueueSearchText,
-        onSearchChanged: { q in
-          addFromQueueSearchText = q
-        }, focusTarget: .addFromQueue, autoFocusOnAppear: true)
+        focusTarget: .addFromQueue,
+        autoFocusOnAppear: true
+      )
 
       if !addFromQueueSearchText.isEmpty {
         HStack {
           Text("找到 \(candidates.count) / \(playlistManager.audioFiles.count) 首歌曲")
             .font(.caption)
-            .foregroundColor(.secondary)
+            .foregroundStyle(theme.stageSecondaryText)
           Spacer()
         }
       }

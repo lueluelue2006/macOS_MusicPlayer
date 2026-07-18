@@ -42,9 +42,13 @@ final class ToastState: ObservableObject {
             isVisible = true
         }
 
-        dismissTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, duration) * 1_000_000_000))
-            await dismiss()
+        dismissTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(max(0, duration) * 1_000_000_000))
+            } catch {
+                return
+            }
+            self?.dismiss()
         }
     }
 
@@ -60,5 +64,9 @@ final class ToastState: ObservableObject {
 
     var hasTapAction: Bool {
         tapURL != nil || tapUpdate != nil
+    }
+
+    deinit {
+        dismissTask?.cancel()
     }
 }

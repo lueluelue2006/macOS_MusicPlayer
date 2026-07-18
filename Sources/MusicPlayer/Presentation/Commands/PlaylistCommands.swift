@@ -3,6 +3,7 @@ import Foundation
 /// 与歌单/队列管理相关的离散用户命令。
 ///
 /// 这里只做参数校验和调用服务，不处理任何视图状态或窗口管理。
+@MainActor
 enum PlaylistCommands {
     /// 创建空歌单。
     static func createEmptyPlaylist(

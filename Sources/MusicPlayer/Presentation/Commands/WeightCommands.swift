@@ -2,7 +2,7 @@ import Foundation
 
 /// 封装与随机权重相关的用户命令，统一处理设置失败时的提示。
 enum WeightCommands {
-    static func handleSetWeightResult(_ result: PlaybackWeights.SetLevelResult) {
+    static func handleSetWeightResult(_ result: PlaybackWeights.MutationResult) {
         switch result {
         case .applied, .unchanged:
             break

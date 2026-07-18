@@ -10,7 +10,13 @@ final class PlaylistViewModel: ObservableObject {
     let sortState: SearchSortState
     let weights: PlaybackWeights
 
-    @AppStorage("userPlaylistPanelMode") private var panelModeRaw: Int = PanelMode.queue.rawValue
+    private static let panelModeDefaultsKey = "userPlaylistPanelMode"
+
+    @Published private(set) var panelMode: PanelMode {
+        didSet {
+            UserDefaults.standard.set(panelMode.rawValue, forKey: Self.panelModeDefaultsKey)
+        }
+    }
     @Published private(set) var queueVisibleFiles: [AudioFile] = []
     @Published private(set) var queueVisibleRevision: UInt64 = 0
     @Published var queueScrollTargetID: String?
@@ -18,14 +24,9 @@ final class PlaylistViewModel: ObservableObject {
     private var queueRefreshTask: Task<Void, Never>?
     private var queueScrollTask: Task<Void, Never>?
 
-    private enum PanelMode: Int {
+    enum PanelMode: Int {
         case queue = 0
         case playlists = 1
-    }
-
-    var panelMode: PanelMode {
-        get { PanelMode(rawValue: panelModeRaw) ?? .queue }
-        set { panelModeRaw = newValue.rawValue }
     }
 
     var isQueueSelected: Bool { panelMode == .queue }
@@ -33,15 +34,15 @@ final class PlaylistViewModel: ObservableObject {
 
     var scanSubfoldersBinding: Binding<Bool> {
         Binding(
-            get: { playlistManager.scanSubfolders },
-            set: { playlistManager.scanSubfolders = $0 }
+            get: { self.playlistManager.scanSubfolders },
+            set: { self.playlistManager.scanSubfolders = $0 }
         )
     }
 
     var queueSearchTextBinding: Binding<String> {
         Binding(
-            get: { playlistManager.searchText },
-            set: { updateQueueSearch($0) }
+            get: { self.playlistManager.searchText },
+            set: { self.updateQueueSearch($0) }
         )
     }
 
@@ -100,14 +101,17 @@ final class PlaylistViewModel: ObservableObject {
         audioPlayer: AudioPlayer,
         playlistManager: PlaylistManager,
         playlistsStore: PlaylistsStore,
-        sortState: SearchSortState = .shared,
-        weights: PlaybackWeights = .shared
+        sortState: SearchSortState? = nil,
+        weights: PlaybackWeights? = nil
     ) {
         self.audioPlayer = audioPlayer
         self.playlistManager = playlistManager
         self.playlistsStore = playlistsStore
-        self.sortState = sortState
-        self.weights = weights
+        self.sortState = sortState ?? .shared
+        self.weights = weights ?? .shared
+        self.panelMode = PanelMode(
+            rawValue: UserDefaults.standard.integer(forKey: Self.panelModeDefaultsKey)
+        ) ?? .queue
 
         // 转发服务状态变化，让 SwiftUI 重新渲染；但不在这里刷新派生列表，
         // 避免 @Published 更新触发递归刷新。
@@ -115,8 +119,8 @@ final class PlaylistViewModel: ObservableObject {
             audioPlayer.objectWillChange,
             playlistManager.objectWillChange,
             playlistsStore.objectWillChange,
-            sortState.objectWillChange,
-            weights.objectWillChange
+            self.sortState.objectWillChange,
+            self.weights.objectWillChange
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] _ in
@@ -130,8 +134,8 @@ final class PlaylistViewModel: ObservableObject {
             playlistManager.$filteredFiles.map { _ in () }.eraseToAnyPublisher(),
             playlistManager.$isInitialRestorePending.map { _ in () }.eraseToAnyPublisher(),
             playlistManager.$isRestoringPlaylist.map { _ in () }.eraseToAnyPublisher(),
-            sortState.$revision.map { _ in () }.eraseToAnyPublisher(),
-            weights.$revision.map { _ in () }.eraseToAnyPublisher()
+            self.sortState.$revision.map { _ in () }.eraseToAnyPublisher(),
+            self.weights.$revision.map { _ in () }.eraseToAnyPublisher()
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] _ in
@@ -265,7 +269,6 @@ final class PlaylistViewModel: ObservableObject {
     // MARK: - Search
 
     func updateQueueSearch(_ query: String) {
-        playlistManager.searchText = query
         playlistManager.searchFiles(query)
     }
 

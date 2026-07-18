@@ -18,20 +18,39 @@ final class PlayerViewModel: ObservableObject {
     init(
         audioPlayer: AudioPlayer,
         playlistManager: PlaylistManager,
-        weights: PlaybackWeights = .shared
+        weights: PlaybackWeights? = nil
     ) {
         self.audioPlayer = audioPlayer
         self.playlistManager = playlistManager
-        self.weights = weights
+        self.weights = weights ?? .shared
 
+        // 视图仍由 ViewModel 接收业务服务的展示更新，避免根视图重复观察。
         Publishers.MergeMany([
             audioPlayer.objectWillChange,
             playlistManager.objectWillChange,
-            weights.objectWillChange
+            self.weights.objectWillChange
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] _ in
             self?.objectWillChange.send()
+        }
+        .store(in: &cancellables)
+
+        // “下一首”只依赖播放选择、播放范围、队列和权重；音量、
+        // 输出设备、歌词等 AudioPlayer 状态变化不应触发队列预测。
+        Publishers.MergeMany([
+            audioPlayer.$currentFile.map { _ in () }.eraseToAnyPublisher(),
+            audioPlayer.$persistPlaybackState.map { _ in () }.eraseToAnyPublisher(),
+            audioPlayer.$playbackMode.map { _ in () }.eraseToAnyPublisher(),
+            playlistManager.$currentIndex.map { _ in () }.eraseToAnyPublisher(),
+            playlistManager.$playbackScope.map { _ in () }.eraseToAnyPublisher(),
+            playlistManager.$playbackScopeRevision.map { _ in () }.eraseToAnyPublisher(),
+            playlistManager.$audioFiles.map { _ in () }.eraseToAnyPublisher(),
+            playlistManager.$unplayableReasons.map { _ in () }.eraseToAnyPublisher(),
+            self.weights.$revision.map { _ in () }.eraseToAnyPublisher()
+        ])
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] _ in
             self?.refreshNextUpFile()
         }
         .store(in: &cancellables)
@@ -124,16 +143,38 @@ final class PlayerViewModel: ObservableObject {
     // MARK: - Next Up
 
     func refreshNextUpFile() {
+        let candidate: AudioFile?
+
         guard audioPlayer.persistPlaybackState, let current = audioPlayer.currentFile else {
-            nextUpFile = nil
+            setNextUpFile(nil)
             return
         }
 
         if audioPlayer.playbackMode == .repeatOne {
-            nextUpFile = current
-            return
+            candidate = current
+        } else {
+            candidate = playlistManager.peekNextFile(isShuffling: true)
         }
 
-        nextUpFile = playlistManager.peekNextFile(isShuffling: true)
+        setNextUpFile(candidate)
+    }
+
+    private func setNextUpFile(_ candidate: AudioFile?) {
+        guard !hasSameNextUpPresentation(nextUpFile, candidate) else { return }
+        nextUpFile = candidate
+    }
+
+    private func hasSameNextUpPresentation(_ lhs: AudioFile?, _ rhs: AudioFile?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return true
+        case let (lhs?, rhs?):
+            return lhs.id == rhs.id
+                && lhs.metadata.title == rhs.metadata.title
+                && lhs.metadata.artist == rhs.metadata.artist
+                && lhs.duration == rhs.duration
+        default:
+            return false
+        }
     }
 }

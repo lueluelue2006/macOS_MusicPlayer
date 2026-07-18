@@ -10,6 +10,20 @@ struct RecordSleeveHero: View {
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
   var body: some View {
+    GeometryReader { proxy in
+      let scale = min(
+        proxy.size.width / 314,
+        proxy.size.height / 310
+      )
+
+      heroArtwork
+        .frame(width: 314, height: 310)
+        .scaleEffect(max(0, scale))
+        .frame(width: proxy.size.width, height: proxy.size.height)
+    }
+  }
+
+  private var heroArtwork: some View {
     ZStack {
       RoundedRectangle(cornerRadius: 14, style: .continuous)
         .fill(theme.panelSurface)
@@ -53,7 +67,7 @@ struct RecordSleeveHero: View {
         }
         .offset(x: -7, y: 4)
     }
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .frame(width: 314, height: 310)
     .shadow(color: theme.subtleShadow, radius: 16, x: 0, y: 9)
   }
 }

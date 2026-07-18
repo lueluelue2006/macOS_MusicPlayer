@@ -2,7 +2,6 @@ import SwiftUI
 
 struct SearchBarView: View {
   @Binding var searchText: String
-  let onSearchChanged: (String) -> Void
   let focusTarget: SearchFocusTarget
   var autoFocusOnAppear: Bool = false
   @ObservedObject private var sortState = SearchSortState.shared
@@ -20,9 +19,6 @@ struct SearchBarView: View {
         .textFieldStyle(PlainTextFieldStyle())
         .font(.subheadline)
         .focused($isFocused)
-        .onChange(of: searchText) { newValue in
-          onSearchChanged(newValue)
-        }
         .onChange(of: isFocused) { focused in
           if focused {
             AppFocusState.shared.activeSearchTarget = focusTarget
@@ -37,7 +33,6 @@ struct SearchBarView: View {
       if !searchText.isEmpty {
         Button(action: {
           searchText = ""
-          onSearchChanged("")
         }) {
           Image(systemName: "xmark.circle.fill")
             .foregroundColor(theme.mutedText)
@@ -72,6 +67,7 @@ struct SearchBarView: View {
         guard AppFocusState.shared.activeSearchTarget == focusTarget else { return }
       }
       AppFocusState.shared.activeSearchTarget = focusTarget
+      AppFocusState.shared.pendingSearchFocusTarget = nil
       isFocused = true
       AppFocusState.shared.isSearchFocused = true
     }
@@ -83,7 +79,10 @@ struct SearchBarView: View {
     }
     .onAppear {
       DispatchQueue.main.async {
-        if autoFocusOnAppear {
+        let shouldFocus = autoFocusOnAppear
+          || AppFocusState.shared.pendingSearchFocusTarget == focusTarget
+        if shouldFocus {
+          AppFocusState.shared.pendingSearchFocusTarget = nil
           AppFocusState.shared.activeSearchTarget = focusTarget
           isFocused = true
           AppFocusState.shared.isSearchFocused = true

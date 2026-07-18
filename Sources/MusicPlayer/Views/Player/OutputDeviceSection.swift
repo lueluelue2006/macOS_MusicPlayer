@@ -19,5 +19,7 @@ struct OutputDeviceSection: View {
       Spacer(minLength: 0)
     }
     .foregroundStyle(theme.stageTertiaryText.opacity(0.82))
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel("当前音频输出设备：\(viewModel.audioPlayer.currentOutputDeviceName)")
   }
 }

@@ -2,12 +2,31 @@ import SwiftUI
 
 struct CurrentTrackSection: View {
   @ObservedObject var viewModel: PlayerViewModel
+  var isCompact: Bool = false
   @Environment(\.colorScheme) private var colorScheme
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 0) {
+    Group {
       if let currentFile = viewModel.currentFile {
+        if isCompact {
+          compactTrack(currentFile)
+        } else {
+          regularTrack(currentFile)
+        }
+      } else if isCompact {
+        compactEmptyState
+      } else {
+        regularEmptyState
+      }
+    }
+    .frame(maxWidth: isCompact ? .infinity : 334)
+    .padding(.horizontal, isCompact ? 20 : 24)
+    .frame(maxWidth: .infinity)
+  }
+
+  private func regularTrack(_ currentFile: AudioFile) -> some View {
+    VStack(alignment: .leading, spacing: 0) {
         RecordSleeveHero(
           image: viewModel.audioPlayer.artworkImage,
           title: currentFile.metadata.title,
@@ -17,98 +36,135 @@ struct CurrentTrackSection: View {
           .frame(maxWidth: .infinity)
 
         if viewModel.persistPlaybackState == false {
-          ephemeralPlaybackHint
+          ephemeralPlaybackHint(compact: false)
         }
 
-        VStack(alignment: .leading, spacing: 5) {
-          Text(currentFile.metadata.title)
-            .font(AppTheme.musicDisplayFont(size: 28, weight: .semibold))
-            .lineLimit(2)
-            .multilineTextAlignment(.leading)
-            .foregroundColor(theme.stagePrimaryText)
-
-          Text(currentFile.metadata.artist)
-            .font(.system(size: 15, weight: .medium))
-            .foregroundColor(theme.stageSecondaryText)
-            .lineLimit(1)
-
-          Text(
-            [currentFile.metadata.album, currentFile.metadata.year]
-              .compactMap { value -> String? in
-                guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                else { return nil }
-                return value
-              }
-              .joined(separator: " · ")
-          )
-            .font(.system(size: 12))
-            .foregroundColor(theme.stageTertiaryText)
-            .lineLimit(1)
-        }
+        trackMetadata(currentFile, compact: false)
         .padding(.top, 26)
 
-        ProgressSliderView(
-          playbackClock: viewModel.audioPlayer.playbackClock,
-          playbackStart: viewModel.audioPlayer.effectivePlaybackStartTime,
-          playbackEnd: viewModel.audioPlayer.effectivePlaybackEndTime,
-          onSeek: { viewModel.seek(to: $0) }
-        )
+        progressSlider
         .padding(.top, 18)
 
-        HStack(spacing: 10) {
-          playbackRateMenu
-
-          WeightBlocksView(
-            level: viewModel.weightLevel(),
-            scopeLabel: viewModel.weightScopeLabel()
-          ) { newLevel in
-            viewModel.setWeightLevel(newLevel)
-          }
-          .fixedSize(horizontal: true, vertical: true)
-          .layoutPriority(3)
-
-          Button {
-            viewModel.playRandomTrack()
-          } label: {
-            Image(systemName: "die.face.5")
-              .font(.system(size: 12, weight: .medium))
-              .frame(width: 22, height: 22)
-              .contentShape(Rectangle())
-          }
-          .buttonStyle(.plain)
-          .disabled(
-            viewModel.playlistManager.playbackScopePlayableCount() < 2
-              || viewModel.persistPlaybackState == false
-          )
-          .help(viewModel.persistPlaybackState == false ? "临时播放模式下不可切歌" : "随机选一首")
-
-          Spacer()
-        }
-        .foregroundStyle(theme.stageTertiaryText)
+        secondaryControls
         .padding(.top, 10)
-
-      } else {
-        emptyState
-      }
     }
-    .frame(maxWidth: 334)
-    .padding(.horizontal, 24)
-    .frame(maxWidth: .infinity)
   }
 
-  private var ephemeralPlaybackHint: some View {
+  private func compactTrack(_ currentFile: AudioFile) -> some View {
+    HStack(alignment: .top, spacing: 16) {
+      RecordSleeveHero(
+        image: viewModel.audioPlayer.artworkImage,
+        title: currentFile.metadata.title,
+        artist: currentFile.metadata.artist
+      )
+      .frame(width: 138, height: 136)
+      .layoutPriority(1)
+
+      VStack(alignment: .leading, spacing: 0) {
+        if viewModel.persistPlaybackState == false {
+          ephemeralPlaybackHint(compact: true)
+        }
+
+        trackMetadata(currentFile, compact: true)
+
+        progressSlider
+          .padding(.top, 8)
+
+        secondaryControls
+          .padding(.top, 6)
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
+  }
+
+  private func trackMetadata(_ currentFile: AudioFile, compact: Bool) -> some View {
+    VStack(alignment: .leading, spacing: compact ? 2 : 5) {
+      Text(currentFile.metadata.title)
+        .font(AppTheme.musicDisplayFont(size: compact ? 21 : 28, weight: .semibold))
+        .lineLimit(compact ? 1 : 2)
+        .multilineTextAlignment(.leading)
+        .foregroundColor(theme.stagePrimaryText)
+
+      Text(currentFile.metadata.artist)
+        .font(.system(size: compact ? 13 : 15, weight: .medium))
+        .foregroundColor(theme.stageSecondaryText)
+        .lineLimit(1)
+
+      Text(collectionSubtitle(for: currentFile))
+        .font(.system(size: compact ? 10 : 12))
+        .foregroundColor(theme.stageTertiaryText)
+        .lineLimit(1)
+    }
+  }
+
+  private var progressSlider: some View {
+    ProgressSliderView(
+      playbackClock: viewModel.audioPlayer.playbackClock,
+      playbackStart: viewModel.audioPlayer.effectivePlaybackStartTime,
+      playbackEnd: viewModel.audioPlayer.effectivePlaybackEndTime,
+      onSeek: { viewModel.seek(to: $0) }
+    )
+  }
+
+  private var secondaryControls: some View {
+    HStack(spacing: 10) {
+      playbackRateMenu
+
+      WeightBlocksView(
+        level: viewModel.weightLevel(),
+        scopeLabel: viewModel.weightScopeLabel()
+      ) { newLevel in
+        viewModel.setWeightLevel(newLevel)
+      }
+      .fixedSize(horizontal: true, vertical: true)
+      .layoutPriority(3)
+
+      Button {
+        viewModel.playRandomTrack()
+      } label: {
+        Image(systemName: "die.face.5")
+          .font(.system(size: 12, weight: .medium))
+          .frame(width: 22, height: 22)
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .disabled(
+        viewModel.playlistManager.playbackScopePlayableCount() < 2
+          || viewModel.persistPlaybackState == false
+      )
+      .help(viewModel.persistPlaybackState == false ? "临时播放模式下不可切歌" : "随机选一首")
+
+      Spacer(minLength: 0)
+    }
+    .foregroundStyle(theme.stageTertiaryText)
+  }
+
+  private func collectionSubtitle(for currentFile: AudioFile) -> String {
+    [currentFile.metadata.album, currentFile.metadata.year]
+      .compactMap { value -> String? in
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return value
+      }
+      .joined(separator: " · ")
+  }
+
+  private func ephemeralPlaybackHint(compact: Bool) -> some View {
     HStack(spacing: 8) {
       Image(systemName: "bolt.fill")
         .font(.caption)
       Text("临时播放")
         .font(.caption)
         .fontWeight(.semibold)
-      Text("关闭窗口后不会保存进度")
-        .font(.caption)
-        .foregroundStyle(theme.stageSecondaryText)
+      if !compact {
+        Text("关闭窗口后不会保存进度")
+          .font(.caption)
+          .foregroundStyle(theme.stageSecondaryText)
+      }
     }
     .foregroundColor(Color.orange.opacity(0.92))
-    .padding(.top, 16)
+    .padding(.bottom, compact ? 4 : 0)
+    .padding(.top, compact ? 0 : 16)
     .help("通过 Finder/Dock 打开的临时播放：关闭应用或再次以临时方式打开其他歌曲都会丢失当前进度")
   }
 
@@ -136,7 +192,7 @@ struct CurrentTrackSection: View {
     .help("播放速度")
   }
 
-  private var emptyState: some View {
+  private var regularEmptyState: some View {
     VStack(alignment: .leading, spacing: 18) {
       RecordSleeveHero(image: nil, title: "MusicPlayer", artist: "本地音乐")
         .frame(width: 314, height: 310)
@@ -152,5 +208,25 @@ struct CurrentTrackSection: View {
       }
     }
     .frame(maxWidth: .infinity, alignment: .center)
+  }
+
+  private var compactEmptyState: some View {
+    HStack(spacing: 16) {
+      RecordSleeveHero(image: nil, title: "MusicPlayer", artist: "本地音乐")
+        .frame(width: 138, height: 136)
+
+      VStack(alignment: .leading, spacing: 5) {
+        Text("等待播放")
+          .font(AppTheme.musicDisplayFont(size: 22, weight: .semibold))
+          .foregroundColor(theme.stagePrimaryText)
+
+        Text("添加音乐，开始你的本地唱片架")
+          .font(.system(size: 13))
+          .foregroundColor(theme.stageSecondaryText)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+
+      Spacer(minLength: 0)
+    }
   }
 }

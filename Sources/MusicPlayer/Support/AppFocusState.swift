@@ -16,4 +16,7 @@ final class AppFocusState {
 
     // 当前 Command+F 应该聚焦的搜索框目标
     var activeSearchTarget: SearchFocusTarget = .queue
+
+    // 紧凑布局切换 pane 时，由新出现的目标搜索框一次性消费。
+    var pendingSearchFocusTarget: SearchFocusTarget?
 }

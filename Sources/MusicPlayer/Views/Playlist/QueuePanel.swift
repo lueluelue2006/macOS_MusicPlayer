@@ -4,15 +4,13 @@ struct QueuePanel: View {
   @ObservedObject var viewModel: PlaylistViewModel
   let onRequestEditMetadata: (AudioFile) -> Void
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       SearchBarView(
         searchText: viewModel.queueSearchTextBinding,
-        onSearchChanged: { query in
-          viewModel.updateQueueSearch(query)
-        },
         focusTarget: .queue
       )
       .padding(.horizontal, 24)
@@ -47,7 +45,7 @@ struct QueuePanel: View {
         "找到 \(viewModel.playlistManager.filteredFiles.count) / \(viewModel.playlistManager.audioFiles.count) 首歌曲"
       )
       .font(.caption)
-      .foregroundColor(.secondary)
+      .foregroundStyle(theme.stageSecondaryText)
       Spacer()
     }
     .padding(.horizontal, 24)
@@ -58,10 +56,10 @@ struct QueuePanel: View {
     ScrollViewReader { proxy in
       ScrollView {
         LazyVStack(spacing: 0) {
-          ForEach(viewModel.displayedQueueFiles.indices, id: \.self) { index in
-            let file = viewModel.displayedQueueFiles[index]
+          ForEach(viewModel.displayedQueueFiles.numberedTracks) { numberedTrack in
+            let file = numberedTrack.file
             TrackRowView(
-              trackNumber: index + 1,
+              trackNumber: numberedTrack.number,
               file: file,
               isCurrentTrack: viewModel.currentHighlightedURL == file.url,
               isVolumeAnalyzed: viewModel.audioPlayer.hasVolumeNormalizationCache(for: file.url),
@@ -82,20 +80,33 @@ struct QueuePanel: View {
       .background(Color.clear)
       .onChange(of: viewModel.queueScrollTargetID) { target in
         guard let target else { return }
-        viewModel.performQueueScrollSequence(targetID: target, proxy: proxy)
+        performQueueScroll(targetID: target, proxy: proxy)
       }
       .onChange(of: viewModel.queueVisibleRevision) { _ in
         guard let target = viewModel.queueScrollTargetID else { return }
-        viewModel.performQueueScrollSequence(targetID: target, proxy: proxy)
+        performQueueScroll(targetID: target, proxy: proxy)
       }
       .onChange(of: viewModel.playlistManager.searchText) { _ in
         guard let target = viewModel.queueScrollTargetID else { return }
-        viewModel.performQueueScrollSequence(targetID: target, proxy: proxy)
+        performQueueScroll(targetID: target, proxy: proxy)
       }
       .onAppear {
         guard let target = viewModel.queueScrollTargetID else { return }
-        viewModel.performQueueScrollSequence(targetID: target, proxy: proxy)
+        performQueueScroll(targetID: target, proxy: proxy)
       }
+    }
+  }
+
+  private func performQueueScroll(targetID: String, proxy: ScrollViewProxy) {
+    guard reduceMotion else {
+      viewModel.performQueueScrollSequence(targetID: targetID, proxy: proxy)
+      return
+    }
+
+    guard viewModel.displayedQueueFiles.contains(where: { $0.id == targetID }) else { return }
+    proxy.scrollTo(targetID, anchor: .center)
+    if viewModel.queueScrollTargetID == targetID {
+      viewModel.queueScrollTargetID = nil
     }
   }
 }

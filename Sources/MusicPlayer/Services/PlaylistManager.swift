@@ -15,6 +15,9 @@ final class PlaylistManager: ObservableObject {
     @Published var searchText: String = ""
     /// Which collection playback controls operate on (queue vs a user playlist).
     @Published private(set) var playbackScope: PlaybackScope = .queue
+    /// Changes whenever the ordered tracks behind `playbackScope` change without
+    /// necessarily changing the scope value itself.
+    @Published private(set) var playbackScopeRevision: UInt64 = 0
     @Published var scanSubfolders: Bool = true { // 默认开启子文件夹扫描
         didSet { saveScanSubfoldersPreference() }
     }
@@ -138,6 +141,7 @@ final class PlaylistManager: ObservableObject {
         playbackPlaylistTrackKeys.removeAll(keepingCapacity: true)
         playbackPlaylistPositionByKey.removeAll(keepingCapacity: true)
         resetPlaylistShuffleQueue()
+        playbackScopeRevision &+= 1
         persistPlaybackScope(.queue)
     }
 
@@ -148,6 +152,7 @@ final class PlaylistManager: ObservableObject {
         playbackPlaylistTrackKeys = trackURLsInOrder.map { pathKey($0) }
         rebuildPlaybackPlaylistPositions()
         resetPlaylistShuffleQueue()
+        playbackScopeRevision &+= 1
         persistPlaybackScope(.playlist(playlistID))
     }
 
@@ -162,10 +167,12 @@ final class PlaylistManager: ObservableObject {
 
         let oldKeys = playbackPlaylistTrackKeys
         let newKeys = trackURLsInOrder.map { pathKey($0) }
+        guard oldKeys != newKeys else { return }
 
         playbackPlaylistTrackKeys = newKeys
         rebuildPlaybackPlaylistPositions()
         updatePlaylistShuffleQueue(oldKeys: oldKeys, newKeys: newKeys)
+        playbackScopeRevision &+= 1
     }
 
     private func persistPlaybackScope(_ scope: PlaybackScope) {
