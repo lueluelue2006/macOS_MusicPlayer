@@ -1,15 +1,39 @@
 import Foundation
 
 struct UserPlaylist: Identifiable, Codable, Equatable {
-    struct Track: Codable, Equatable, Hashable, Sendable {
+    struct Track: Identifiable, Codable, Equatable, Hashable, Sendable {
+        /// Stable identity used to merge asynchronous enrichment without
+        /// reviving a removed track or updating a replacement at the same path.
+        let id: UUID
         /// Stored as a standardized file path (case preserved).
         let path: String
         /// Optional file signature for relocation support.
         let signature: FileSignature?
 
-        init(path: String, signature: FileSignature? = nil) {
+        init(id: UUID = UUID(), path: String, signature: FileSignature? = nil) {
+            self.id = id
             self.path = path
             self.signature = signature
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case path
+            case signature
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+            path = try container.decode(String.self, forKey: .path)
+            signature = try container.decodeIfPresent(FileSignature.self, forKey: .signature)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(id, forKey: .id)
+            try container.encode(path, forKey: .path)
+            try container.encodeIfPresent(signature, forKey: .signature)
         }
     }
 
@@ -27,4 +51,3 @@ struct UserPlaylist: Identifiable, Codable, Equatable {
         self.updatedAt = updatedAt
     }
 }
-

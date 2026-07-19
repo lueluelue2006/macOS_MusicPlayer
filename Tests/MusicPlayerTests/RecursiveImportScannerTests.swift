@@ -399,4 +399,200 @@ final class RecursiveImportScannerTests: XCTestCase {
         XCTAssertTrue(duplicateSkips.contains { $0.path == tempDir.path }, "should detect duplicate tempDir root")
         XCTAssertTrue(duplicateSkips.contains { $0.path == subDir.path }, "should detect overlapping subDir root")
     }
+
+    // MARK: - Bounded Resource Tests
+
+    func testOversizedDirectoryStopsAtHardEntryLimitWithoutKeepingPartialResults() throws {
+        for index in 0..<33 {
+            try Data().write(to: tempDir.appendingPathComponent("track-\(index).mp3"))
+        }
+
+        let limits = RecursiveImportScanner.Limits(
+            maximumDirectoryEntries: 32,
+            maximumDiscoveredItems: 100,
+            maximumScannedFiles: 100,
+            maximumAcceptedFiles: 100,
+            maximumTrackedFileIdentities: 100,
+            maximumVisitedDirectories: 10,
+            maximumPendingDirectories: 10,
+            maximumSkippedItems: 10
+        )
+        let result = RecursiveImportScanner.scan(
+            urls: [tempDir],
+            recursive: true,
+            isCancelled: { false },
+            limits: limits
+        )
+
+        XCTAssertEqual(
+            result.stopReason,
+            .directoryEntryLimitReached(path: tempDir.path, limit: 32)
+        )
+        XCTAssertTrue(result.wasTruncated)
+        XCTAssertFalse(result.wasCancelled)
+        XCTAssertEqual(result.files.count, 0)
+        XCTAssertEqual(result.skipped.count, 0)
+        XCTAssertEqual(result.totalDiscoveredItemCount, 0)
+        XCTAssertLessThanOrEqual(result.visitedDirectoryCount, limits.maximumVisitedDirectories)
+    }
+
+    func testAcceptedFilesAndTrackedIdentitiesRespectIndependentHardLimits() throws {
+        for index in 0..<10 {
+            try Data().write(to: tempDir.appendingPathComponent("audio-\(index).mp3"))
+        }
+
+        let acceptedLimits = RecursiveImportScanner.Limits(
+            maximumDirectoryEntries: 20,
+            maximumDiscoveredItems: 20,
+            maximumScannedFiles: 20,
+            maximumAcceptedFiles: 3,
+            maximumTrackedFileIdentities: 20,
+            maximumVisitedDirectories: 10,
+            maximumPendingDirectories: 10,
+            maximumSkippedItems: 10
+        )
+        let acceptedResult = RecursiveImportScanner.scan(
+            urls: [tempDir],
+            recursive: true,
+            isCancelled: { false },
+            limits: acceptedLimits
+        )
+
+        XCTAssertEqual(acceptedResult.stopReason, .acceptedFileLimitReached(limit: 3))
+        XCTAssertEqual(acceptedResult.files.count, 3)
+        XCTAssertLessThanOrEqual(acceptedResult.trackedFileIdentityCount, acceptedLimits.maximumTrackedFileIdentities)
+
+        let identityDirectory = tempDir.appendingPathComponent("unsupported")
+        try FileManager.default.createDirectory(at: identityDirectory, withIntermediateDirectories: true)
+        for index in 0..<10 {
+            try Data().write(to: identityDirectory.appendingPathComponent("item-\(index).txt"))
+        }
+        let identityLimits = RecursiveImportScanner.Limits(
+            maximumDirectoryEntries: 20,
+            maximumDiscoveredItems: 20,
+            maximumScannedFiles: 20,
+            maximumAcceptedFiles: 20,
+            maximumTrackedFileIdentities: 3,
+            maximumVisitedDirectories: 10,
+            maximumPendingDirectories: 10,
+            maximumSkippedItems: 10
+        )
+        let identityResult = RecursiveImportScanner.scan(
+            urls: [identityDirectory],
+            recursive: true,
+            isCancelled: { false },
+            limits: identityLimits
+        )
+
+        XCTAssertEqual(identityResult.stopReason, .trackedFileIdentityLimitReached(limit: 3))
+        XCTAssertEqual(identityResult.trackedFileIdentityCount, 3)
+        XCTAssertEqual(identityResult.unsupportedFormatCount, 3)
+    }
+
+    func testSkippedItemsAreSummarizedAfterStorageLimit() throws {
+        let target = tempDir.appendingPathComponent("target.mp3")
+        try Data().write(to: target)
+        for index in 0..<8 {
+            try FileManager.default.createSymbolicLink(
+                at: tempDir.appendingPathComponent("link-\(index).mp3"),
+                withDestinationURL: target
+            )
+        }
+
+        let limits = RecursiveImportScanner.Limits(
+            maximumDirectoryEntries: 20,
+            maximumDiscoveredItems: 20,
+            maximumScannedFiles: 20,
+            maximumAcceptedFiles: 20,
+            maximumTrackedFileIdentities: 20,
+            maximumVisitedDirectories: 10,
+            maximumPendingDirectories: 10,
+            maximumSkippedItems: 2
+        )
+        let result = RecursiveImportScanner.scan(
+            urls: [tempDir],
+            recursive: true,
+            isCancelled: { false },
+            limits: limits
+        )
+
+        XCTAssertNil(result.stopReason)
+        XCTAssertEqual(result.files, [target])
+        XCTAssertEqual(result.totalSkippedItemCount, 8)
+        XCTAssertEqual(result.skipped.count, 2)
+        XCTAssertEqual(result.omittedSkippedItemCount, 6)
+    }
+
+    func testVisitedAndPendingDirectoryCollectionsRespectHardLimits() throws {
+        for name in ["a", "b", "c"] {
+            try FileManager.default.createDirectory(
+                at: tempDir.appendingPathComponent(name),
+                withIntermediateDirectories: true
+            )
+        }
+
+        let pendingLimits = RecursiveImportScanner.Limits(
+            maximumDirectoryEntries: 20,
+            maximumDiscoveredItems: 20,
+            maximumScannedFiles: 20,
+            maximumAcceptedFiles: 20,
+            maximumTrackedFileIdentities: 20,
+            maximumVisitedDirectories: 10,
+            maximumPendingDirectories: 2,
+            maximumSkippedItems: 10
+        )
+        let pendingResult = RecursiveImportScanner.scan(
+            urls: [tempDir],
+            recursive: true,
+            isCancelled: { false },
+            limits: pendingLimits
+        )
+
+        XCTAssertEqual(pendingResult.stopReason, .pendingDirectoryLimitReached(limit: 2))
+        XCTAssertEqual(pendingResult.peakPendingDirectoryCount, 2)
+        XCTAssertEqual(pendingResult.visitedDirectoryCount, 1)
+
+        let visitedLimits = RecursiveImportScanner.Limits(
+            maximumDirectoryEntries: 20,
+            maximumDiscoveredItems: 20,
+            maximumScannedFiles: 20,
+            maximumAcceptedFiles: 20,
+            maximumTrackedFileIdentities: 20,
+            maximumVisitedDirectories: 2,
+            maximumPendingDirectories: 10,
+            maximumSkippedItems: 10
+        )
+        let visitedResult = RecursiveImportScanner.scan(
+            urls: [tempDir],
+            recursive: true,
+            isCancelled: { false },
+            limits: visitedLimits
+        )
+
+        XCTAssertEqual(visitedResult.stopReason, .visitedDirectoryLimitReached(limit: 2))
+        XCTAssertEqual(visitedResult.visitedDirectoryCount, 2)
+        XCTAssertLessThanOrEqual(visitedResult.peakPendingDirectoryCount, visitedLimits.maximumPendingDirectories)
+    }
+
+    func testCancellationDuringStreamingEnumerationStopsBeforeFileProcessing() throws {
+        for index in 0..<200 {
+            try Data().write(to: tempDir.appendingPathComponent("track-\(index).mp3"))
+        }
+
+        var cancellationChecks = 0
+        let result = RecursiveImportScanner.scan(
+            urls: [tempDir],
+            recursive: true,
+            isCancelled: {
+                cancellationChecks += 1
+                return cancellationChecks >= 4
+            }
+        )
+
+        XCTAssertTrue(result.wasCancelled)
+        XCTAssertNil(result.stopReason)
+        XCTAssertEqual(result.totalScanned, 0)
+        XCTAssertEqual(result.files.count, 0)
+        XCTAssertLessThanOrEqual(cancellationChecks, 4)
+    }
 }

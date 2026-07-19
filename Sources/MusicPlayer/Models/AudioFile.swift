@@ -136,8 +136,14 @@ struct AudioFile: Identifiable, Equatable {
     // Lazily loaded (and disk-cached) duration in seconds
     var duration: TimeInterval?
     
-    init(url: URL, metadata: AudioMetadata, lyricsTimeline: LyricsTimeline? = nil, duration: TimeInterval? = nil) {
-        self.id = AudioFile.makeStableID(for: url)
+    init(
+        id: String? = nil,
+        url: URL,
+        metadata: AudioMetadata,
+        lyricsTimeline: LyricsTimeline? = nil,
+        duration: TimeInterval? = nil
+    ) {
+        self.id = id ?? AudioFile.makeStableID(for: url)
         self.url = url
         self.metadata = metadata
         self.lyricsTimeline = lyricsTimeline

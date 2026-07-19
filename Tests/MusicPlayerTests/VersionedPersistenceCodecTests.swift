@@ -113,7 +113,7 @@ final class VersionedPersistenceCodecTests: XCTestCase {
             return
         }
 
-        XCTAssertEqual(json["version"] as? Int, 1, "should write version field")
+        XCTAssertEqual(json["version"] as? Int, 2, "should write current version field")
 
         guard let tracks = json["tracks"] as? [[String: Any]] else {
             XCTFail("tracks field missing or wrong type")

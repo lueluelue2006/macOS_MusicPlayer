@@ -78,8 +78,16 @@ final class SignatureCaptureTests: XCTestCase {
         let playlistID = await store.createPlaylist(name: "Test Playlist", trackURLs: [file1, file2])
         XCTAssertNotNil(playlistID)
 
+        await counter.waitForCaptureCount(2)
         let uniqueCaptures = await counter.uniqueCaptureCount()
         XCTAssertEqual(uniqueCaptures, 2, "Should capture signatures during playlist creation")
+
+        let enriched = await waitUntil {
+            guard let playlistID,
+                  let playlist = store.playlist(for: playlistID) else { return false }
+            return playlist.tracks.allSatisfy { $0.signature != nil }
+        }
+        XCTAssertTrue(enriched)
 
         store.flushPersistence()
 
@@ -115,6 +123,7 @@ final class SignatureCaptureTests: XCTestCase {
         let playlistID = await store.createPlaylist(name: "Add Test", trackURLs: [file1])
         XCTAssertNotNil(playlistID)
 
+        await counter.waitForCaptureCount(1)
         let capturesAfterCreate = await counter.captureCount()
         XCTAssertEqual(capturesAfterCreate, 1)
 
@@ -126,8 +135,14 @@ final class SignatureCaptureTests: XCTestCase {
         let added = await store.addTracks([file2], to: id)
         XCTAssertEqual(added, 1)
 
+        await counter.waitForCaptureCount(2)
         let totalCaptures = await counter.captureCount()
         XCTAssertEqual(totalCaptures, 2, "Should capture signature for newly added track")
+
+        let enriched = await waitUntil {
+            store.playlist(for: id)?.tracks.allSatisfy { $0.signature != nil } == true
+        }
+        XCTAssertTrue(enriched)
 
         store.flushPersistence()
 
@@ -225,7 +240,8 @@ final class SignatureCaptureTests: XCTestCase {
         await counter.resume()
 
         let added = await addTask.value
-        XCTAssertEqual(added, 0, "Deleted playlist should discard capture results")
+        XCTAssertEqual(added, 2, "Track insertion committed before the later playlist deletion")
+        try? await Task.sleep(nanoseconds: 50_000_000)
 
         let playlists = store.playlists
         XCTAssertTrue(playlists.isEmpty, "Playlist should be deleted")
@@ -240,6 +256,89 @@ final class SignatureCaptureTests: XCTestCase {
         }
 
         XCTAssertTrue(savedPlaylists.isEmpty, "No playlists should persist after deletion")
+    }
+
+    func testPersistenceRecoveryReschedulesOnlyCurrentMissingSignatureTargets() async throws {
+        let deletedURL = tempDir.appendingPathComponent("retry-deleted.wav")
+        let replacedURL = tempDir.appendingPathComponent("retry-replaced.wav")
+        let currentURL = tempDir.appendingPathComponent("retry-current.wav")
+        try TestAudioFixture.createSineWAV(at: deletedURL, frequency: 330, duration: 0.1)
+        try TestAudioFixture.createSineWAV(at: replacedURL, frequency: 440, duration: 0.1)
+        try TestAudioFixture.createSineWAV(at: currentURL, frequency: 550, duration: 0.1)
+
+        let storeFile = tempDir.appendingPathComponent("playlists-retry.json")
+        let store = PlaylistsStore(
+            playlistsFileURLOverride: storeFile,
+            signatureCaptureService: captureService,
+            automaticallyProcessesCleanup: false
+        )
+        await store.ensureLoaded()
+        try FileManager.default.createDirectory(at: storeFile, withIntermediateDirectories: false)
+
+        let deletedCreation = await store.createPlaylistResult(
+            name: "Deleted",
+            trackURLs: [deletedURL]
+        )
+        guard case .applied(let deletedPlaylistID, _) = deletedCreation else {
+            return XCTFail("first playlist mutation must be accepted in memory")
+        }
+        let liveCreation = await store.createPlaylistResult(
+            name: "Live",
+            trackURLs: [replacedURL]
+        )
+        guard case .applied(let livePlaylistID, _) = liveCreation,
+              let deletedPlaylist = store.playlist(for: deletedPlaylistID),
+              let replacedTrack = store.playlist(for: livePlaylistID)?.tracks.first else {
+            return XCTFail("test playlists must exist before recovery")
+        }
+
+        guard case .applied = store.deletePlaylistResult(deletedPlaylist),
+              case .applied = store.removeTracksResult(
+                  trackIDs: [replacedTrack.id],
+                  from: livePlaylistID
+              ) else {
+            return XCTFail("stale targets must be removable while persistence is dirty")
+        }
+        let replacement = await store.addTracksResult([currentURL], to: livePlaylistID)
+        guard case .applied(_, let latestReceipt) = replacement else {
+            return XCTFail("replacement track mutation must be accepted")
+        }
+
+        guard case .failed = await store.awaitDurableCommit(latestReceipt) else {
+            return XCTFail("directory at the snapshot path must exhaust the initial write retries")
+        }
+        let capturesBeforeRecovery = await counter.captureCount()
+        XCTAssertEqual(capturesBeforeRecovery, 0)
+
+        try FileManager.default.removeItem(at: storeFile)
+        let retryReceipt = try XCTUnwrap(store.retryPersistence())
+        guard case .committed = await store.awaitDurableCommit(retryReceipt) else {
+            return XCTFail("manual persistence retry must recover after storage is writable")
+        }
+
+        let enriched = await waitUntil(timeout: 2) {
+            guard let playlist = store.playlist(for: livePlaylistID),
+                  playlist.tracks.count == 1 else { return false }
+            return playlist.tracks[0].path == currentURL.path
+                && playlist.tracks[0].signature != nil
+        }
+        XCTAssertTrue(enriched)
+        XCTAssertNil(store.playlist(for: deletedPlaylistID))
+        let captureCount = await counter.captureCount()
+        let uniqueCaptureCount = await counter.uniqueCaptureCount()
+        XCTAssertEqual(captureCount, 1)
+        XCTAssertEqual(uniqueCaptureCount, 1)
+        XCTAssertTrue(store.flushPersistence())
+
+        let data = try Data(contentsOf: storeFile)
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        let savedPlaylists = try XCTUnwrap(payload["playlists"] as? [[String: Any]])
+        let savedTracks = savedPlaylists.flatMap {
+            ($0["tracks"] as? [[String: Any]]) ?? []
+        }
+        XCTAssertEqual(savedTracks.compactMap { $0["path"] as? String }, [currentURL.path])
     }
 
     func testPlaylistsStoreDrainWaitsForSignatureBatches() async throws {
@@ -278,10 +377,10 @@ final class SignatureCaptureTests: XCTestCase {
         let added = await addTask.value
         await drainTask.value
 
-        XCTAssertEqual(added, 1, "Track should be added before drain completes")
+        XCTAssertEqual(added, 1, "Track path mutation should commit before termination")
 
         let capturesCompleted = await counter.captureCount()
-        XCTAssertEqual(capturesCompleted, 1, "Drain should complete all signature captures")
+        XCTAssertEqual(capturesCompleted, 1, "The started capture should remain observable")
 
         guard let data = try? Data(contentsOf: storeFile),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -293,7 +392,11 @@ final class SignatureCaptureTests: XCTestCase {
         }
 
         let signaturesPresent = tracks.compactMap { $0["signature"] }.count
-        XCTAssertEqual(signaturesPresent, 1)
+        XCTAssertEqual(
+            signaturesPresent,
+            0,
+            "Termination cancels reconstructable signature enrichment instead of blocking quit"
+        )
     }
 
     func testPlaylistManagerDrainCancelsInProgressAndFlushes() async throws {
@@ -371,8 +474,16 @@ final class SignatureCaptureTests: XCTestCase {
         let playlistID = await store.createPlaylist(name: result.playlistName, tracks: result.tracks)
         XCTAssertNotNil(playlistID)
 
+        await counter.waitForCaptureCount(2)
         let uniqueCaptures = await counter.uniqueCaptureCount()
         XCTAssertEqual(uniqueCaptures, 2, "M3U8 tracks should trigger signature capture")
+
+        let enriched = await waitUntil {
+            guard let playlistID,
+                  let playlist = store.playlist(for: playlistID) else { return false }
+            return playlist.tracks.allSatisfy { $0.signature != nil }
+        }
+        XCTAssertTrue(enriched)
 
         store.flushPersistence()
 
@@ -387,5 +498,17 @@ final class SignatureCaptureTests: XCTestCase {
 
         let signaturesPresent = savedTracks.compactMap { $0["signature"] }.count
         XCTAssertEqual(signaturesPresent, 2, "M3U8 tracks should have persisted signatures")
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        condition: @escaping @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return condition()
     }
 }

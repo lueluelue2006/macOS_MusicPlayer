@@ -9,10 +9,12 @@ enum PlaylistCommands {
     static func createEmptyPlaylist(
         name: String,
         in store: PlaylistsStore
-    ) -> UserPlaylist.ID? {
+    ) -> PlaylistMutationResult<UserPlaylist.ID> {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return store.createEmptyPlaylist(name: trimmed)
+        guard !trimmed.isEmpty else {
+            return .rejected(.invalidInput("歌单名称不能为空"))
+        }
+        return store.createEmptyPlaylistResult(name: trimmed)
     }
 
     /// 重命名歌单。
@@ -20,18 +22,20 @@ enum PlaylistCommands {
         _ playlist: UserPlaylist,
         to newName: String,
         in store: PlaylistsStore
-    ) {
+    ) -> PlaylistMutationResult<UserPlaylist.ID> {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        store.renamePlaylist(playlist, to: trimmed)
+        guard !trimmed.isEmpty else {
+            return .rejected(.invalidInput("歌单名称不能为空"))
+        }
+        return store.renamePlaylistResult(playlist, to: trimmed)
     }
 
     /// 删除歌单。
     static func deletePlaylist(
         _ playlist: UserPlaylist,
         from store: PlaylistsStore
-    ) {
-        store.deletePlaylist(playlist)
+    ) -> PlaylistMutationResult<PlaylistDeletionSummary> {
+        store.deletePlaylistResult(playlist)
     }
 
     /// 从队列中移除一首歌曲，并在必要时清理播放器状态。

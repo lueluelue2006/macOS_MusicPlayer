@@ -177,8 +177,10 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
             configuration: configuration
         )
 
-        XCTAssertEqual(bounds.audibleEnd, 8.95, accuracy: 0.001)
-        XCTAssertGreaterThan(10 - bounds.audibleEnd, 1)
+        // Keep the fade down through the protection floor, then remove the
+        // genuinely silent suffix.
+        XCTAssertEqual(bounds.audibleEnd, 9.15, accuracy: 0.001)
+        XCTAssertGreaterThan(10 - bounds.audibleEnd, 0.75)
     }
 
     func testDetectorPreservesConstantQuietOutroWhenTailContrastIsLow() {
@@ -276,6 +278,30 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
         XCTAssertEqual(bounds.audibleEnd, 52.75, accuracy: 0.001)
     }
 
+    func testDetectorPreservesWeakCodaAboveProtectionFloorBeforeNineSecondsOfSilence() {
+        let configuration = detectorConfiguration()
+        let head = metrics(from: 0, through: 5, audibleRanges: [0 ..< 5.1])
+        var tail = metrics(from: 30, through: 60, audibleRanges: [30 ..< 45])
+        for index in tail.indices where (50 ..< 50.5).contains(tail[index].startTime) {
+            tail[index] = ImmersivePlaybackAnalyzer.WindowMetric(
+                startTime: tail[index].startTime,
+                duration: tail[index].duration,
+                rmsDBFS: -66,
+                peakDBFS: -58
+            )
+        }
+
+        let bounds = ImmersivePlaybackAnalyzer.detectBounds(
+            physicalDuration: 60,
+            headMetrics: head,
+            tailMetrics: tail,
+            configuration: configuration
+        )
+
+        XCTAssertEqual(bounds.audibleEnd, 50.75, accuracy: 0.001)
+        XCTAssertGreaterThan(60 - bounds.audibleEnd, 9)
+    }
+
     func testDetectorDoesNotMistakeSteppedQuietOutroForProgressiveFade() {
         let configuration = detectorConfiguration()
         let head = metrics(from: 0, through: 5, audibleRanges: [0 ..< 5.1])
@@ -325,7 +351,7 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
         XCTAssertEqual(bounds.audibleEnd, 10, accuracy: 0.001)
     }
 
-    func testDetectorTrimsACompletelyQuietLongTailDespiteAnIsolatedClick() {
+    func testDetectorPreservesAnIsolatedLoudTransientInsideOtherwiseQuietTail() {
         let configuration = detectorConfiguration()
         let head = metrics(from: 0, through: 5, audibleRanges: [0 ..< 4.5])
         var tail = metrics(from: 30, through: 60, audibleRanges: [])
@@ -347,8 +373,8 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
             configuration: configuration
         )
 
-        XCTAssertEqual(bounds.audibleEnd, 30.25, accuracy: 0.001)
-        XCTAssertLessThan(bounds.audibleEnd, 31)
+        XCTAssertEqual(bounds.audibleEnd, 50.35, accuracy: 0.001)
+        XCTAssertGreaterThan(bounds.audibleEnd, 50)
     }
 
     func testAnalyzerFindsBoundsInSyntheticWAVAndReloadsCacheAfterColdStart() async throws {
@@ -519,6 +545,148 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
         XCTAssertEqual(bounds.audibleStart, 2.90, accuracy: 0.01)
         // Tail extends to physical end
         XCTAssertEqual(bounds.audibleEnd, 10.0, accuracy: 0.01)
+    }
+
+    func testSlowDecodeFallsBackAtDeadlineWithoutBlockingCacheActor() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent("slow-source.bin")
+        try Data("fixture".utf8).write(to: audioURL)
+
+        let analyzer = ImmersivePlaybackAnalyzer(
+            cacheFileURL: nil,
+            configuration: .init(analysisTimeout: 0.05),
+            analysisOperation: { _, _ in
+                Thread.sleep(forTimeInterval: 0.5)
+                return .init(bounds: .fullRange(duration: 4), isCacheable: true)
+            }
+        )
+
+        let start = ContinuousClock.now
+        let bounds = await analyzer.bounds(for: audioURL)
+        let elapsed = start.duration(to: .now)
+        XCTAssertLessThan(elapsed, .milliseconds(250))
+        XCTAssertEqual(bounds, .fullRange(duration: 0))
+
+        let flushStart = ContinuousClock.now
+        let flushResult = await analyzer.flushPersistence()
+        XCTAssertLessThan(flushStart.duration(to: .now), .milliseconds(100))
+        guard case .success = flushResult else {
+            return XCTFail("Cache flush should not wait for the decode worker")
+        }
+    }
+
+    func testLateSuccessfulDecodePopulatesCacheAfterPlaybackDeadline() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent("late-success.bin")
+        try Data("fixture".utf8).write(to: audioURL)
+        let expected = PlaybackBounds(
+            audibleStart: 0.5,
+            audibleEnd: 3.5,
+            physicalDuration: 4
+        )
+        let analyzer = ImmersivePlaybackAnalyzer(
+            cacheFileURL: nil,
+            configuration: .init(analysisTimeout: 0.02),
+            analysisOperation: { _, _ in
+                Thread.sleep(forTimeInterval: 0.10)
+                return .init(bounds: expected, isCacheable: true)
+            }
+        )
+
+        let immediate = await analyzer.bounds(for: audioURL)
+        XCTAssertEqual(immediate, .fullRange(duration: 0))
+        let deadline = Date().addingTimeInterval(1)
+        var cached: PlaybackBounds?
+        repeat {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            cached = await analyzer.cachedBoundsIfValid(for: audioURL)
+        } while cached == nil && Date() < deadline
+        XCTAssertEqual(cached, expected)
+    }
+
+    func testReadFailureUsesSignatureBoundNegativeCache() async throws {
+        struct SyntheticFailure: Error {}
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent("unsupported.bin")
+        try Data("fixture".utf8).write(to: audioURL)
+        let counter = ImmersiveThreadSafeCounter()
+
+        let analyzer = ImmersivePlaybackAnalyzer(
+            cacheFileURL: nil,
+            configuration: .init(analysisTimeout: 0.5),
+            analysisOperation: { _, _ in
+                counter.increment()
+                throw SyntheticFailure()
+            }
+        )
+
+        _ = await analyzer.bounds(for: audioURL)
+        _ = await analyzer.bounds(for: audioURL)
+        XCTAssertEqual(counter.value, 1)
+
+        try Data("replacement".utf8).write(to: audioURL, options: .atomic)
+        _ = await analyzer.bounds(for: audioURL)
+        XCTAssertEqual(counter.value, 2, "A new file signature must clear the failure cooldown")
+    }
+
+    func testFutureCacheIsQuarantinedByteForByteBeforeCurrentCacheIsCreated() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cacheURL = directory.appendingPathComponent("immersive-boundaries.json")
+        let futureBytes = Data(
+            "{\"formatVersion\":99,\"algorithmVersion\":99,\"future\":\"preserve\"}".utf8
+        )
+        try futureBytes.write(to: cacheURL)
+
+        let analyzer = ImmersivePlaybackAnalyzer(cacheFileURL: cacheURL)
+        let clearResult = await analyzer.removeAll()
+        guard case .success = clearResult else {
+            return XCTFail("A future derived cache should be preserved then replaced with a clean active cache")
+        }
+
+        let quarantineDirectory = directory.appendingPathComponent("CacheQuarantine", isDirectory: true)
+        let quarantined = try FileManager.default.contentsOfDirectory(
+            at: quarantineDirectory,
+            includingPropertiesForKeys: nil
+        )
+        let preserved = try XCTUnwrap(quarantined.first)
+        XCTAssertEqual(try Data(contentsOf: preserved), futureBytes)
+
+        let activeObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as? [String: Any]
+        )
+        XCTAssertEqual(activeObject["formatVersion"] as? Int, 2)
+    }
+
+    func testFailedClearRestoresInMemoryEntries() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent("source.bin")
+        try Data("fixture".utf8).write(to: audioURL)
+        let blockedParent = directory.appendingPathComponent("not-a-directory")
+        try Data("blocker".utf8).write(to: blockedParent)
+        let cacheURL = blockedParent.appendingPathComponent("cache.json")
+
+        let expected = PlaybackBounds(audibleStart: 0.5, audibleEnd: 3.5, physicalDuration: 4)
+        let analyzer = ImmersivePlaybackAnalyzer(
+            cacheFileURL: cacheURL,
+            configuration: .init(analysisTimeout: 0.5),
+            analysisOperation: { _, _ in
+                .init(bounds: expected, isCacheable: true)
+            }
+        )
+        let analyzed = await analyzer.bounds(for: audioURL)
+        XCTAssertEqual(analyzed, expected)
+
+        let clearResult = await analyzer.removeAll()
+        guard case .failure = clearResult else {
+            return XCTFail("Clear should report the storage failure")
+        }
+        let cachedAfterFailedClear = await analyzer.cachedBoundsIfValid(for: audioURL)
+        XCTAssertEqual(cachedAfterFailedClear, expected)
     }
 
     func testIsolatedWeakAnacrusisPreserved() {
@@ -709,5 +877,22 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
             try file.write(from: buffer)
             writtenFrames += count
         }
+    }
+}
+
+private final class ImmersiveThreadSafeCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func increment() {
+        lock.lock()
+        storage += 1
+        lock.unlock()
     }
 }

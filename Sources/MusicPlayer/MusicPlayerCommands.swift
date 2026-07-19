@@ -138,8 +138,9 @@ struct MusicPlayerCommands: Commands {
                             cancelTitle: "不清除"
                         )
                         guard confirmed else { return }
-                        audioPlayer.clearVolumeCache()
-                        NotificationCenter.default.post(name: .showVolumeCacheClearedAlert, object: nil)
+                        if Self.clearVolumeCacheWithProtectedConfirmation(audioPlayer) {
+                            NotificationCenter.default.post(name: .showVolumeCacheClearedAlert, object: nil)
+                        }
                     }
                 }
 
@@ -152,13 +153,22 @@ struct MusicPlayerCommands: Commands {
                             cancelTitle: "不清除"
                         )
                         guard confirmed else { return }
-                        await audioPlayer.clearImmersivePlaybackCache()
-                        NotificationSettingsHelper.postToast(
-                            title: "沉浸分析缓存已清空",
-                            subtitle: "音乐文件没有改动",
-                            kind: "success",
-                            duration: 2.6
-                        )
+                        switch await audioPlayer.clearImmersivePlaybackCache() {
+                        case .success:
+                            NotificationSettingsHelper.postToast(
+                                title: "沉浸分析缓存已清空",
+                                subtitle: "音乐文件没有改动",
+                                kind: "success",
+                                duration: 2.6
+                            )
+                        case .failure(let error):
+                            NotificationSettingsHelper.postToast(
+                                title: "沉浸分析缓存清理失败",
+                                subtitle: error.localizedDescription,
+                                kind: "error",
+                                duration: 4.0
+                            )
+                        }
                     }
                 }
 
@@ -171,9 +181,13 @@ struct MusicPlayerCommands: Commands {
                             cancelTitle: "不清除"
                         )
                         guard confirmed else { return }
-                        await DurationCache.shared.removeAll()
-                        playlistManager.resetDurationsAndRestartPrefetch()
-                        NotificationCenter.default.post(name: .showDurationCacheClearedAlert, object: nil)
+                        switch await DurationCache.shared.clearPersistence() {
+                        case .success:
+                            playlistManager.resetDurationsAndRestartPrefetch()
+                            NotificationCenter.default.post(name: .showDurationCacheClearedAlert, object: nil)
+                        case .failure(let error):
+                            Self.postCacheFailure(title: "时长缓存清理失败", error: error)
+                        }
                     }
                 }
 
@@ -247,6 +261,7 @@ struct MusicPlayerCommands: Commands {
                         )
                         guard confirmed else { return }
                         audioPlayer.clearArtworkCache()
+                        await PlaylistArtworkStore.shared.clearMemoryCache()
                         NotificationCenter.default.post(name: .showArtworkCacheClearedAlert, object: nil)
                     }
                 }
@@ -271,18 +286,45 @@ struct MusicPlayerCommands: Commands {
                     Task { @MainActor in
                         let confirmed = DestructiveConfirmation.confirm(
                             title: "清空所有缓存？",
-                            message: "将清空音量均衡、沉浸分析、时长、封面缩略图（内存）和歌词缓存，不会修改音乐文件。操作不可撤销。",
+                            message: "将清空音量均衡、沉浸分析、元数据、时长、封面缩略图（内存）和歌词缓存，不会修改音乐文件。操作不可撤销。",
                             confirmTitle: "清除",
                             cancelTitle: "不清除"
                         )
                         guard confirmed else { return }
-                        audioPlayer.clearVolumeCache()
-                        await audioPlayer.clearImmersivePlaybackCache()
-                        await DurationCache.shared.removeAll()
-                        playlistManager.resetDurationsAndRestartPrefetch()
+                        let volumeCleared = Self.clearVolumeCacheWithProtectedConfirmation(audioPlayer)
+                        let immersiveResult = await audioPlayer.clearImmersivePlaybackCache()
+                        let durationResult = await DurationCache.shared.clearPersistence()
+                        let metadataResult = await MetadataCache.shared.clearPersistence()
+                        if case .success = durationResult {
+                            playlistManager.resetDurationsAndRestartPrefetch()
+                        }
                         audioPlayer.clearArtworkCache()
+                        await PlaylistArtworkStore.shared.clearMemoryCache()
                         await LyricsService.shared.invalidateAll()
-                        NotificationCenter.default.post(name: .showAllCachesClearedAlert, object: nil)
+                        let derivedFailures = [durationResult.map { _ in () }, metadataResult.map { _ in () }]
+                            .compactMap { result -> DerivedCachePersistenceError? in
+                                if case .failure(let error) = result { return error }
+                                return nil
+                            }
+                        if !volumeCleared {
+                            NotificationSettingsHelper.postToast(
+                                title: "部分缓存未清理",
+                                subtitle: "音量均衡缓存已保留",
+                                kind: "warning",
+                                duration: 4.0
+                            )
+                        } else if case .failure(let error) = immersiveResult {
+                            NotificationSettingsHelper.postToast(
+                                title: "部分缓存清理失败",
+                                subtitle: error.localizedDescription,
+                                kind: "error",
+                                duration: 4.0
+                            )
+                        } else if let firstFailure = derivedFailures.first {
+                            Self.postCacheFailure(title: "部分缓存清理失败", error: firstFailure)
+                        } else {
+                            NotificationCenter.default.post(name: .showAllCachesClearedAlert, object: nil)
+                        }
                     }
                 }
             }
@@ -424,6 +466,73 @@ struct MusicPlayerCommands: Commands {
                 NotificationCenter.default.post(name: .manualCheckForUpdates, object: nil)
             }
             .help("检查 GitHub Releases 是否有新版本")
+        }
+    }
+
+    private static func postCacheFailure(
+        title: String,
+        error: DerivedCachePersistenceError
+    ) {
+        NotificationSettingsHelper.postToast(
+            title: title,
+            subtitle: error.localizedDescription,
+            kind: "error",
+            duration: 4.0
+        )
+    }
+
+    @MainActor
+    private static func clearVolumeCacheWithProtectedConfirmation(
+        _ audioPlayer: AudioPlayer
+    ) -> Bool {
+        switch audioPlayer.clearVolumeCache() {
+        case .cleared:
+            return true
+        case .failed(let message):
+            NotificationSettingsHelper.postToast(
+                title: "音量均衡缓存清理失败",
+                subtitle: message,
+                kind: "error",
+                duration: 4.0
+            )
+            return false
+        case .requiresConfirmation(let reason):
+            let confirmed = DestructiveConfirmation.confirm(
+                title: "删除受保护的音量缓存？",
+                message: protectedVolumeCacheMessage(reason),
+                confirmTitle: "仍然删除",
+                cancelTitle: "保留"
+            )
+            guard confirmed else { return false }
+            switch audioPlayer.clearVolumeCache(forceProtectedData: true) {
+            case .cleared:
+                return true
+            case .failed(let message):
+                NotificationSettingsHelper.postToast(
+                    title: "音量均衡缓存清理失败",
+                    subtitle: message,
+                    kind: "error",
+                    duration: 4.0
+                )
+                return false
+            case .requiresConfirmation:
+                return false
+            }
+        }
+    }
+
+    private static func protectedVolumeCacheMessage(
+        _ reason: ProtectedVolumeCacheReason
+    ) -> String {
+        switch reason {
+        case .futureLegacyJSON(let version):
+            return "发现由更高版本创建的音量缓存（版本 \(version)）。删除后无法恢复其中的数据。"
+        case .unknownLegacyJSON:
+            return "现有音量缓存格式无法识别。删除后无法恢复原文件。"
+        case .futureDatabase(let version):
+            return "发现由更高版本创建的音量数据库（版本 \(version)）。删除后无法恢复其中的数据。"
+        case .foreignDatabase:
+            return "现有数据库不属于 MusicPlayer。为避免误删，只有再次确认后才会移除。"
         }
     }
 }

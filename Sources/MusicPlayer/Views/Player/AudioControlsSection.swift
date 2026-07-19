@@ -17,7 +17,12 @@ struct AudioControlsSection: View {
           get: { Double(viewModel.audioPlayer.volume) },
           set: { viewModel.audioPlayer.setVolume(Float($0)) }
         ),
-        in: 0...1
+        in: 0...1,
+        onEditingChanged: { isEditing in
+          if !isEditing {
+            _ = viewModel.audioPlayer.flushUserPreferencesPersistence()
+          }
+        }
       )
       .controlSize(.small)
       .tint(theme.accent)

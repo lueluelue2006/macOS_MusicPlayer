@@ -9,5 +9,6 @@ dmg-temp/
 .vscode/
 .swiftpm/
 .codex/
+.codex-tasks/
 *.dmg
 SHA256SUMS.txt

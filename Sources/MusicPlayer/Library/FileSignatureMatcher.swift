@@ -1,8 +1,18 @@
 import Foundation
 
+struct FileRelocationCandidate: Equatable, Sendable {
+    let url: URL
+    let signature: FileSignature
+}
+
 /// Pure matcher for FileSignature identity comparison.
 /// No I/O, no disk scanning, no filesystem access—only value-based logic.
 enum FileSignatureMatcher {
+
+    enum IdentityKey: Hashable, Sendable {
+        case resource(identifier: String, volume: String)
+        case inode(number: UInt64, volume: String, size: Int64, modificationTime: Int64)
+    }
 
     // MARK: - Result Types
 
@@ -99,6 +109,26 @@ enum FileSignatureMatcher {
         default:
             return .ambiguous
         }
+    }
+
+    /// Produces the same strong identity used by `match`, allowing callers to
+    /// index relocation candidates once instead of rescanning the full list for
+    /// every missing track.
+    static func identityKey(for signature: FileSignature) -> IdentityKey? {
+        let resourceID = usableIdentifier(signature.fileResourceIdentifier)
+        let volumeID = usableIdentifier(signature.volumeIdentifier)
+        if let resourceID, let volumeID {
+            return .resource(identifier: resourceID, volume: volumeID)
+        }
+        guard resourceID == nil,
+              let inode = signature.inode,
+              let volumeID else { return nil }
+        return .inode(
+            number: inode,
+            volume: volumeID,
+            size: signature.size,
+            modificationTime: signature.modificationTimeNanoseconds
+        )
     }
 
     // MARK: - Private Helpers

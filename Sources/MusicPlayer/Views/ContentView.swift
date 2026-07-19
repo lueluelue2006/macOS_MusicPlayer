@@ -41,9 +41,6 @@ struct ContentView: View {
                 )
                 triggerAutoUpdateCheck()
             }
-            .onDisappear {
-                playlistManager.savePlaylist()
-            }
             .onDrop(of: [.fileURL], isTargeted: nil) { providers in
                 handleGlobalDrop(providers: providers)
                 return true

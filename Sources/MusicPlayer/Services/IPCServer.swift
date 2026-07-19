@@ -11,9 +11,17 @@ final class IPCServer {
     private let instanceID: String
     private let requestNotificationName: Notification.Name
     private let replyNotificationName: Notification.Name
-    private let authToken: String
+    private let authToken: String?
     private let registrationURL: URL?
     private var observer: NSObjectProtocol?
+    private let decodeQueue = DispatchQueue(label: "MusicPlayer.IPC.Decode", qos: .utility)
+    private let requestStateLock = NSLock()
+    private var inFlightRequestIDs: Set<String> = []
+    private var recentReplyOrder: [String] = []
+    private var recentReplies: [String: IPCReply] = [:]
+    private static let maximumPayloadBytes = 256 * 1_024
+    private static let maximumInFlightRequests = 16
+    private static let maximumRememberedReplies = 128
 
     init(audioPlayer: AudioPlayer, playlistManager: PlaylistManager, playlistsStore: PlaylistsStore) {
         self.audioPlayer = audioPlayer
@@ -23,8 +31,9 @@ final class IPCServer {
         self.instanceID = instanceID
         self.requestNotificationName = MusicPlayerIPC.requestNotification(for: instanceID)
         self.replyNotificationName = MusicPlayerIPC.replyNotification(for: instanceID)
-        self.authToken = Self.loadOrCreateAuthToken()
-        self.registrationURL = Self.registrationURL(for: instanceID)
+        let token = Self.loadOrCreateAuthToken()
+        self.authToken = token
+        self.registrationURL = token == nil ? nil : Self.registrationURL(for: instanceID)
         start()
     }
 
@@ -36,7 +45,7 @@ final class IPCServer {
     }
 
     private func start() {
-        registerInstance()
+        guard authToken != nil else { return }
         observer = center.addObserver(
             forName: requestNotificationName,
             object: nil,
@@ -44,19 +53,88 @@ final class IPCServer {
         ) { [weak self] notification in
             self?.handle(notification)
         }
+        // Publish discoverability only after the request observer is live.
+        registerInstance()
     }
 
     private func handle(_ notification: Notification) {
-        guard
-            let userInfo = notification.userInfo,
-            let data = userInfo[MusicPlayerIPC.payloadKey] as? Data,
-            let request = try? MusicPlayerIPC.decodePayload(IPCRequest.self, from: data)
-        else { return }
+        guard let data = notification.userInfo?[MusicPlayerIPC.payloadKey] as? Data,
+              !data.isEmpty,
+              data.count <= Self.maximumPayloadBytes else { return }
 
-        Task { @MainActor in
-            let reply = await self.handleRequest(request)
-            self.postReply(reply)
+        decodeQueue.async { [weak self] in
+            guard let self,
+                  let request = try? MusicPlayerIPC.decodePayload(IPCRequest.self, from: data),
+                  self.isAuthenticated(request),
+                  Self.isStructurallyValid(request) else { return }
+
+            self.requestStateLock.lock()
+            if let cached = self.recentReplies[request.id] {
+                self.requestStateLock.unlock()
+                self.postReply(cached)
+                return
+            }
+            if self.inFlightRequestIDs.contains(request.id) {
+                self.requestStateLock.unlock()
+                return
+            }
+            guard self.inFlightRequestIDs.count < Self.maximumInFlightRequests else {
+                self.requestStateLock.unlock()
+                self.postReply(
+                    IPCReply(id: request.id, ok: false, message: "IPC 忙，请稍后重试")
+                )
+                return
+            }
+            self.inFlightRequestIDs.insert(request.id)
+            self.requestStateLock.unlock()
+
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let reply = await self.handleRequest(request)
+                self.finishRequest(reply)
+            }
         }
+    }
+
+    private func finishRequest(_ reply: IPCReply) {
+        requestStateLock.lock()
+        inFlightRequestIDs.remove(reply.id)
+        if recentReplies[reply.id] == nil {
+            recentReplyOrder.append(reply.id)
+        }
+        recentReplies[reply.id] = reply
+        while recentReplyOrder.count > Self.maximumRememberedReplies {
+            let removed = recentReplyOrder.removeFirst()
+            recentReplies.removeValue(forKey: removed)
+        }
+        requestStateLock.unlock()
+        postReply(reply)
+    }
+
+    private static func isStructurallyValid(_ request: IPCRequest) -> Bool {
+        guard request.id.utf8.count <= 64,
+              UUID(uuidString: request.id) != nil else { return false }
+        var totalBytes = request.id.utf8.count
+        if let arguments = request.arguments {
+            guard arguments.count <= 64 else { return false }
+            for (key, value) in arguments {
+                let keyBytes = key.utf8.count
+                let valueBytes = value.utf8.count
+                guard keyBytes > 0, keyBytes <= 128, valueBytes <= 16 * 1_024 else { return false }
+                totalBytes += keyBytes + valueBytes
+                guard totalBytes <= maximumPayloadBytes else { return false }
+            }
+        }
+        if let paths = request.paths {
+            guard paths.count <= 128 else { return false }
+            for path in paths {
+                let bytes = path.utf8.count
+                guard path.hasPrefix("/"), bytes > 0, bytes <= 16 * 1_024 else { return false }
+                totalBytes += bytes
+                guard totalBytes <= maximumPayloadBytes else { return false }
+            }
+        }
+        return true
     }
 
     @MainActor
@@ -195,13 +273,13 @@ final class IPCServer {
             return handleLocateNowPlaying(request)
 
         case .setWeight:
-            return handleSetWeight(request)
+            return await handleSetWeight(request)
 
         case .getWeight:
             return handleGetWeight(request)
 
         case .clearWeights:
-            return handleClearWeights(request)
+            return await handleClearWeights(request)
 
         case .syncPlaylistWeightsToQueue:
             return await handleSyncPlaylistWeightsToQueue(request)
@@ -649,7 +727,7 @@ final class IPCServer {
         let items: [PlaylistSummaryItem]
     }
 
-    private struct PlaylistTrackItem: Codable {
+    private struct PlaylistTrackItem: Codable, Sendable {
         let index: Int
         let path: String
         let fileName: String
@@ -778,9 +856,18 @@ final class IPCServer {
 
     @MainActor
     private func handleClearQueue(_ request: IPCRequest) -> IPCReply {
-        playlistManager.clearAllFiles()
+        let result = playlistManager.clearAllFiles()
+        guard result.didApply else {
+            return IPCReply(id: request.id, ok: false, message: "queue is not writable")
+        }
         audioPlayer.stopAndClearCurrent()
-        return IPCReply(id: request.id, ok: true, message: "queue cleared")
+        return IPCReply(
+            id: request.id,
+            ok: result.isDurable,
+            message: result.isDurable
+                ? "queue cleared"
+                : "queue cleared in memory; persistence is retrying"
+        )
     }
 
     @MainActor
@@ -839,30 +926,37 @@ final class IPCServer {
             return 200
         }()
 
+        let total = playlist.tracks.count
+        let start = max(0, min(offset, total))
+        // Page the lightweight persisted records before touching the file system
+        // or the weight store. A CLI request must not turn into an O(library)
+        // main-thread scan merely because the playlist itself is large.
+        let pageTracks = Array(playlist.tracks.enumerated().dropFirst(start).prefix(limit))
         let currentLookup = currentTrackLookupSet()
-        let allItems: [PlaylistTrackItem] = playlist.tracks.enumerated().map { entry in
-            let path = entry.element.path
-            let url = URL(fileURLWithPath: path)
-            let exists = FileManager.default.fileExists(atPath: path)
-            let lookup = Set(PathKey.lookupKeys(for: url))
-            return PlaylistTrackItem(
-                index: entry.offset,
-                path: path,
-                fileName: url.lastPathComponent,
-                exists: exists,
-                isCurrent: !currentLookup.isDisjoint(with: lookup),
-                queueWeight: PlaybackWeights.shared.level(for: url, scope: .queue).rawValue,
-                playlistWeight: PlaybackWeights.shared.level(for: url, scope: .playlist(playlistID)).rawValue
-            )
-        }
+        let page: [PlaylistTrackItem] = await Task.detached(priority: .utility) {
+            pageTracks.map { entry in
+                let path = entry.element.path
+                let url = URL(fileURLWithPath: path)
+                let exists = FileManager.default.fileExists(atPath: path)
+                let lookup = Set(PathKey.lookupKeys(for: url))
+                return PlaylistTrackItem(
+                    index: entry.offset,
+                    path: path,
+                    fileName: url.lastPathComponent,
+                    exists: exists,
+                    isCurrent: !currentLookup.isDisjoint(with: lookup),
+                    queueWeight: PlaybackWeights.shared.level(for: url, scope: .queue).rawValue,
+                    playlistWeight: PlaybackWeights.shared.level(for: url, scope: .playlist(playlistID)).rawValue
+                )
+            }
+        }.value
 
-        let page = Array(allItems.dropFirst(offset).prefix(limit))
         let payload = PlaylistTracksPayload(
             playlistID: playlistID.uuidString,
             playlistName: playlist.name,
-            total: allItems.count,
+            total: total,
             returned: page.count,
-            offset: offset,
+            offset: start,
             items: page
         )
 
@@ -903,20 +997,23 @@ final class IPCServer {
         }
         let name = request.arguments?["name"] ?? ""
         let urls: [URL] = (request.paths ?? []).map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
-        let createdID = await playlistsStore.createPlaylist(name: name, trackURLs: urls)
-        if let id = createdID {
+        let mutation = await playlistsStore.createPlaylistResult(name: name, trackURLs: urls)
+        switch await playlistsStore.awaitDurability(of: mutation) {
+        case .committed(let id), .unchanged(let id):
             return IPCReply(
                 id: request.id,
                 ok: true,
                 message: "playlist created",
                 data: ["playlistID": id.uuidString]
             )
-        } else {
+        case .rejected(let rejection):
             return IPCReply(
                 id: request.id,
                 ok: false,
-                message: "create failed (read-only or terminating)"
+                message: rejection.diagnosticMessage
             )
+        case .persistenceFailed(let failure):
+            return IPCReply(id: request.id, ok: false, message: failure.diagnosticMessage)
         }
     }
 
@@ -934,8 +1031,15 @@ final class IPCServer {
         guard let playlist = playlistsStore.playlist(for: playlistID) else {
             return IPCReply(id: request.id, ok: false, message: "playlist not found")
         }
-        playlistsStore.renamePlaylist(playlist, to: name)
-        return IPCReply(id: request.id, ok: true, message: "playlist renamed")
+        let mutation = playlistsStore.renamePlaylistResult(playlist, to: name)
+        switch await playlistsStore.awaitDurability(of: mutation) {
+        case .committed, .unchanged:
+            return IPCReply(id: request.id, ok: true, message: "playlist renamed")
+        case .rejected(let rejection):
+            return IPCReply(id: request.id, ok: false, message: rejection.diagnosticMessage)
+        case .persistenceFailed(let failure):
+            return IPCReply(id: request.id, ok: false, message: failure.diagnosticMessage)
+        }
     }
 
     @MainActor
@@ -952,8 +1056,15 @@ final class IPCServer {
         if playlistManager.playbackScope == .playlist(playlistID) {
             playlistManager.setPlaybackScopeQueue()
         }
-        playlistsStore.deletePlaylist(playlist)
-        return IPCReply(id: request.id, ok: true, message: "playlist deleted")
+        let mutation = playlistsStore.deletePlaylistResult(playlist)
+        switch await playlistsStore.awaitDurability(of: mutation) {
+        case .committed, .unchanged:
+            return IPCReply(id: request.id, ok: true, message: "playlist deleted")
+        case .rejected(let rejection):
+            return IPCReply(id: request.id, ok: false, message: rejection.diagnosticMessage)
+        case .persistenceFailed(let failure):
+            return IPCReply(id: request.id, ok: false, message: failure.diagnosticMessage)
+        }
     }
 
     @MainActor
@@ -992,7 +1103,16 @@ final class IPCServer {
         }
 
         let urls = pathList.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
-        let added = await playlistsStore.addTracks(urls, to: playlistID)
+        let mutation = await playlistsStore.addTracksResult(urls, to: playlistID)
+        let added: Int
+        switch await playlistsStore.awaitDurability(of: mutation) {
+        case .committed(let summary), .unchanged(let summary):
+            added = summary.affectedCount
+        case .rejected(let rejection):
+            return IPCReply(id: request.id, ok: false, message: rejection.diagnosticMessage)
+        case .persistenceFailed(let failure):
+            return IPCReply(id: request.id, ok: false, message: failure.diagnosticMessage)
+        }
 
         guard let updatedPlaylist = playlistsStore.playlist(for: playlistID) else {
             return IPCReply(id: request.id, ok: false, message: "playlist was deleted during add")
@@ -1026,7 +1146,7 @@ final class IPCServer {
             return IPCReply(id: request.id, ok: false, message: "playlist not found")
         }
 
-        var pathsToRemove: [String] = []
+        var trackIDsToRemove: [UUID] = []
         let mode = request.arguments?["mode"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let removeAllMatches = (mode == "all") || (parseBool(request.arguments?["all"]) ?? false)
 
@@ -1034,9 +1154,32 @@ final class IPCServer {
             guard index >= 0, index < playlist.tracks.count else {
                 return IPCReply(id: request.id, ok: false, message: "index out of range")
             }
-            pathsToRemove = [playlist.tracks[index].path]
+            trackIDsToRemove = [playlist.tracks[index].id]
         } else if let rawPath = request.arguments?["path"]?.trimmingCharacters(in: .whitespacesAndNewlines), !rawPath.isEmpty {
-            pathsToRemove = [(rawPath as NSString).expandingTildeInPath]
+            let expandedPath = (rawPath as NSString).expandingTildeInPath
+            let targetLookup = Set(PathKey.lookupKeys(for: URL(fileURLWithPath: expandedPath)))
+            let matches = playlist.tracks.enumerated().filter { _, track in
+                !targetLookup.isDisjoint(
+                    with: Set(PathKey.lookupKeys(for: URL(fileURLWithPath: track.path)))
+                )
+            }
+            guard !matches.isEmpty else {
+                return IPCReply(id: request.id, ok: false, message: "no match for path")
+            }
+            if !removeAllMatches, matches.count > 1 {
+                let preview = matches.prefix(8).map {
+                    "[\($0.offset)] \(URL(fileURLWithPath: $0.element.path).lastPathComponent)"
+                }.joined(separator: "\n")
+                let suffix = matches.count > 8 ? "\n…" : ""
+                return IPCReply(
+                    id: request.id,
+                    ok: false,
+                    message: "\(matches.count) matching occurrences. Use --index or mode=all.\n\(preview)\(suffix)"
+                )
+            }
+            trackIDsToRemove = removeAllMatches
+                ? matches.map { $0.element.id }
+                : [matches[0].element.id]
         } else if let rawQuery = request.arguments?["query"] {
             let tokens = tokenizeQuery(rawQuery)
             guard !tokens.isEmpty else {
@@ -1064,18 +1207,26 @@ final class IPCServer {
                     message: "\(matches.count) matches. Use --index or mode=all.\n\(preview)\(suffix)"
                 )
             }
-            pathsToRemove = removeAllMatches ? matches.map { $0.element.path } : [matches[0].element.path]
+            trackIDsToRemove = removeAllMatches
+                ? matches.map { $0.element.id }
+                : [matches[0].element.id]
         } else {
             return IPCReply(id: request.id, ok: false, message: "missing index/path/query")
         }
 
-        guard !pathsToRemove.isEmpty else {
+        guard !trackIDsToRemove.isEmpty else {
             return IPCReply(id: request.id, ok: false, message: "no tracks to remove")
         }
 
-        let deduped = Array(Set(pathsToRemove))
-        for path in deduped {
-            playlistsStore.removeTrack(path: path, from: playlistID)
+        let mutation = playlistsStore.removeTracksResult(trackIDs: trackIDsToRemove, from: playlistID)
+        let removedCount: Int
+        switch await playlistsStore.awaitDurability(of: mutation) {
+        case .committed(let summary), .unchanged(let summary):
+            removedCount = summary.affectedCount
+        case .rejected(let rejection):
+            return IPCReply(id: request.id, ok: false, message: rejection.diagnosticMessage)
+        case .persistenceFailed(let failure):
+            return IPCReply(id: request.id, ok: false, message: failure.diagnosticMessage)
         }
 
         if playlistManager.playbackScope == .playlist(playlistID) {
@@ -1086,9 +1237,9 @@ final class IPCServer {
         return IPCReply(
             id: request.id,
             ok: true,
-            message: "removed \(deduped.count) item(s)",
+            message: "removed \(removedCount) item(s)",
             data: [
-                "removedCount": "\(deduped.count)",
+                "removedCount": "\(removedCount)",
                 "trackCount": "\(remaining)",
                 "playlistID": playlistID.uuidString
             ]
@@ -1106,20 +1257,19 @@ final class IPCServer {
         }
 
         let fm = FileManager.default
-        let urlsInOrder = playlist.tracks
-            .map { URL(fileURLWithPath: $0.path) }
-            .filter { fm.fileExists(atPath: $0.path) }
+        let playableTracks = playlist.tracks.filter { fm.fileExists(atPath: $0.path) }
+        let urlsInOrder = playableTracks.map { URL(fileURLWithPath: $0.path) }
         guard !urlsInOrder.isEmpty else {
             return IPCReply(id: request.id, ok: false, message: "playlist has no playable tracks")
         }
 
-        let targetURL: URL = {
+        let targetPosition: Int = {
             if let raw = request.arguments?["index"], let index = Int(raw), index >= 0, index < urlsInOrder.count {
-                return urlsInOrder[index]
+                return index
             }
             if let raw = request.arguments?["query"] {
                 let tokens = tokenizeQuery(raw)
-                if let matched = urlsInOrder.first(where: { url in
+                if let matched = urlsInOrder.firstIndex(where: { url in
                     let fields = [url.lastPathComponent, url.path]
                     return tokens.allSatisfy { token in
                         fields.contains(where: { $0.localizedCaseInsensitiveContains(token) })
@@ -1128,8 +1278,9 @@ final class IPCServer {
                     return matched
                 }
             }
-            return urlsInOrder[0]
+            return 0
         }()
+        let targetURL = urlsInOrder[targetPosition]
 
         var queueMap: [String: AudioFile] = [:]
         queueMap.reserveCapacity(playlistManager.audioFiles.count * 2)
@@ -1168,7 +1319,12 @@ final class IPCServer {
         }
 
         playlistsStore.selectedPlaylistID = playlistID
-        playlistManager.setPlaybackScopePlaylist(playlistID, trackURLsInOrder: urlsInOrder)
+        playlistManager.setPlaybackScopePlaylist(
+            playlistID,
+            trackURLsInOrder: urlsInOrder,
+            trackIDsInOrder: playableTracks.map { $0.id.uuidString },
+            selectedTrackID: playableTracks[targetPosition].id.uuidString
+        )
 
         audioPlayer.selectOrResume(selected)
 
@@ -1199,12 +1355,17 @@ final class IPCServer {
             guard let playlist = playlistsStore.playlist(for: playlistID) else {
                 return IPCReply(id: request.id, ok: false, message: "playlist not found")
             }
-            let urls = compactPlayableURLs(from: playlist)
+            let tracks = compactPlayableTracks(from: playlist)
+            let urls = tracks.map { URL(fileURLWithPath: $0.path) }
             guard !urls.isEmpty else {
                 return IPCReply(id: request.id, ok: false, message: "playlist has no playable tracks")
             }
             playlistsStore.selectedPlaylistID = playlistID
-            playlistManager.setPlaybackScopePlaylist(playlistID, trackURLsInOrder: urls)
+            playlistManager.setPlaybackScopePlaylist(
+                playlistID,
+                trackURLsInOrder: urls,
+                trackIDsInOrder: tracks.map { $0.id.uuidString }
+            )
             return IPCReply(id: request.id, ok: true, message: "scope=playlist", data: ["playlistID": playlistID.uuidString])
         default:
             return IPCReply(id: request.id, ok: false, message: "invalid scope")
@@ -1229,7 +1390,7 @@ final class IPCServer {
     }
 
     @MainActor
-    private func handleSetWeight(_ request: IPCRequest) -> IPCReply {
+    private func handleSetWeight(_ request: IPCRequest) async -> IPCReply {
         guard let scope = parseWeightScope(arguments: request.arguments) else {
             return IPCReply(id: request.id, ok: false, message: "invalid scope/playlistID")
         }
@@ -1241,25 +1402,18 @@ final class IPCServer {
         }
 
         let result = PlaybackWeights.shared.setLevel(level, for: url, scope: scope)
-        switch result {
-        case .applied, .unchanged:
-            return IPCReply(
-                id: request.id,
-                ok: true,
-                data: [
-                    "path": url.path,
-                    "scope": weightScopeLabel(scope),
-                    "level": "\(level.rawValue)",
-                    "multiplier": String(format: "%.3f", level.multiplier)
-                ]
-            )
-        case .rejectedReadOnly(let reason):
-            return IPCReply(
-                id: request.id,
-                ok: false,
-                message: "权重设置被拒绝: \(reason.diagnosticMessage)"
-            )
-        }
+        return await makeDurableWeightMutationReply(
+            requestID: request.id,
+            successMessage: nil,
+            data: [
+                "path": url.path,
+                "scope": weightScopeLabel(scope),
+                "level": "\(level.rawValue)",
+                "multiplier": String(format: "%.3f", level.multiplier)
+            ],
+            mutationResult: result,
+            rejectedPrefix: "权重设置被拒绝"
+        )
     }
 
     @MainActor
@@ -1284,27 +1438,29 @@ final class IPCServer {
     }
 
     @MainActor
-    private func handleClearWeights(_ request: IPCRequest) -> IPCReply {
+    private func handleClearWeights(_ request: IPCRequest) async -> IPCReply {
         let scopeRaw = request.arguments?["scope"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if scopeRaw == "all" || (parseBool(request.arguments?["all"]) ?? false) {
             let result = PlaybackWeights.shared.clearAll()
-            switch result {
-            case .applied, .unchanged:
-                return IPCReply(id: request.id, ok: true, message: "cleared all weight overrides")
-            case .rejectedReadOnly(let reason):
-                return IPCReply(id: request.id, ok: false, message: "清空权重被拒绝: \(reason.diagnosticMessage)")
-            }
+            return await makeDurableWeightMutationReply(
+                requestID: request.id,
+                successMessage: "cleared all weight overrides",
+                data: nil,
+                mutationResult: result,
+                rejectedPrefix: "清空权重被拒绝"
+            )
         }
         guard let scope = parseWeightScope(arguments: request.arguments) else {
             return IPCReply(id: request.id, ok: false, message: "invalid scope/playlistID")
         }
         let result = PlaybackWeights.shared.clear(scope: scope)
-        switch result {
-        case .applied, .unchanged:
-            return IPCReply(id: request.id, ok: true, message: "weights cleared", data: ["scope": weightScopeLabel(scope)])
-        case .rejectedReadOnly(let reason):
-            return IPCReply(id: request.id, ok: false, message: "清空权重被拒绝: \(reason.diagnosticMessage)")
-        }
+        return await makeDurableWeightMutationReply(
+            requestID: request.id,
+            successMessage: "weights cleared",
+            data: ["scope": weightScopeLabel(scope)],
+            mutationResult: result,
+            rejectedPrefix: "清空权重被拒绝"
+        )
     }
 
     @MainActor
@@ -1318,24 +1474,82 @@ final class IPCServer {
         }
 
         let result = PlaybackWeights.shared.syncPlaylistOverridesToQueue(from: playlistID)
-        switch result.mutationResult {
-        case .applied, .unchanged:
-            return IPCReply(
-                id: request.id,
-                ok: true,
-                data: [
-                    "playlistID": playlistID.uuidString,
-                    "total": "\(result.total)",
-                    "changed": "\(result.changed)"
-                ]
-            )
+        return await makeDurableWeightMutationReply(
+            requestID: request.id,
+            successMessage: nil,
+            data: [
+                "playlistID": playlistID.uuidString,
+                "total": "\(result.total)",
+                "changed": "\(result.changed)"
+            ],
+            mutationResult: result.mutationResult,
+            rejectedPrefix: "同步权重被拒绝"
+        )
+    }
+
+    @MainActor
+    private func makeDurableWeightMutationReply(
+        requestID: String,
+        successMessage: String?,
+        data: [String: String]?,
+        mutationResult: PlaybackWeights.MutationResult,
+        rejectedPrefix: String
+    ) async -> IPCReply {
+        switch mutationResult {
         case .rejectedReadOnly(let reason):
             return IPCReply(
-                id: request.id,
+                id: requestID,
                 ok: false,
-                message: "同步权重被拒绝: \(reason.diagnosticMessage)"
+                message: "\(rejectedPrefix): \(reason.diagnosticMessage)"
+            )
+        case .applied, .unchanged:
+            let flushResult = await Task.detached(priority: .utility) {
+                PlaybackWeights.shared.flushPersistence()
+            }.value
+            return Self.makeWeightPersistenceReply(
+                requestID: requestID,
+                successMessage: successMessage,
+                data: data,
+                flushResult: flushResult
             )
         }
+    }
+
+    /// Kept internal so durability semantics can be verified without launching
+    /// an app instance or touching the user's real weight store.
+    static func makeWeightPersistenceReply(
+        requestID: String,
+        successMessage: String?,
+        data: [String: String]?,
+        flushResult: PlaybackWeights.PersistenceFlushResult
+    ) -> IPCReply {
+        guard flushResult.isDurable else {
+            let detail: String
+            switch flushResult.outcome {
+            case .failed(.storageUnavailable):
+                detail = "storage unavailable"
+            case .failed(.capacityExceeded):
+                detail = "capacity exceeded"
+            case .failed(.writeFailed):
+                detail = "write failed"
+            case .rejectedReadOnly(let reason):
+                detail = reason.diagnosticMessage
+            case .persisted, .alreadyCurrent:
+                detail = "pending changes remain"
+            }
+            var diagnosticData = data ?? [:]
+            diagnosticData["acceptedInMemory"] = "true"
+            diagnosticData["durableGeneration"] = "\(flushResult.durableGeneration)"
+            diagnosticData["attemptedGeneration"] = "\(flushResult.attemptedGeneration)"
+            diagnosticData["hasPendingChanges"] = flushResult.hasPendingChanges ? "true" : "false"
+            return IPCReply(
+                id: requestID,
+                ok: false,
+                message: "weight persistence failed: \(detail)",
+                data: diagnosticData
+            )
+        }
+        return IPCReply(id: requestID, ok: true, message: successMessage, data: data)
     }
 
     @MainActor
@@ -1371,7 +1585,9 @@ final class IPCServer {
                       let playlist = playlistsStore.playlist(for: playlistID) else {
                     return IPCReply(id: request.id, ok: false, message: "playlist not found")
                 }
-                urls = compactPlayableURLs(from: playlist)
+                urls = compactPlayableTracks(from: playlist).map {
+                    URL(fileURLWithPath: $0.path)
+                }
             } else if scope == "current" {
                 guard let current = audioPlayer.currentFile?.url else {
                     return IPCReply(id: request.id, ok: false, message: "no current track")
@@ -1524,19 +1740,22 @@ final class IPCServer {
             playlistManager.setPlaybackScopeQueue()
             return
         }
-        let urls = compactPlayableURLs(from: playlist)
+        let tracks = compactPlayableTracks(from: playlist)
+        let urls = tracks.map { URL(fileURLWithPath: $0.path) }
         if urls.isEmpty {
             playlistManager.setPlaybackScopeQueue()
         } else {
-            playlistManager.setPlaybackScopePlaylist(playlistID, trackURLsInOrder: urls)
+            playlistManager.setPlaybackScopePlaylist(
+                playlistID,
+                trackURLsInOrder: urls,
+                trackIDsInOrder: tracks.map { $0.id.uuidString }
+            )
         }
     }
 
-    private func compactPlayableURLs(from playlist: UserPlaylist) -> [URL] {
+    private func compactPlayableTracks(from playlist: UserPlaylist) -> [UserPlaylist.Track] {
         let fm = FileManager.default
-        return playlist.tracks
-            .map { URL(fileURLWithPath: $0.path) }
-            .filter { fm.fileExists(atPath: $0.path) }
+        return playlist.tracks.filter { fm.fileExists(atPath: $0.path) }
     }
 
     private func parseBool(_ raw: String?) -> Bool? {
@@ -1724,7 +1943,8 @@ final class IPCServer {
     }
 
     private func isAuthenticated(_ request: IPCRequest) -> Bool {
-        guard let provided = request.authToken?.trimmingCharacters(in: .whitespacesAndNewlines), !provided.isEmpty else {
+        guard let authToken,
+              let provided = request.authToken?.trimmingCharacters(in: .whitespacesAndNewlines), !provided.isEmpty else {
             return false
         }
         return provided == authToken
@@ -1743,7 +1963,7 @@ final class IPCServer {
         )
         do {
             let data = try JSONEncoder().encode(payload)
-            try data.write(to: registrationURL, options: .atomic)
+            try Self.persistRegistrationData(data, to: registrationURL)
         } catch {
             PersistenceLogger.log("写入 IPC 实例注册失败: \(error)")
         }
@@ -1754,36 +1974,130 @@ final class IPCServer {
         try? FileManager.default.removeItem(at: registrationURL)
     }
 
-    private static func loadOrCreateAuthToken() -> String {
+    private static func loadOrCreateAuthToken() -> String? {
         let generated = [UUID().uuidString, UUID().uuidString].joined()
-        guard let tokenURL = authTokenURL() else { return generated }
-        if let existing = try? String(contentsOf: tokenURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !existing.isEmpty {
-            return existing
+        guard let tokenURL = authTokenURL() else { return nil }
+        do {
+            return try loadOrCreateAuthToken(at: tokenURL, generatedToken: generated)
+        } catch {
+            // Never replace an unreadable/invalid existing token: preserving it
+            // prevents a racing process from silently changing CLI credentials.
+            PersistenceLogger.log("读取或创建 IPC 鉴权 token 失败")
+        }
+        return nil
+    }
+
+    struct SecurePersistenceError: Error, Equatable {
+        enum Operation: String, Equatable {
+            case prepareDirectory
+            case open
+            case validate
+            case read
+            case write
+            case sync
+            case permissions
         }
 
-        do {
-            let fm = FileManager.default
-            try fm.createDirectory(at: tokenURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try generated.write(to: tokenURL, atomically: true, encoding: .utf8)
-            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tokenURL.path)
-        } catch {
-            PersistenceLogger.log("写入 IPC 鉴权 token 失败: \(error)")
+        let operation: Operation
+        let code: Int32
+    }
+
+    /// Atomically elects one token creator with O_CREAT|O_EXCL. Contenders that
+    /// observe the just-created file retry briefly until the winner has written
+    /// and fsynced the complete token; no contender overwrites another token.
+    static func loadOrCreateAuthToken(
+        at tokenURL: URL,
+        generatedToken: String = [UUID().uuidString, UUID().uuidString].joined()
+    ) throws -> String {
+        try preparePrivateDirectory(at: tokenURL.deletingLastPathComponent())
+        guard isValidAuthToken(generatedToken) else {
+            throw SecurePersistenceError(operation: .validate, code: EINVAL)
         }
-        return generated
+
+        let maximumAttempts = 50
+        for attempt in 0..<maximumAttempts {
+            do {
+                if let existing = try readExistingAuthToken(at: tokenURL) {
+                    return existing
+                }
+            } catch let error as SecurePersistenceError
+                where error.operation == .read && error.code == EAGAIN {
+                if attempt + 1 < maximumAttempts {
+                    usleep(2_000)
+                    continue
+                }
+                throw error
+            }
+
+            let descriptor = Darwin.open(
+                tokenURL.path,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                mode_t(S_IRUSR | S_IWUSR)
+            )
+            if descriptor < 0 {
+                if errno == EEXIST {
+                    usleep(2_000)
+                    continue
+                }
+                throw SecurePersistenceError(operation: .open, code: errno)
+            }
+
+            var shouldRemoveIncompleteFile = true
+            defer {
+                Darwin.close(descriptor)
+                if shouldRemoveIncompleteFile {
+                    _ = tokenURL.path.withCString { unlink($0) }
+                }
+            }
+
+            guard fchmod(descriptor, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
+                throw SecurePersistenceError(operation: .permissions, code: errno)
+            }
+            let data = Data(generatedToken.utf8)
+            try writeAll(data, to: descriptor)
+            guard fsync(descriptor) == 0 else {
+                throw SecurePersistenceError(operation: .sync, code: errno)
+            }
+            shouldRemoveIncompleteFile = false
+            return generatedToken
+        }
+
+        throw SecurePersistenceError(operation: .open, code: EAGAIN)
+    }
+
+    static func persistRegistrationData(_ data: Data, to url: URL) throws {
+        do {
+            guard data.count <= 64 * 1_024 else {
+                throw SecurePersistenceError(operation: .validate, code: EFBIG)
+            }
+            try DerivedCacheFileIO.atomicWrite(data, to: url)
+            var info = stat()
+            guard lstat(url.path, &info) == 0,
+                  (info.st_mode & S_IFMT) == S_IFREG,
+                  info.st_uid == geteuid() else {
+                throw SecurePersistenceError(
+                    operation: .validate,
+                    code: errno == 0 ? EINVAL : errno
+                )
+            }
+        } catch let error as SecurePersistenceError {
+            throw error
+        } catch {
+            throw SecurePersistenceError(
+                operation: .write,
+                code: Int32((error as NSError).code)
+            )
+        }
     }
 
     private static func appSupportDirectory() -> URL? {
         let fm = FileManager.default
         guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
         let dir = base.appendingPathComponent("MusicPlayer", isDirectory: true)
-        if !fm.fileExists(atPath: dir.path) {
-            do {
-                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            } catch {
-                return nil
-            }
+        do {
+            try preparePrivateDirectory(at: dir)
+        } catch {
+            return nil
         }
         return dir
     }
@@ -1791,12 +2105,10 @@ final class IPCServer {
     private static func registryDirectoryURL() -> URL? {
         guard let dir = appSupportDirectory() else { return nil }
         let registry = dir.appendingPathComponent(MusicPlayerIPC.registryDirectoryName, isDirectory: true)
-        if !FileManager.default.fileExists(atPath: registry.path) {
-            do {
-                try FileManager.default.createDirectory(at: registry, withIntermediateDirectories: true)
-            } catch {
-                return nil
-            }
+        do {
+            try preparePrivateDirectory(at: registry)
+        } catch {
+            return nil
         }
         return registry
     }
@@ -1809,31 +2121,275 @@ final class IPCServer {
         appSupportDirectory()?.appendingPathComponent(MusicPlayerIPC.authTokenFileName, isDirectory: false)
     }
 
+    private static func preparePrivateDirectory(at directory: URL) throws {
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            var info = stat()
+            guard lstat(directory.path, &info) == 0,
+                  (info.st_mode & S_IFMT) == S_IFDIR,
+                  info.st_uid == geteuid() else {
+                throw SecurePersistenceError(
+                    operation: .prepareDirectory,
+                    code: errno == 0 ? ENOTDIR : errno
+                )
+            }
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: directory.path
+            )
+        } catch let error as SecurePersistenceError {
+            throw error
+        } catch {
+            throw SecurePersistenceError(
+                operation: .prepareDirectory,
+                code: Int32((error as NSError).code)
+            )
+        }
+    }
+
+    private static func readExistingAuthToken(at tokenURL: URL) throws -> String? {
+        let descriptor = Darwin.open(tokenURL.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        if descriptor < 0 {
+            if errno == ENOENT { return nil }
+            throw SecurePersistenceError(operation: .open, code: errno)
+        }
+        defer { Darwin.close(descriptor) }
+
+        var info = stat()
+        guard fstat(descriptor, &info) == 0,
+              (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_uid == geteuid() else {
+            throw SecurePersistenceError(
+                operation: .validate,
+                code: errno == 0 ? EINVAL : errno
+            )
+        }
+        guard fchmod(descriptor, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
+            throw SecurePersistenceError(operation: .permissions, code: errno)
+        }
+        guard info.st_size > 0 else {
+            throw SecurePersistenceError(operation: .read, code: EAGAIN)
+        }
+        guard info.st_size <= 4_096 else {
+            throw SecurePersistenceError(operation: .validate, code: EFBIG)
+        }
+
+        var bytes = [UInt8](repeating: 0, count: Int(info.st_size))
+        var offset = 0
+        while offset < bytes.count {
+            let count = bytes.withUnsafeMutableBytes { buffer -> Int in
+                guard let base = buffer.baseAddress else { return 0 }
+                return Darwin.read(
+                    descriptor,
+                    base.advanced(by: offset),
+                    buffer.count - offset
+                )
+            }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw SecurePersistenceError(operation: .read, code: errno)
+            }
+            if count == 0 { break }
+            offset += count
+        }
+        guard offset == bytes.count,
+              let raw = String(data: Data(bytes), encoding: .utf8) else {
+            throw SecurePersistenceError(operation: .read, code: EIO)
+        }
+        let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isValidAuthToken(token) else {
+            throw SecurePersistenceError(operation: .validate, code: EINVAL)
+        }
+        return token
+    }
+
+    private static func writeAll(_ data: Data, to descriptor: Int32) throws {
+        var offset = 0
+        while offset < data.count {
+            let count = data.withUnsafeBytes { buffer -> Int in
+                guard let base = buffer.baseAddress else { return 0 }
+                return Darwin.write(
+                    descriptor,
+                    base.advanced(by: offset),
+                    buffer.count - offset
+                )
+            }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw SecurePersistenceError(operation: .write, code: errno)
+            }
+            guard count > 0 else {
+                throw SecurePersistenceError(operation: .write, code: EIO)
+            }
+            offset += count
+        }
+    }
+
+    private static func isValidAuthToken(_ token: String) -> Bool {
+        guard (32...256).contains(token.utf8.count) else { return false }
+        return token.unicodeScalars.allSatisfy {
+            CharacterSet.alphanumerics.contains($0) || $0 == "-"
+        }
+    }
+
     private static func cleanupStaleRegistrations() {
         guard let registryDirectory = registryDirectoryURL() else { return }
-        guard let entries = try? FileManager.default.contentsOfDirectory(
+        _ = cleanupStaleRegistrations(
             at: registryDirectory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) else { return }
+            maximumEntries: 256,
+            processValidator: processMatchesRegistration
+        )
+    }
 
-        for url in entries where url.pathExtension.lowercased() == "json" {
-            guard let data = try? Data(contentsOf: url),
-                  let registration = try? JSONDecoder().decode(IPCInstanceRegistration.self, from: data)
-            else {
-                try? FileManager.default.removeItem(at: url)
-                continue
-            }
-            if !processExists(pid: registration.pid) {
-                try? FileManager.default.removeItem(at: url)
+    struct RegistryCleanupReport: Equatable {
+        let examined: Int
+        let removed: Int
+    }
+
+    /// Enumerates directly from an owner-only directory descriptor and stops
+    /// after `maximumEntries`. This keeps startup work bounded even if a damaged
+    /// or hostile registry directory contains a very large number of entries.
+    @discardableResult
+    static func cleanupStaleRegistrations(
+        at registryDirectory: URL,
+        maximumEntries: Int = 256,
+        processValidator: (IPCInstanceRegistration) -> Bool
+    ) -> RegistryCleanupReport {
+        let cappedMaximum = max(0, min(256, maximumEntries))
+        guard cappedMaximum > 0 else {
+            return RegistryCleanupReport(examined: 0, removed: 0)
+        }
+
+        let descriptor = Darwin.open(
+            registryDirectory.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard descriptor >= 0 else {
+            return RegistryCleanupReport(examined: 0, removed: 0)
+        }
+
+        var directoryInfo = stat()
+        guard fstat(descriptor, &directoryInfo) == 0,
+              (directoryInfo.st_mode & S_IFMT) == S_IFDIR,
+              directoryInfo.st_uid == geteuid()
+        else {
+            Darwin.close(descriptor)
+            return RegistryCleanupReport(examined: 0, removed: 0)
+        }
+
+        guard let stream = fdopendir(descriptor) else {
+            Darwin.close(descriptor)
+            return RegistryCleanupReport(examined: 0, removed: 0)
+        }
+        defer { closedir(stream) }
+
+        let anchoredDescriptor = dirfd(stream)
+        var examined = 0
+        var removed = 0
+        while examined < cappedMaximum, let entry = readdir(stream) {
+            let name = directoryEntryName(entry)
+            guard name != ".", name != ".." else { continue }
+            examined += 1
+            guard !name.hasPrefix("."),
+                  name.utf8.count <= 255,
+                  name.lowercased().hasSuffix(".json")
+            else { continue }
+
+            let url = registryDirectory.appendingPathComponent(name, isDirectory: false)
+            let registration: IPCInstanceRegistration? = {
+                guard let data = try? DerivedCacheFileIO.readBoundedRegularFile(
+                    at: url,
+                    maximumBytes: 64 * 1_024
+                ),
+                      let decoded = try? JSONDecoder().decode(IPCInstanceRegistration.self, from: data),
+                      isStructurallyValidRegistration(decoded, fileName: name)
+                else { return nil }
+                return decoded
+            }()
+
+            if registration.map(processValidator) != true {
+                let result = name.withCString { unlinkat(anchoredDescriptor, $0, 0) }
+                if result == 0 { removed += 1 }
             }
         }
+
+        if removed > 0 {
+            _ = fsync(anchoredDescriptor)
+        }
+
+        return RegistryCleanupReport(examined: examined, removed: removed)
+    }
+
+    private static func directoryEntryName(_ entry: UnsafeMutablePointer<dirent>) -> String {
+        withUnsafePointer(to: &entry.pointee.d_name) { namePointer in
+            namePointer.withMemoryRebound(
+                to: CChar.self,
+                capacity: Int(entry.pointee.d_namlen) + 1
+            ) { String(cString: $0) }
+        }
+    }
+
+    private static func isStructurallyValidRegistration(
+        _ registration: IPCInstanceRegistration,
+        fileName: String
+    ) -> Bool {
+        guard UUID(uuidString: registration.instanceID) != nil,
+              fileName == "\(registration.instanceID).json",
+              registration.pid > 0,
+              registration.startedAt.isFinite,
+              registration.startedAt > 0,
+              registration.bundlePath.hasPrefix("/"),
+              registration.bundlePath.utf8.count <= 16 * 1_024,
+              registration.requestNotificationName
+                == MusicPlayerIPC.requestNotification(for: registration.instanceID).rawValue,
+              registration.replyNotificationName
+                == MusicPlayerIPC.replyNotification(for: registration.instanceID).rawValue
+        else { return false }
+        return true
     }
 
     private static func processExists(pid: Int32) -> Bool {
         guard pid > 0 else { return false }
         if kill(pid, 0) == 0 { return true }
         return errno == EPERM
+    }
+
+    private static func processMatchesRegistration(_ registration: IPCInstanceRegistration) -> Bool {
+        guard processExists(pid: registration.pid),
+              let application = NSRunningApplication(processIdentifier: registration.pid),
+              let launchDate = application.launchDate,
+              let runningBundleURL = application.bundleURL?.resolvingSymlinksInPath().standardizedFileURL,
+              let runningExecutableURL = application.executableURL?.resolvingSymlinksInPath().standardizedFileURL
+        else { return false }
+
+        // A PID can be reused after a crash. Bind the registry record to this
+        // concrete process launch so a stale record cannot impersonate a newer
+        // MusicPlayer process that happens to receive the same PID.
+        guard abs(launchDate.timeIntervalSince1970 - registration.startedAt) <= 300 else {
+            return false
+        }
+
+        let registeredBundleURL = URL(fileURLWithPath: registration.bundlePath, isDirectory: true)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        guard runningBundleURL.path == registeredBundleURL.path,
+              let registeredExecutableURL = Bundle(url: registeredBundleURL)?
+                .executableURL?
+                .resolvingSymlinksInPath()
+                .standardizedFileURL,
+              registeredExecutableURL.path == runningExecutableURL.path
+        else { return false }
+
+        if let expectedBundleIdentifier = Bundle.main.bundleIdentifier,
+           !expectedBundleIdentifier.isEmpty,
+           application.bundleIdentifier != expectedBundleIdentifier {
+            return false
+        }
+        return true
     }
 
     private func formatMs(_ value: Double?) -> String {

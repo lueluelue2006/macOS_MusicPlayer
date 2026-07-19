@@ -123,6 +123,8 @@ cat > MusicPlayer.app/Contents/Info.plist << EOF
 	    <string>${VERSION}</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>LSMultipleInstancesProhibited</key>
+    <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>

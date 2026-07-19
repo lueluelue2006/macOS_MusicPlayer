@@ -9,15 +9,53 @@ struct MusicPlayerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     // Create single shared instances for the whole app lifetime.
     // These survive window closes (Cmd+W) and avoid duplicate audio playback.
-	    private let audioPlayer: AudioPlayer
-	    private let playlistManager: PlaylistManager
-	    private let playlistsStore: PlaylistsStore
-	    private let playbackCoordinator: PlaybackCoordinator
-	    private let audioRouteMonitor: AudioRouteMonitor
-	    private let ipcServer: IPCServer
+	    private let audioPlayer: AudioPlayer?
+	    private let playlistManager: PlaylistManager?
+	    private let playlistsStore: PlaylistsStore?
+	    private let playbackCoordinator: PlaybackCoordinator?
+	    private let audioRouteMonitor: AudioRouteMonitor?
+	    private let ipcServer: IPCServer?
+	    private let singleInstanceCoordinator: SingleInstanceCoordinator?
 	    private let notificationDelegate = NotificationCenterDelegate()
     
     init() {
+        let coordinator: SingleInstanceCoordinator
+        let acquisition: SingleInstanceCoordinator.Acquisition
+        do {
+            coordinator = try SingleInstanceCoordinator()
+            acquisition = try coordinator.acquire()
+        } catch {
+            // Fail closed: starting without the writer lock could corrupt queue,
+            // playlist, weight, and cache state if another process is alive.
+            PersistenceLogger.log("无法建立单实例写锁，当前进程将安全退出")
+            self.singleInstanceCoordinator = nil
+            self.audioPlayer = nil
+            self.playlistManager = nil
+            self.playlistsStore = nil
+            self.playbackCoordinator = nil
+            self.audioRouteMonitor = nil
+            self.ipcServer = nil
+            Self.scheduleSecondaryTermination()
+            return
+        }
+
+        self.singleInstanceCoordinator = coordinator
+        guard acquisition == .primary else {
+            let launchURLs = SingleInstanceCoordinator.commandLineOpenURLs(
+                arguments: ProcessInfo.processInfo.arguments
+            )
+            coordinator.forwardOpenRequest(launchURLs)
+            self.audioPlayer = nil
+            self.playlistManager = nil
+            self.playlistsStore = nil
+            self.playbackCoordinator = nil
+            self.audioRouteMonitor = nil
+            self.ipcServer = nil
+            appDelegate.configureSecondary(singleInstanceCoordinator: coordinator)
+            Self.scheduleSecondaryTermination()
+            return
+        }
+
         // Bundle identifier change migration:
         // - avoids conflicting defaults when other apps use the old id
         // - preserves existing user settings on upgrade
@@ -25,9 +63,19 @@ struct MusicPlayerApp: App {
         PathKeyDiskMigrator.migrateLegacyLowercasedKeysIfNeeded()
 
 	        let audioPlayer = AudioPlayer()
-	        let playlistManager = PlaylistManager()
+            _ = LegacyPersistenceGovernor.runDefault()
+	        let playlistManager = PlaylistManager(
+                playbackStateRekeyHandler: { [weak audioPlayer] oldURL, newURL in
+                    audioPlayer?.rekeyPersistedPlaybackState(from: oldURL, to: newURL)
+                        ?? .unchanged
+                }
+            )
 	        let playlistsStore = PlaylistsStore()
-	        let playbackCoordinator = PlaybackCoordinator(audioPlayer: audioPlayer, playlistManager: playlistManager)
+	        let playbackCoordinator = PlaybackCoordinator(
+                audioPlayer: audioPlayer,
+                playlistManager: playlistManager,
+                playlistsStore: playlistsStore
+            )
 	        let ipcServer = IPCServer(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
 
         let audioRouteMonitor = AudioRouteMonitor(
@@ -110,7 +158,8 @@ struct MusicPlayerApp: App {
         appDelegate.configure(
             audioPlayer: audioPlayer,
             playlistManager: playlistManager,
-            playlistsStore: playlistsStore
+            playlistsStore: playlistsStore,
+            singleInstanceCoordinator: coordinator
         )
 
         // Run format detection tests in background to avoid blocking app startup/IPC.
@@ -136,13 +185,33 @@ struct MusicPlayerApp: App {
     var body: some Scene {
         // 使用单窗口场景，避免因外部“打开文件”事件在 macOS 上产生重复主窗口
 	        Window("音乐播放器", id: "main") {
-	            RootView(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
-	                .frame(minWidth: 600, minHeight: 400)
+            Group {
+                if let audioPlayer, let playlistManager, let playlistsStore {
+	                RootView(
+                        audioPlayer: audioPlayer,
+                        playlistManager: playlistManager,
+                        playlistsStore: playlistsStore
+                    )
+                } else {
+                    EmptyView()
+                }
+            }
+            .frame(minWidth: 600, minHeight: 400)
 	        }
         .windowResizability(.contentSize)
         .windowToolbarStyle(.unified)
         .commands {
-            MusicPlayerCommands(audioPlayer: audioPlayer, playlistManager: playlistManager)
+            if let audioPlayer, let playlistManager {
+	            MusicPlayerCommands(audioPlayer: audioPlayer, playlistManager: playlistManager)
+            }
+        }
+    }
+
+    private static func scheduleSecondaryTermination() {
+        // Keep the forwarding process alive briefly so the idempotent handoff
+        // retry can bridge the primary process' observer-installation window.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
+            NSApplication.shared.terminate(nil)
         }
     }
 }

@@ -4,8 +4,26 @@ import XCTest
 @MainActor
 final class PlaylistPersistenceTests: XCTestCase {
     private struct SavedPlaylist: Decodable {
+        private struct Track: Decodable {
+            let path: String
+        }
+
         let paths: [String]
         let currentIndex: Int
+
+        private enum CodingKeys: String, CodingKey {
+            case tracks
+            case paths
+            case currentIndex
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let tracks = try container.decodeIfPresent([Track].self, forKey: .tracks) ?? []
+            let legacyPaths = try container.decodeIfPresent([String].self, forKey: .paths) ?? []
+            paths = tracks.isEmpty ? legacyPaths : tracks.map(\.path)
+            currentIndex = try container.decode(Int.self, forKey: .currentIndex)
+        }
     }
 
     private struct SavedUserPlaylists: Codable {
@@ -61,6 +79,287 @@ final class PlaylistPersistenceTests: XCTestCase {
         XCTAssertEqual(snapshot.paths, manager.audioFiles.map { $0.url.path })
     }
 
+    func testFlushBeforeInitialRestorePreservesExistingQueueBytes() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-queue-quick-quit-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        let original = Data(#"{"version":1,"tracks":[],"paths":["/keep/me.mp3"],"currentIndex":0}"#.utf8)
+        try original.write(to: playlistURL)
+
+        let manager = PlaylistManager(
+            playlistFileURLOverride: playlistURL,
+            initialQueueLoadState: .notStarted
+        )
+        manager.flushPlaylistPersistence()
+
+        XCTAssertEqual(try Data(contentsOf: playlistURL), original)
+        XCTAssertEqual(manager.queueLoadState, .notStarted)
+    }
+
+    func testFutureQueueSchemaIsPreservedByteForByteAndNeverOverwritten() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-queue-future-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        let original = Data(#"{"version":99,"tracks":[],"paths":["/future.mp3"],"currentIndex":0,"future":{"keep":true}}"#.utf8)
+        try original.write(to: playlistURL)
+
+        let manager = PlaylistManager(playlistFileURLOverride: playlistURL)
+        await manager.loadSavedPlaylist()
+        manager.audioFiles = [makeAudioFile(at: directory.appendingPathComponent("replacement.mp3"), title: "replacement")]
+        manager.flushPlaylistPersistence()
+
+        XCTAssertEqual(try Data(contentsOf: playlistURL), original)
+    }
+
+    func testNonPositiveExplicitQueueVersionsAreProtectedByteForByte() async throws {
+        for version in [0, -1] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+                "musicplayer-queue-invalid-version-\(version)-\(UUID().uuidString)",
+                isDirectory: true
+            )
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+
+            let playlistURL = directory.appendingPathComponent("playlist.json")
+            let original = Data(
+                "{\"version\":\(version),\"tracks\":[],\"paths\":[\"/keep.mp3\"],\"currentIndex\":0}".utf8
+            )
+            try original.write(to: playlistURL)
+
+            let manager = PlaylistManager(playlistFileURLOverride: playlistURL)
+            await manager.loadSavedPlaylist()
+            manager.audioFiles = [
+                makeAudioFile(
+                    at: directory.appendingPathComponent("replacement.mp3"),
+                    title: "replacement"
+                )
+            ]
+            manager.flushPlaylistPersistence()
+
+            XCTAssertEqual(try Data(contentsOf: playlistURL), original)
+        }
+    }
+
+    func testCorruptQueueKeepsOriginalAndWritesBoundedDiagnosticCopy() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-queue-corrupt-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        let original = Data(#"{"version":1,"tracks":["broken""#.utf8)
+        try original.write(to: playlistURL)
+
+        let manager = PlaylistManager(playlistFileURLOverride: playlistURL)
+        await manager.loadSavedPlaylist()
+        manager.audioFiles = [makeAudioFile(at: directory.appendingPathComponent("replacement.mp3"), title: "replacement")]
+        manager.flushPlaylistPersistence()
+
+        XCTAssertEqual(try Data(contentsOf: playlistURL), original)
+        let diagnostics = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.hasPrefix("playlist.corrupted.") }
+        XCTAssertEqual(diagnostics.count, 1)
+        XCTAssertEqual(try Data(contentsOf: diagnostics[0]), original)
+    }
+
+    func testOversizedQueueEntersProtectionWithoutReadingOrReplacingFile() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-queue-oversized-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        XCTAssertTrue(FileManager.default.createFile(atPath: playlistURL.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: playlistURL)
+        try handle.truncate(atOffset: UInt64(16 * 1_024 * 1_024 + 1))
+        try handle.close()
+
+        let manager = PlaylistManager(playlistFileURLOverride: playlistURL)
+        await manager.loadSavedPlaylist()
+        manager.audioFiles = [makeAudioFile(at: directory.appendingPathComponent("replacement.mp3"), title: "replacement")]
+        manager.flushPlaylistPersistence()
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: playlistURL.path)
+        XCTAssertEqual(attributes[.size] as? NSNumber, NSNumber(value: 16 * 1_024 * 1_024 + 1))
+    }
+
+    func testQueueSymlinkIsRejectedAndTargetRemainsUntouched() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-queue-symlink-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let targetURL = directory.appendingPathComponent("target.json")
+        let targetBytes = Data(#"{"sentinel":true}"#.utf8)
+        try targetBytes.write(to: targetURL)
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        try FileManager.default.createSymbolicLink(at: playlistURL, withDestinationURL: targetURL)
+
+        let manager = PlaylistManager(playlistFileURLOverride: playlistURL)
+        await manager.loadSavedPlaylist()
+        manager.audioFiles = [makeAudioFile(at: directory.appendingPathComponent("replacement.mp3"), title: "replacement")]
+        manager.flushPlaylistPersistence()
+
+        XCTAssertEqual(try Data(contentsOf: targetURL), targetBytes)
+        let values = try playlistURL.resourceValues(forKeys: [.isSymbolicLinkKey])
+        XCTAssertEqual(values.isSymbolicLink, true)
+    }
+
+    func testQueueSnapshotUsesPrivateFileAndDirectoryPermissions() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-queue-permissions-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        let manager = PlaylistManager(playlistFileURLOverride: playlistURL)
+        manager.audioFiles = [makeAudioFile(at: directory.appendingPathComponent("one.mp3"), title: "one")]
+        manager.flushPlaylistPersistence()
+
+        let fileAttributes = try FileManager.default.attributesOfItem(atPath: playlistURL.path)
+        let directoryAttributes = try FileManager.default.attributesOfItem(atPath: directory.path)
+        XCTAssertEqual((fileAttributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        XCTAssertEqual((directoryAttributes[.posixPermissions] as? NSNumber)?.intValue, 0o700)
+    }
+
+    func testDebouncedSaveBeforeInitialRestoreCannotOverwriteQueue() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-queue-pre-restore-save-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        let original = Data(#"{"version":1,"tracks":[],"paths":["/keep/me.mp3"],"currentIndex":0}"#.utf8)
+        try original.write(to: playlistURL)
+
+        let manager = PlaylistManager(
+            playlistFileURLOverride: playlistURL,
+            persistenceDebounceInterval: 0.01,
+            initialQueueLoadState: .notStarted
+        )
+        manager.audioFiles = []
+        manager.savePlaylist()
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        XCTAssertEqual(try Data(contentsOf: playlistURL), original)
+    }
+
+    func testCancelledRestoreGenerationCannotBecomeReadyOrOverwriteQueue() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-queue-cancelled-restore-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        let original = Data(#"{"version":1,"tracks":[],"paths":["/keep/me.mp3"],"currentIndex":0}"#.utf8)
+        try original.write(to: playlistURL)
+
+        let manager = PlaylistManager(
+            playlistFileURLOverride: playlistURL,
+            initialQueueLoadState: .loading(generation: 7)
+        )
+        manager.prepareForImmediateTermination()
+
+        XCTAssertEqual(manager.queueLoadState, .terminating(wasReady: false))
+        XCTAssertFalse(manager.completeInitialQueueLoad(generation: 7))
+        manager.flushPlaylistPersistence()
+        XCTAssertEqual(try Data(contentsOf: playlistURL), original)
+    }
+
+    func testPendingAddWaitsUntilQueueBecomesReady() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-queue-pending-add-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let audioURL = directory.appendingPathComponent("pending.wav")
+        try TestAudioFixture.createSineWAV(at: audioURL, frequency: 440, duration: 0.05)
+        let manager = PlaylistManager(
+            playlistFileURLOverride: directory.appendingPathComponent("playlist.json"),
+            initialQueueLoadState: .loading(generation: 9)
+        )
+
+        manager.enqueueAddFiles([audioURL])
+        XCTAssertFalse(manager.isAddingFiles)
+
+        XCTAssertTrue(manager.completeInitialQueueLoad(generation: 9))
+        XCTAssertTrue(manager.isAddingFiles)
+        manager.cancelAddFiles()
+        await manager.waitForAddFilesCompletionForTesting()
+    }
+
+    func testEphemeralLaunchStillRestoresPersistedQueue() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-queue-ephemeral-restore-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let audioURL = directory.appendingPathComponent("saved.wav")
+        try TestAudioFixture.createSineWAV(at: audioURL, frequency: 440, duration: 0.05)
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        let payload: [String: Any] = [
+            "version": 1,
+            "tracks": [["path": audioURL.path, "signature": NSNull()]],
+            "paths": [audioURL.path],
+            "currentIndex": 0,
+        ]
+        try JSONSerialization.data(withJSONObject: payload).write(to: playlistURL)
+
+        let manager = PlaylistManager(
+            playlistFileURLOverride: playlistURL,
+            initialQueueLoadState: .notStarted
+        )
+        let store = PlaylistsStore(
+            playlistsFileURLOverride: directory.appendingPathComponent("user-playlists.json")
+        )
+        let player = AudioPlayer()
+        player.markSkipRestoreThisLaunch()
+        defer {
+            manager.prepareForImmediateTermination()
+            player.stopAndClearCurrent(clearLastPlayed: false)
+        }
+
+        manager.performInitialRestoreIfNeeded(audioPlayer: player, playlistsStore: store)
+        let restored = await waitUntil(timeout: 2) {
+            manager.queueLoadState == .ready
+                && !manager.isInitialRestorePending
+                && manager.audioFiles.count == 1
+        }
+
+        XCTAssertTrue(restored)
+        XCTAssertEqual(manager.audioFiles.first?.url.path, audioURL.path)
+        XCTAssertNil(player.currentFile, "ephemeral launch must suppress only playback restoration")
+        await manager.waitForBackgroundRestoreWorkForTesting()
+    }
+
     func testFlushWinsOverAlreadyScheduledOlderSnapshots() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "musicplayer-playlist-flush-\(UUID().uuidString)",
@@ -95,6 +394,102 @@ final class PlaylistPersistenceTests: XCTestCase {
         XCTAssertEqual(snapshot.paths, manager.audioFiles.map { $0.url.path })
     }
 
+    func testFailedQueueFlushKeepsLatestSnapshotDirtyAndRetries() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-playlist-retry-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        let attemptLock = NSLock()
+        var attempts = 0
+        let manager = PlaylistManager(
+            playlistFileURLOverride: playlistURL,
+            playlistFileWriter: { data, url in
+                let currentAttempt = attemptLock.withLock {
+                    attempts += 1
+                    return attempts
+                }
+                if currentAttempt == 1 {
+                    throw CocoaError(.fileWriteOutOfSpace)
+                }
+                try DerivedCacheFileIO.atomicWrite(data, to: url)
+            }
+        )
+        manager.audioFiles = [
+            makeAudioFile(at: directory.appendingPathComponent("latest.mp3"), title: "latest")
+        ]
+
+        let firstFlush = manager.flushPlaylistPersistence()
+        XCTAssertEqual(firstFlush.outcome, .failed)
+        XCTAssertFalse(firstFlush.isDurable)
+
+        let retried = await waitUntil(timeout: 2) {
+            (try? self.readSnapshot(at: playlistURL).paths) == manager.audioFiles.map { $0.url.path }
+        }
+        XCTAssertTrue(retried)
+        let finalAttempts = attemptLock.withLock { attempts }
+        XCTAssertGreaterThanOrEqual(finalAttempts, 2)
+    }
+
+    func testQueueFlushDeadlineReturnsWithoutWaitingForSlowDisk() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-playlist-flush-deadline-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        let manager = PlaylistManager(
+            playlistFileURLOverride: playlistURL,
+            playlistFileWriter: { data, url in
+                Thread.sleep(forTimeInterval: 0.20)
+                try DerivedCacheFileIO.atomicWrite(data, to: url)
+            }
+        )
+        manager.audioFiles = [
+            makeAudioFile(at: directory.appendingPathComponent("slow.mp3"), title: "slow")
+        ]
+
+        let start = ContinuousClock.now
+        let result = manager.flushPlaylistPersistence(timeout: 0.02)
+        XCTAssertEqual(result.outcome, .timedOut)
+        XCTAssertLessThan(start.duration(to: .now), .milliseconds(150))
+
+        let eventuallyPersisted = await waitUntil(timeout: 1) {
+            (try? self.readSnapshot(at: playlistURL).paths.count) == 1
+        }
+        XCTAssertTrue(eventuallyPersisted)
+    }
+
+    func testAllMissingQueuePreservesPersistedCurrentIdentity() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-all-missing-current-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        let paths = (0 ..< 3).map { directory.appendingPathComponent("missing-\($0).mp3").path }
+        let data = try JSONSerialization.data(withJSONObject: [
+            "version": 1,
+            "tracks": paths.map { ["path": $0, "signature": NSNull()] },
+            "paths": paths,
+            "currentIndex": 2,
+        ])
+        try data.write(to: playlistURL)
+
+        let manager = PlaylistManager(playlistFileURLOverride: playlistURL)
+        await manager.loadSavedPlaylist()
+        manager.flushPlaylistPersistence()
+
+        XCTAssertEqual(try readSnapshot(at: playlistURL).currentIndex, 2)
+        XCTAssertEqual(try readSnapshot(at: playlistURL).paths, paths)
+    }
+
     func testUserPlaylistFlushPersistsLatestQueuedSnapshot() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "musicplayer-user-playlists-flush-\(UUID().uuidString)",
@@ -120,7 +515,7 @@ final class PlaylistPersistenceTests: XCTestCase {
             SavedUserPlaylists.self,
             from: Data(contentsOf: storeURL)
         )
-        XCTAssertEqual(saved.version, 1)
+        XCTAssertEqual(saved.version, 2)
         XCTAssertEqual(saved.playlists.count, 1)
         XCTAssertEqual(saved.playlists[0].id, playlistID)
         XCTAssertEqual(saved.playlists[0].tracks.map(\.path), trackURLs.map(\.path))
@@ -193,14 +588,12 @@ final class PlaylistPersistenceTests: XCTestCase {
 
         manager.flushPlaylistPersistence()
 
-        guard let data = try? Data(contentsOf: playlistURL),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let paths = json["paths"] as? [String] else {
-            XCTFail("Failed to read persisted playlist")
-            return
-        }
-
-        XCTAssertEqual(paths, [fileA.path, fileB.path, fileC.path], "Should preserve original order including missing")
+        let persisted = try readSnapshot(at: playlistURL)
+        XCTAssertEqual(
+            persisted.paths,
+            [fileA.path, fileB.path, fileC.path],
+            "Should preserve original order including missing"
+        )
     }
 
     func testCurrentIndexMapsCorrectlyWhenMissingItemsBeforeCurrent() async throws {
@@ -349,7 +742,11 @@ final class PlaylistPersistenceTests: XCTestCase {
             return
         }
 
-        XCTAssertEqual(savedIndex, 2, "Should persist full-order index of fileC")
+        XCTAssertEqual(
+            savedIndex,
+            1,
+            "Should preserve the missing current track identity until the user selects another item"
+        )
     }
 
     func testRemoveFileAlsoClearsLoadedSignature() async throws {
@@ -409,6 +806,79 @@ final class PlaylistPersistenceTests: XCTestCase {
         }
 
         XCTAssertNil(track["signature"], "Signature should not be persisted after remove+re-add without signature")
+    }
+
+    func testClearAllFilesClearsMissingEntriesAndPendingWeightRekeys() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-clear-queue-intents-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        let weightsURL = directory.appendingPathComponent("weights.json")
+        try Data(#"{"version":99,"queueLevels":{},"playlistLevels":{}}"#.utf8).write(to: weightsURL)
+        let missingPath = directory.appendingPathComponent("missing.mp3").path
+        let movedPath = directory.appendingPathComponent("moved.mp3").path
+        let savedJSON = """
+        {
+          "version": 2,
+          "tracks": [{"path": "\(missingPath)", "signature": null}],
+          "paths": [],
+          "currentIndex": 0,
+          "pendingWeightRekeys": [{"oldPath": "\(missingPath)", "newPath": "\(movedPath)"}]
+        }
+        """
+        try savedJSON.write(to: playlistURL, atomically: true, encoding: .utf8)
+
+        let weights = PlaybackWeights(cacheFileURLOverride: weightsURL)
+        let manager = PlaylistManager(
+            playlistFileURLOverride: playlistURL,
+            playbackWeights: weights
+        )
+        await manager.loadSavedPlaylist()
+
+        let result = manager.clearAllFiles()
+        XCTAssertTrue(result.didApply)
+        XCTAssertTrue(result.isDurable)
+        XCTAssertTrue(manager.audioFiles.isEmpty)
+        XCTAssertEqual(manager.currentIndex, 0)
+
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: playlistURL)) as? [String: Any]
+        )
+        XCTAssertEqual(json["version"] as? Int, 2)
+        XCTAssertEqual((json["tracks"] as? [[String: Any]])?.count, 0)
+        XCTAssertNil(json["pendingWeightRekeys"])
+
+        let reloaded = PlaylistManager(
+            playlistFileURLOverride: playlistURL,
+            playbackWeights: weights
+        )
+        await reloaded.loadSavedPlaylist()
+        XCTAssertTrue(reloaded.audioFiles.isEmpty)
+        XCTAssertEqual(reloaded.currentIndex, 0)
+    }
+
+    func testEnsureInQueueRejectsOversizedPathBeforeMutatingMemory() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-queue-preflight-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        let manager = PlaylistManager(playlistFileURLOverride: playlistURL)
+        let originalURL = directory.appendingPathComponent("original.mp3")
+        manager.audioFiles = [makeAudioFile(at: originalURL, title: "original")]
+
+        let oversizedURL = URL(fileURLWithPath: "/" + String(repeating: "a", count: 16 * 1_024 + 1))
+        let result = manager.ensureInQueue(
+            [makeAudioFile(at: oversizedURL, title: "oversized")],
+            focusURL: oversizedURL
+        )
+
+        XCTAssertNil(result)
+        XCTAssertEqual(manager.audioFiles.map(\.url), [originalURL])
     }
 
     func testCorruptedUserPlaylistsQuarantinedAndOriginalPreserved() async throws {

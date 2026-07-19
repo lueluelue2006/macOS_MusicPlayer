@@ -8,6 +8,7 @@ import CoreGraphics
 final class PlaybackCoordinator {
     private let audioPlayer: AudioPlayer
     private let playlistManager: PlaylistManager
+    private weak var playlistsStore: PlaylistsStore?
     private var cancellables: Set<AnyCancellable> = []
     private var idleVolumePreanalysisTask: Task<Void, Never>?
     private var automaticAnalysisActivityMonitorTask: Task<Void, Never>?
@@ -15,10 +16,16 @@ final class PlaybackCoordinator {
     private var nextPreloadCandidatePathKey: String? = nil
     private var nextPreloadRetryCount = 0
     private var lastHandledCompletionEventID: UInt64?
+    private var playlistRelocationTask: Task<Void, Never>?
 
-    init(audioPlayer: AudioPlayer, playlistManager: PlaylistManager) {
+    init(
+        audioPlayer: AudioPlayer,
+        playlistManager: PlaylistManager,
+        playlistsStore: PlaylistsStore? = nil
+    ) {
         self.audioPlayer = audioPlayer
         self.playlistManager = playlistManager
+        self.playlistsStore = playlistsStore
         audioPlayer.playbackFinishedHandler = { [weak self] generation, eventID, url, persist in
             self?.handlePlaybackFinished(
                 generation: generation,
@@ -173,6 +180,7 @@ final class PlaybackCoordinator {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.scheduleIdleVolumePreanalysisIfNeeded()
+                self?.schedulePlaylistRelocationIfNeeded()
             }
             .store(in: &cancellables)
 
@@ -185,6 +193,36 @@ final class PlaybackCoordinator {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.handleSystemResourceStateChanged() }
             .store(in: &cancellables)
+    }
+
+    private func schedulePlaylistRelocationIfNeeded() {
+        guard playlistsStore != nil else { return }
+        playlistRelocationTask?.cancel()
+        playlistRelocationTask = Task { @MainActor [weak self] in
+            guard let self, let playlistsStore = self.playlistsStore else { return }
+            do {
+                try await Task.sleep(nanoseconds: 300_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await playlistsStore.ensureLoaded()
+            let candidates = self.playlistManager.fileRelocationCandidatesSnapshot()
+            guard !candidates.isEmpty, !Task.isCancelled else { return }
+            let mutation = playlistsStore.relocateMissingTracksResult(using: candidates)
+            switch await playlistsStore.awaitDurability(of: mutation) {
+            case .committed(let summary):
+                if summary.relocatedTrackCount > 0 {
+                    PersistenceLogger.log("已按文件身份恢复 \(summary.relocatedTrackCount) 个歌单路径")
+                }
+            case .unchanged:
+                break
+            case .rejected(let rejection):
+                PersistenceLogger.log("歌单路径恢复未执行：\(rejection.diagnosticMessage)")
+            case .persistenceFailed(let failure):
+                PersistenceLogger.log("歌单路径恢复尚未持久化：\(failure.diagnosticMessage)")
+            }
+        }
     }
 
     private func handlePlaybackActivityChanged() {

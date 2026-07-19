@@ -491,6 +491,28 @@ final class PlaylistNavigationTests: XCTestCase {
         XCTAssertEqual(backToA?.id, startFile.id, "playlist second previous should retrace to A")
     }
 
+    @MainActor
+    func testPlaylistScopePreservesDuplicatePathOccurrences() {
+        let repeated = makeDummyFile(name: "repeated.mp3")
+        let other = makeDummyFile(name: "other.mp3")
+        manager.audioFiles = [repeated, other]
+        manager.currentIndex = 0
+        manager.setPlaybackScopePlaylist(
+            UUID(),
+            trackURLsInOrder: [repeated.url, repeated.url, other.url],
+            trackIDsInOrder: ["occurrence-a", "occurrence-b", "occurrence-c"],
+            selectedTrackID: "occurrence-a"
+        )
+
+        XCTAssertEqual(manager.playbackScopePlayableCount(), 3)
+        XCTAssertEqual(manager.nextFile(isShuffling: false)?.url, repeated.url)
+        XCTAssertEqual(manager.nextFile(isShuffling: false)?.url, other.url)
+        XCTAssertEqual(manager.previousFile(isShuffling: false)?.url, repeated.url)
+        XCTAssertEqual(manager.previousFile(isShuffling: false)?.url, repeated.url)
+        XCTAssertEqual(manager.nextFile(isShuffling: false)?.url, repeated.url)
+        XCTAssertEqual(manager.nextFile(isShuffling: false)?.url, other.url)
+    }
+
     // MARK: - Helper Methods
 
     private func makeDummyFile(name: String) -> AudioFile {

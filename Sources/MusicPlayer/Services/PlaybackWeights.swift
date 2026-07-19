@@ -1,12 +1,13 @@
 import Foundation
+import Darwin
 
 /// Persistent, lightweight per-track playback weight settings.
 ///
 /// Design:
 /// - Scoped: queue weights and per-playlist weights are isolated.
 /// - Keyed by canonical file path (no bookmarks), with legacy lowercased key compatibility.
-/// - Best-effort disk persistence (JSON, debounced).
-final class PlaybackWeights: ObservableObject {
+/// - Durable, bounded disk persistence (JSON, debounced with explicit flush results).
+final class PlaybackWeights: ObservableObject, @unchecked Sendable {
     static let shared = PlaybackWeights()
 
     struct SyncResult: Sendable {
@@ -34,6 +35,7 @@ final class PlaybackWeights: ObservableObject {
         case unsupportedVersion(Int)
         case unreadable
         case quarantineFailed
+        case capacityExceeded
 
         var diagnosticMessage: String {
             switch self {
@@ -43,6 +45,37 @@ final class PlaybackWeights: ObservableObject {
                 return "权重文件不可读"
             case .quarantineFailed:
                 return "权重文件损坏且隔离失败"
+            case .capacityExceeded:
+                return "权重数据超过安全容量上限"
+            }
+        }
+    }
+
+    enum PersistenceFailure: Equatable, Sendable {
+        case storageUnavailable
+        case capacityExceeded
+        case writeFailed
+    }
+
+    struct PersistenceFlushResult: Equatable, Sendable {
+        enum Outcome: Equatable, Sendable {
+            case persisted
+            case alreadyCurrent
+            case rejectedReadOnly(ReadOnlyReason)
+            case failed(PersistenceFailure)
+        }
+
+        let outcome: Outcome
+        let attemptedGeneration: UInt64
+        let durableGeneration: UInt64
+        let hasPendingChanges: Bool
+
+        var isDurable: Bool {
+            switch outcome {
+            case .persisted, .alreadyCurrent:
+                return !hasPendingChanges
+            case .rejectedReadOnly, .failed:
+                return false
             }
         }
     }
@@ -50,6 +83,26 @@ final class PlaybackWeights: ObservableObject {
     enum Scope: Equatable, Sendable {
         case queue
         case playlist(UserPlaylist.ID)
+    }
+
+    struct PlaylistTrackRemoval: Sendable {
+        let playlistID: UserPlaylist.ID
+        let trackURLs: [URL]
+
+        init(playlistID: UserPlaylist.ID, trackURLs: [URL]) {
+            self.playlistID = playlistID
+            self.trackURLs = trackURLs
+        }
+    }
+
+    struct TrackRekey: Sendable {
+        let oldURL: URL
+        let newURL: URL
+
+        init(oldURL: URL, newURL: URL) {
+            self.oldURL = oldURL
+            self.newURL = newURL
+        }
     }
 
     enum Level: Int, CaseIterable, Sendable {
@@ -86,14 +139,29 @@ final class PlaybackWeights: ObservableObject {
 
     private let cacheFileName = "playback-weights.json"
     private let formatVersion = 3
+    private static let supportedFormatVersions: Set<Int> = [1, 2, 3]
+    private static let maximumFileBytes = 16 * 1_024 * 1_024
+    private static let maximumPathBytes = 16 * 1_024
+    private static let maximumAggregatePathBytes = 12 * 1_024 * 1_024
+    private static let maximumQueueEntries = 100_000
+    private static let maximumPlaylistCount = 2_000
+    private static let maximumEntriesPerPlaylist = 50_000
+    private static let maximumTotalEntries = 100_000
     private let cacheFileURLOverride: URL?
-    private let fileMover: (URL, URL) throws -> Void
+    /// Optional legacy hooks are retained for deterministic failure tests. Normal
+    /// production IO always goes through `DerivedCacheFileIO`.
+    private let fileMover: ((URL, URL) throws -> Void)?
+    private let fileWriter: ((Data, URL) throws -> Void)?
+    private let persistenceDebounceInterval: TimeInterval
+    private let persistenceRetryBaseInterval: TimeInterval
+    private let maximumAutomaticRetryAttempts: Int
     private let lock = NSLock()
     private let persistenceLock = NSLock()
     private let persistenceQueue = DispatchQueue(
         label: "MusicPlayer.PlaybackWeights.Persistence",
         qos: .utility
     )
+    private let persistenceQueueKey = DispatchSpecificKey<Void>()
 
     private struct CacheFile: Codable {
         let version: Int
@@ -110,19 +178,42 @@ final class PlaybackWeights: ObservableObject {
     private var needsReplacementWrite = false
     private var queueLevels: [String: Int] = [:]
     private var playlistLevels: [String: [String: Int]] = [:] // playlistID.uuidString -> (pathKey -> level)
+    private var storedEntryCount = 0
+    private var storedPathByteCount = 0
+    private var logicalRevision: UInt64 = 0
+    private var dirtyGeneration: UInt64 = 0
+    private var durableGeneration: UInt64 = 0
+    private var lastFailureNotificationGeneration: UInt64?
     private var persistenceRevision: UInt64 = 0
+    private var automaticRetryAttempt = 0
     private var pendingSaveWorkItem: DispatchWorkItem?
 
     init(
         cacheFileURLOverride: URL? = nil,
-        fileMover: @escaping (URL, URL) throws -> Void = { try FileManager.default.moveItem(at: $0, to: $1) }
+        fileMover: ((URL, URL) throws -> Void)? = nil,
+        fileWriter: ((Data, URL) throws -> Void)? = nil,
+        persistenceDebounceInterval: TimeInterval = 0.5,
+        persistenceRetryBaseInterval: TimeInterval = 1.0,
+        maximumAutomaticRetryAttempts: Int = 3
     ) {
         self.cacheFileURLOverride = cacheFileURLOverride
         self.fileMover = fileMover
+        self.fileWriter = fileWriter
+        self.persistenceDebounceInterval = max(0, persistenceDebounceInterval)
+        self.persistenceRetryBaseInterval = max(0, persistenceRetryBaseInterval)
+        self.maximumAutomaticRetryAttempts = max(0, maximumAutomaticRetryAttempts)
+        persistenceQueue.setSpecific(key: persistenceQueueKey, value: ())
         loadIfNeeded()
     }
 
+    var hasPendingPersistence: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isPersistenceDirtyLocked
+    }
+
     func level(for url: URL, scope: Scope) -> Level {
+        guard url.isFileURL, Self.isValidRuntimePath(url.path) else { return .defaultLevel }
         let keys = Self.lookupKeys(for: url)
         if let first = keys.first {
             return level(forLookupKeys: keys, canonicalKey: first, scope: scope)
@@ -131,7 +222,13 @@ final class PlaybackWeights: ObservableObject {
     }
 
     func level(forKey key: String, scope: Scope) -> Level {
-        level(forLookupKeys: [PathKey.canonical(path: key), PathKey.legacy(path: key)], canonicalKey: PathKey.canonical(path: key), scope: scope)
+        guard Self.isValidRuntimePath(key) else { return .defaultLevel }
+        let canonicalKey = PathKey.canonical(path: key)
+        return level(
+            forLookupKeys: [canonicalKey, PathKey.legacy(path: key)],
+            canonicalKey: canonicalKey,
+            scope: scope
+        )
     }
 
     private func level(forLookupKeys lookupKeys: [String], canonicalKey: String, scope: Scope) -> Level {
@@ -160,6 +257,9 @@ final class PlaybackWeights: ObservableObject {
     }
 
     func setLevel(_ level: Level, for url: URL, scope: Scope) -> MutationResult {
+        guard url.isFileURL, Self.isValidRuntimePath(url.path) else {
+            return .rejectedReadOnly(.capacityExceeded)
+        }
         let key = Self.key(for: url)
         return setLevelRaw(level.rawValue, forKey: key, scope: scope)
     }
@@ -167,6 +267,10 @@ final class PlaybackWeights: ObservableObject {
     func setLevelRaw(_ raw: Int, forKey key: String, scope: Scope) -> MutationResult {
         loadIfNeeded()
 
+        guard Self.isValidRuntimePath(key) else {
+            return .rejectedReadOnly(.capacityExceeded)
+        }
+        let canonicalKey = PathKey.canonical(path: key)
         let clamped = normalizedStoredRaw(raw)
         var changed = false
         var shouldSave = false
@@ -179,36 +283,67 @@ final class PlaybackWeights: ObservableObject {
 
         switch scope {
         case .queue:
-            if clamped == Level.defaultLevel.rawValue {
-                if removeKeyVariants(key, from: &queueLevels) { changed = true }
-            } else if queueLevels[key] != clamped {
-                queueLevels[key] = clamped
-                removeLegacyVariant(key, from: &queueLevels)
+            let projection = Self.projectStoredLevelMutation(
+                clamped,
+                canonicalKey: canonicalKey,
+                in: queueLevels
+            )
+            guard capacityAllowsLocked(
+                projection,
+                currentMapCount: queueLevels.count,
+                maximumMapEntries: Self.maximumQueueEntries,
+                createsPlaylist: false
+            ) else {
+                lock.unlock()
+                return .rejectedReadOnly(.capacityExceeded)
+            }
+            if projection.changed {
+                Self.applyStoredLevelMutation(
+                    clamped,
+                    canonicalKey: canonicalKey,
+                    to: &queueLevels
+                )
+                applyResourceDeltaLocked(projection)
                 changed = true
             }
 
         case .playlist(let id):
             let pid = id.uuidString
-            if playlistLevels[pid] == nil { playlistLevels[pid] = [:] }
-            if clamped == Level.defaultLevel.rawValue {
-                if removeKeyVariants(key, from: &playlistLevels[pid]!) { changed = true }
-                if playlistLevels[pid]?.isEmpty == true { playlistLevels.removeValue(forKey: pid) }
-            } else if playlistLevels[pid]?[key] != clamped {
-                playlistLevels[pid]?[key] = clamped
-                removeLegacyVariant(key, from: &playlistLevels[pid]!)
+            var levels = playlistLevels[pid] ?? [:]
+            let projection = Self.projectStoredLevelMutation(
+                clamped,
+                canonicalKey: canonicalKey,
+                in: levels
+            )
+            guard capacityAllowsLocked(
+                projection,
+                currentMapCount: levels.count,
+                maximumMapEntries: Self.maximumEntriesPerPlaylist,
+                createsPlaylist: levels.isEmpty && projection.entryDelta > 0
+            ) else {
+                lock.unlock()
+                return .rejectedReadOnly(.capacityExceeded)
+            }
+            if projection.changed {
+                Self.applyStoredLevelMutation(
+                    clamped,
+                    canonicalKey: canonicalKey,
+                    to: &levels
+                )
+                if levels.isEmpty {
+                    playlistLevels.removeValue(forKey: pid)
+                } else {
+                    playlistLevels[pid] = levels
+                }
+                applyResourceDeltaLocked(projection)
                 changed = true
             }
         }
 
-        shouldSave = changed || needsReplacementWrite
+        let changeRevision = changed ? markDirtyLocked(publishChange: true) : nil
+        shouldSave = isPersistenceDirtyLocked
         lock.unlock()
-
-        if shouldSave {
-            bumpAndSave()
-            return .applied
-        } else {
-            return .unchanged
-        }
+        return finishMutation(changeRevision: changeRevision, shouldSave: shouldSave)
     }
 
     func clear(scope: Scope) -> MutationResult {
@@ -226,26 +361,27 @@ final class PlaybackWeights: ObservableObject {
         switch scope {
         case .queue:
             if !queueLevels.isEmpty {
+                let footprint = Self.resourceFootprint(of: queueLevels)
                 queueLevels.removeAll()
+                storedEntryCount -= footprint.entries
+                storedPathByteCount -= footprint.pathBytes
                 changed = true
             }
         case .playlist(let id):
             let pid = id.uuidString
-            if playlistLevels[pid]?.isEmpty == false {
+            if let levels = playlistLevels[pid], !levels.isEmpty {
+                let footprint = Self.resourceFootprint(of: levels)
                 playlistLevels.removeValue(forKey: pid)
+                storedEntryCount -= footprint.entries
+                storedPathByteCount -= footprint.pathBytes
                 changed = true
             }
         }
 
-        shouldSave = changed || needsReplacementWrite
+        let changeRevision = changed ? markDirtyLocked(publishChange: true) : nil
+        shouldSave = isPersistenceDirtyLocked
         lock.unlock()
-
-        if shouldSave {
-            bumpAndSave()
-            return .applied
-        } else {
-            return .unchanged
-        }
+        return finishMutation(changeRevision: changeRevision, shouldSave: shouldSave)
     }
 
     func clearAll() -> MutationResult {
@@ -263,24 +399,31 @@ final class PlaybackWeights: ObservableObject {
         if !queueLevels.isEmpty || !playlistLevels.isEmpty {
             queueLevels.removeAll()
             playlistLevels.removeAll()
+            storedEntryCount = 0
+            storedPathByteCount = 0
             changed = true
         }
 
-        shouldSave = changed || needsReplacementWrite
+        let changeRevision = changed ? markDirtyLocked(publishChange: true) : nil
+        shouldSave = isPersistenceDirtyLocked
         lock.unlock()
-
-        if shouldSave {
-            bumpAndSave()
-            return .applied
-        } else {
-            return .unchanged
-        }
+        return finishMutation(changeRevision: changeRevision, shouldSave: shouldSave)
     }
 
     func removePlaylist(_ id: UserPlaylist.ID) -> MutationResult {
+        removePlaylists([id])
+    }
+
+    /// Removes multiple playlist scopes as one logical mutation. The batch
+    /// produces at most one revision, one notification, and one persisted snapshot.
+    func removePlaylists(_ ids: [UserPlaylist.ID]) -> MutationResult {
         loadIfNeeded()
 
-        let pid = id.uuidString
+        guard ids.count <= Self.maximumPlaylistCount else {
+            return .rejectedReadOnly(.capacityExceeded)
+        }
+
+        let playlistIDs = Set(ids.map(\.uuidString))
         var changed = false
         var shouldSave = false
 
@@ -290,26 +433,49 @@ final class PlaybackWeights: ObservableObject {
             return .rejectedReadOnly(reason)
         }
 
-        if playlistLevels.removeValue(forKey: pid) != nil {
-            changed = true
+        for playlistID in playlistIDs {
+            if let removed = playlistLevels.removeValue(forKey: playlistID) {
+                let footprint = Self.resourceFootprint(of: removed)
+                storedEntryCount -= footprint.entries
+                storedPathByteCount -= footprint.pathBytes
+                changed = true
+            }
         }
 
-        shouldSave = changed || needsReplacementWrite
+        let changeRevision = changed ? markDirtyLocked(publishChange: true) : nil
+        shouldSave = isPersistenceDirtyLocked
         lock.unlock()
-
-        if shouldSave {
-            bumpAndSave()
-            return .applied
-        } else {
-            return .unchanged
-        }
+        return finishMutation(changeRevision: changeRevision, shouldSave: shouldSave)
     }
 
     func removeTrack(_ url: URL, fromPlaylist id: UserPlaylist.ID) -> MutationResult {
+        removeTracks([url], fromPlaylist: id)
+    }
+
+    /// Removes several tracks from one playlist scope as one logical mutation.
+    func removeTracks(_ urls: [URL], fromPlaylist id: UserPlaylist.ID) -> MutationResult {
+        removeTracks([PlaylistTrackRemoval(playlistID: id, trackURLs: urls)])
+    }
+
+    /// Removes tracks from multiple playlist scopes as one logical mutation.
+    func removeTracks(_ removals: [PlaylistTrackRemoval]) -> MutationResult {
         loadIfNeeded()
 
-        let key = Self.key(for: url)
-        let pid = id.uuidString
+        var keysByPlaylist: [String: Set<String>] = [:]
+        var requestedTrackCount = 0
+        for removal in removals {
+            let playlistID = removal.playlistID.uuidString
+            for url in removal.trackURLs {
+                guard url.isFileURL,
+                      Self.isValidRuntimePath(url.path),
+                      requestedTrackCount < Self.maximumTotalEntries else {
+                    return .rejectedReadOnly(.capacityExceeded)
+                }
+                keysByPlaylist[playlistID, default: []].insert(Self.key(for: url))
+                requestedTrackCount += 1
+            }
+        }
+
         var changed = false
         var shouldSave = false
 
@@ -319,20 +485,128 @@ final class PlaybackWeights: ObservableObject {
             return .rejectedReadOnly(reason)
         }
 
-        if playlistLevels[pid] != nil, removeKeyVariants(key, from: &playlistLevels[pid]!) {
-            changed = true
-            if playlistLevels[pid]?.isEmpty == true { playlistLevels.removeValue(forKey: pid) }
+        for (playlistID, keys) in keysByPlaylist {
+            guard var levels = playlistLevels[playlistID] else { continue }
+            for key in keys {
+                let projection = Self.projectStoredLevelMutation(
+                    Level.defaultLevel.rawValue,
+                    canonicalKey: key,
+                    in: levels
+                )
+                guard projection.changed else { continue }
+                Self.applyStoredLevelMutation(
+                    Level.defaultLevel.rawValue,
+                    canonicalKey: key,
+                    to: &levels
+                )
+                applyResourceDeltaLocked(projection)
+                changed = true
+            }
+            if levels.isEmpty {
+                playlistLevels.removeValue(forKey: playlistID)
+            } else {
+                playlistLevels[playlistID] = levels
+            }
         }
 
-        shouldSave = changed || needsReplacementWrite
+        let changeRevision = changed ? markDirtyLocked(publishChange: true) : nil
+        shouldSave = isPersistenceDirtyLocked
         lock.unlock()
+        return finishMutation(changeRevision: changeRevision, shouldSave: shouldSave)
+    }
 
-        if shouldSave {
-            bumpAndSave()
-            return .applied
-        } else {
-            return .unchanged
+    /// Rekeys track overrides in every scope. Existing destination overrides win;
+    /// the obsolete source keys are still removed.
+    func rekeyTrack(from oldURL: URL, to newURL: URL) -> MutationResult {
+        rekeyTracks([TrackRekey(oldURL: oldURL, newURL: newURL)])
+    }
+
+    func rekeyTracks(_ changes: [TrackRekey]) -> MutationResult {
+        mutateRekeys(changes, scope: nil)
+    }
+
+    /// Scoped rekey variant for callers that know only one scope moved.
+    func rekeyTrack(from oldURL: URL, to newURL: URL, scope: Scope) -> MutationResult {
+        rekeyTracks([TrackRekey(oldURL: oldURL, newURL: newURL)], scope: scope)
+    }
+
+    func rekeyTracks(_ changes: [TrackRekey], scope: Scope) -> MutationResult {
+        mutateRekeys(changes, scope: scope)
+    }
+
+    private func mutateRekeys(_ changes: [TrackRekey], scope: Scope?) -> MutationResult {
+        loadIfNeeded()
+
+        guard changes.count <= Self.maximumTotalEntries,
+              changes.allSatisfy({
+                  $0.oldURL.isFileURL
+                      && $0.newURL.isFileURL
+                      && Self.isValidRuntimePath($0.oldURL.path)
+                      && Self.isValidRuntimePath($0.newURL.path)
+              }) else {
+            return .rejectedReadOnly(.capacityExceeded)
         }
+
+        var changed = false
+        var shouldSave = false
+
+        lock.lock()
+        if let reason = checkMutationRejection() {
+            lock.unlock()
+            return .rejectedReadOnly(reason)
+        }
+
+        var nextQueue = queueLevels
+        var nextPlaylists = playlistLevels
+        if let scope {
+            switch scope {
+            case .queue:
+                changed = applyRekeys(changes, to: &nextQueue)
+            case .playlist(let id):
+                let playlistID = id.uuidString
+                if var levels = nextPlaylists[playlistID] {
+                    changed = applyRekeys(changes, to: &levels)
+                    if levels.isEmpty {
+                        nextPlaylists.removeValue(forKey: playlistID)
+                    } else {
+                        nextPlaylists[playlistID] = levels
+                    }
+                }
+            }
+        } else {
+            changed = applyRekeys(changes, to: &nextQueue)
+            for playlistID in Array(nextPlaylists.keys) {
+                guard var levels = nextPlaylists[playlistID] else { continue }
+                if applyRekeys(changes, to: &levels) {
+                    changed = true
+                }
+                if levels.isEmpty {
+                    nextPlaylists.removeValue(forKey: playlistID)
+                } else {
+                    nextPlaylists[playlistID] = levels
+                }
+            }
+        }
+
+        if changed {
+            let candidate = CacheFile(
+                version: formatVersion,
+                queueLevels: nextQueue,
+                playlistLevels: nextPlaylists
+            )
+            guard Self.validate(candidate, requireCanonicalSparseForm: true) else {
+                lock.unlock()
+                return .rejectedReadOnly(.capacityExceeded)
+            }
+            queueLevels = nextQueue
+            playlistLevels = nextPlaylists
+            refreshResourceCountersLocked()
+        }
+
+        let changeRevision = changed ? markDirtyLocked(publishChange: true) : nil
+        shouldSave = isPersistenceDirtyLocked
+        lock.unlock()
+        return finishMutation(changeRevision: changeRevision, shouldSave: shouldSave)
     }
 
     /// Copy weight overrides from a playlist scope into the queue scope.
@@ -357,40 +631,84 @@ final class PlaybackWeights: ObservableObject {
 
         let source = playlistLevels[pid] ?? [:]
         if source.isEmpty {
-            shouldSave = needsReplacementWrite
+            shouldSave = isPersistenceDirtyLocked
             lock.unlock()
-            if shouldSave {
-                bumpAndSave()
-                return SyncResult(total: 0, changed: 0, mutationResult: .applied)
-            } else {
-                return SyncResult(total: 0, changed: 0, mutationResult: .unchanged)
-            }
+            let result = finishMutation(changeRevision: nil, shouldSave: shouldSave)
+            return SyncResult(total: 0, changed: 0, mutationResult: result)
         }
 
+        var nextQueue = queueLevels
         for (key, raw) in source {
             let clamped = normalizedStoredRaw(raw)
             guard clamped != Level.defaultLevel.rawValue else { continue }
-            if queueLevels[key] != clamped {
-                queueLevels[key] = clamped
+            if nextQueue[key] != clamped {
+                nextQueue[key] = clamped
                 changed += 1
             }
         }
 
-        shouldSave = changed > 0 || needsReplacementWrite
-        lock.unlock()
-
-        if shouldSave {
-            bumpAndSave()
-            return SyncResult(total: source.count, changed: changed, mutationResult: .applied)
-        } else {
-            return SyncResult(total: source.count, changed: 0, mutationResult: .unchanged)
+        if changed > 0 {
+            let candidate = CacheFile(
+                version: formatVersion,
+                queueLevels: nextQueue,
+                playlistLevels: playlistLevels
+            )
+            guard Self.validate(candidate, requireCanonicalSparseForm: true) else {
+                lock.unlock()
+                return SyncResult(
+                    total: source.count,
+                    changed: 0,
+                    mutationResult: .rejectedReadOnly(.capacityExceeded)
+                )
+            }
+            queueLevels = nextQueue
+            refreshResourceCountersLocked()
         }
+
+        let changeRevision = changed > 0 ? markDirtyLocked(publishChange: true) : nil
+        shouldSave = isPersistenceDirtyLocked
+        lock.unlock()
+        let result = finishMutation(changeRevision: changeRevision, shouldSave: shouldSave)
+        return SyncResult(total: source.count, changed: changed, mutationResult: result)
     }
 
-    private func bumpAndSave() {
-        revision &+= 1
-        NotificationCenter.default.post(name: .playbackWeightsDidChange, object: nil)
-        scheduleSave()
+    private var isPersistenceDirtyLocked: Bool {
+        needsReplacementWrite || dirtyGeneration != durableGeneration
+    }
+
+    /// Must be called with `lock` held and exactly once per logical mutation.
+    @discardableResult
+    private func markDirtyLocked(publishChange: Bool = false) -> UInt64? {
+        dirtyGeneration &+= 1
+        guard publishChange else { return nil }
+        logicalRevision &+= 1
+        return logicalRevision
+    }
+
+    private func finishMutation(changeRevision: UInt64?, shouldSave: Bool) -> MutationResult {
+        if let changeRevision {
+            publishChangeOnMainThread(changeRevision)
+        }
+        if shouldSave {
+            scheduleSave(resetRetryAttempt: changeRevision != nil)
+            return .applied
+        }
+        return .unchanged
+    }
+
+    private func publishChangeOnMainThread(_ changeRevision: UInt64) {
+        let publish = { [weak self] in
+            guard let self else { return }
+            if self.revision < changeRevision {
+                self.revision = changeRevision
+            }
+            NotificationCenter.default.post(name: .playbackWeightsDidChange, object: self)
+        }
+        if Thread.isMainThread {
+            publish()
+        } else {
+            DispatchQueue.main.async(execute: publish)
+        }
     }
 
     // MARK: - IO
@@ -418,14 +736,25 @@ final class PlaybackWeights: ObservableObject {
             return
         }
 
-        guard FileManager.default.fileExists(atPath: url.path) else {
+        var fileInfo = stat()
+        guard lstat(url.path, &fileInfo) == 0 else {
+            if errno != ENOENT {
+                PersistenceLogger.log("随机权重文件状态不可读")
+                lock.lock()
+                _persistenceState = .readOnlyPreserved(.unreadable)
+                lock.unlock()
+                return
+            }
             lock.lock()
             _persistenceState = .ready
             lock.unlock()
             return
         }
 
-        guard let data = try? Data(contentsOf: url) else {
+        guard let data = try? DerivedCacheFileIO.readBoundedRegularFile(
+            at: url,
+            maximumBytes: Self.maximumFileBytes
+        ) else {
             PersistenceLogger.log("随机权重文件 \(url.lastPathComponent) 不可读")
             lock.lock()
             _persistenceState = .readOnlyPreserved(.unreadable)
@@ -441,7 +770,7 @@ final class PlaybackWeights: ObservableObject {
         }
 
         // Check if version is supported
-        guard envelope.version == 1 || envelope.version == 2 || envelope.version == formatVersion else {
+        guard Self.supportedFormatVersions.contains(envelope.version) else {
             // Unsupported version (future or unknown), preserve read-only
             PersistenceLogger.log("随机权重文件 \(url.lastPathComponent) 版本 v\(envelope.version) 不受支持，只读保留")
             lock.lock()
@@ -453,6 +782,12 @@ final class PlaybackWeights: ObservableObject {
         // Try to decode full structure
         guard let decoded = try? JSONDecoder().decode(CacheFile.self, from: data) else {
             // Valid version but corrupted structure, quarantine it
+            quarantineCorruptedFile(url: url)
+            return
+        }
+
+        guard decoded.version == envelope.version,
+              Self.validate(decoded, requireCanonicalSparseForm: false) else {
             quarantineCorruptedFile(url: url)
             return
         }
@@ -501,27 +836,39 @@ final class PlaybackWeights: ObservableObject {
         lock.lock()
         queueLevels = normalizedQueue
         playlistLevels = normalizedPlaylists
+        refreshResourceCountersLocked()
         _persistenceState = finalState
+        if needsPersistence {
+            needsReplacementWrite = true
+            markDirtyLocked()
+        }
         lock.unlock()
 
         if needsPersistence {
-            flushPersistence()
+            _ = flushPersistence()
         }
     }
 
     private func quarantineCorruptedFile(url: URL) {
-        let directory = url.deletingLastPathComponent()
-        let quarantineName = "playback-weights.quarantined-\(UUID().uuidString).json"
-        let quarantineURL = directory.appendingPathComponent(quarantineName)
-
         do {
-            // Attempt to move the corrupted file (only once)
-            try fileMover(url, quarantineURL)
+            let quarantineURL: URL
+            if let fileMover {
+                let directory = url.deletingLastPathComponent()
+                let candidate = directory.appendingPathComponent(
+                    "playback-weights.quarantined-\(UUID().uuidString).json",
+                    isDirectory: false
+                )
+                try fileMover(url, candidate)
+                quarantineURL = candidate
+            } else {
+                quarantineURL = try DerivedCacheFileIO.quarantine(url, reason: .corrupt)
+            }
             PersistenceLogger.log("随机权重损坏文件已隔离: \(quarantineURL.lastPathComponent)")
 
             lock.lock()
             _persistenceState = .quarantinedCorrupt(backupURL: quarantineURL)
             needsReplacementWrite = true
+            markDirtyLocked()
             lock.unlock()
         } catch {
             // Quarantine failed - preserve original file read-only
@@ -544,11 +891,14 @@ final class PlaybackWeights: ObservableObject {
         }
     }
 
-    private func scheduleSave() {
+    private func scheduleSave(resetRetryAttempt: Bool) {
         let workItem: DispatchWorkItem
         let previousWorkItem: DispatchWorkItem?
 
         persistenceLock.lock()
+        if resetRetryAttempt {
+            automaticRetryAttempt = 0
+        }
         persistenceRevision &+= 1
         let revision = persistenceRevision
         previousWorkItem = pendingSaveWorkItem
@@ -559,7 +909,7 @@ final class PlaybackWeights: ObservableObject {
         persistenceLock.unlock()
 
         previousWorkItem?.cancel()
-        persistenceQueue.asyncAfter(deadline: .now() + 0.5, execute: workItem)
+        persistenceQueue.asyncAfter(deadline: .now() + persistenceDebounceInterval, execute: workItem)
     }
 
     private func saveIfCurrent(_ revision: UInt64) {
@@ -571,108 +921,431 @@ final class PlaybackWeights: ObservableObject {
         persistenceLock.unlock()
 
         guard isCurrent else { return }
-        saveNow()
+        let result = saveNow()
+        switch result.outcome {
+        case .failed(.storageUnavailable), .failed(.writeFailed):
+            scheduleRetryIfNeeded(afterFailedRevision: revision)
+        case .failed(.capacityExceeded):
+            break
+        case .persisted, .alreadyCurrent:
+            resetRetryAttemptIfCurrent(revision)
+        case .rejectedReadOnly:
+            break
+        }
     }
 
-    private func invalidateScheduledSave() {
+    private func scheduleRetryIfNeeded(afterFailedRevision failedRevision: UInt64) {
+        guard hasPendingPersistence else { return }
+
+        let workItem: DispatchWorkItem
+        let delay: TimeInterval
+        persistenceLock.lock()
+        guard persistenceRevision == failedRevision,
+              pendingSaveWorkItem == nil,
+              automaticRetryAttempt < maximumAutomaticRetryAttempts
+        else {
+            persistenceLock.unlock()
+            return
+        }
+
+        automaticRetryAttempt += 1
+        let attempt = automaticRetryAttempt
+        persistenceRevision &+= 1
+        let retryRevision = persistenceRevision
+        workItem = DispatchWorkItem { [weak self] in
+            self?.saveIfCurrent(retryRevision)
+        }
+        pendingSaveWorkItem = workItem
+        delay = persistenceRetryBaseInterval * pow(2.0, Double(attempt - 1))
+        persistenceLock.unlock()
+
+        persistenceQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func resetRetryAttemptIfCurrent(_ revision: UInt64) {
+        persistenceLock.lock()
+        if persistenceRevision == revision {
+            automaticRetryAttempt = 0
+        }
+        persistenceLock.unlock()
+    }
+
+    @discardableResult
+    private func invalidateScheduledSave() -> UInt64 {
         persistenceLock.lock()
         persistenceRevision &+= 1
+        automaticRetryAttempt = 0
+        let revision = persistenceRevision
         let pending = pendingSaveWorkItem
         pendingSaveWorkItem = nil
         persistenceLock.unlock()
         pending?.cancel()
+        return revision
     }
 
     /// Reliably persists the latest in-memory snapshot before returning.
     ///
     /// Invalidating the debounce generation prevents an already-cancelled work
     /// item from writing again after this synchronous flush completes.
-    func flushPersistence() {
+    @discardableResult
+    func flushPersistence() -> PersistenceFlushResult {
         loadIfNeeded()
 
-        lock.lock()
-        let canWrite: Bool
-        switch _persistenceState {
-        case .ready, .migrated, .quarantinedCorrupt:
-            canWrite = true
-        case .notLoaded, .loading, .readOnlyPreserved:
-            canWrite = false
+        let revision = invalidateScheduledSave()
+        let operation = { [self] in saveNow() }
+        let result: PersistenceFlushResult
+        if DispatchQueue.getSpecific(key: persistenceQueueKey) != nil {
+            result = operation()
+        } else {
+            result = persistenceQueue.sync(execute: operation)
         }
-        lock.unlock()
 
-        guard canWrite else { return }
-
-        invalidateScheduledSave()
-        persistenceQueue.sync { [self] in
-            saveNow()
+        switch result.outcome {
+        case .failed(.storageUnavailable), .failed(.writeFailed):
+            scheduleRetryIfNeeded(afterFailedRevision: revision)
+        case .failed(.capacityExceeded):
+            break
+        case .persisted, .alreadyCurrent:
+            resetRetryAttemptIfCurrent(revision)
+        case .rejectedReadOnly:
+            break
         }
+        return result
     }
 
-    private func saveNow() {
-        guard let url = cacheFileURL() else {
-            PersistenceLogger.log("随机权重缓存目录不可访问，无法保存")
-            return
-        }
-
+    private func saveNow() -> PersistenceFlushResult {
         lock.lock()
-        // Re-check state in case it changed
-        let canWrite: Bool
+        let attemptedGeneration = dirtyGeneration
         switch _persistenceState {
         case .ready, .migrated, .quarantinedCorrupt:
-            canWrite = true
-        case .notLoaded, .loading, .readOnlyPreserved:
-            canWrite = false
-        }
-        guard canWrite else {
+            break
+        case .readOnlyPreserved(let reason):
+            let result = makeFlushResultLocked(
+                outcome: .rejectedReadOnly(reason),
+                attemptedGeneration: attemptedGeneration
+            )
             lock.unlock()
-            return
+            return result
+        case .notLoaded, .loading:
+            let result = makeFlushResultLocked(
+                outcome: .rejectedReadOnly(.unreadable),
+                attemptedGeneration: attemptedGeneration
+            )
+            lock.unlock()
+            return result
+        }
+
+        guard isPersistenceDirtyLocked else {
+            let result = makeFlushResultLocked(
+                outcome: .alreadyCurrent,
+                attemptedGeneration: attemptedGeneration
+            )
+            lock.unlock()
+            return result
         }
 
         let snapshotQueue = queueLevels
         let snapshotPlaylists = playlistLevels
         lock.unlock()
 
-        let payload = CacheFile(version: formatVersion, queueLevels: snapshotQueue, playlistLevels: snapshotPlaylists)
+        guard let url = cacheFileURL() else {
+            PersistenceLogger.log("随机权重缓存目录不可访问，无法保存")
+            return failedFlushResult(
+                generation: attemptedGeneration,
+                failure: .storageUnavailable
+            )
+        }
+
+        let payload = CacheFile(
+            version: formatVersion,
+            queueLevels: snapshotQueue,
+            playlistLevels: snapshotPlaylists
+        )
+        guard Self.validate(payload, requireCanonicalSparseForm: true) else {
+            PersistenceLogger.log("保存随机权重失败: 数据超过安全边界或不满足格式约束")
+            return failedFlushResult(
+                generation: attemptedGeneration,
+                failure: .capacityExceeded
+            )
+        }
         do {
             let data = try JSONEncoder().encode(payload)
-            try data.write(to: url, options: .atomic)
+            guard data.count <= Self.maximumFileBytes else {
+                return failedFlushResult(
+                    generation: attemptedGeneration,
+                    failure: .capacityExceeded
+                )
+            }
+            if let fileWriter {
+                try fileWriter(data, url)
+            } else {
+                try DerivedCacheFileIO.atomicWrite(data, to: url)
+            }
 
-            // Only clear replacement flag after successful write
             lock.lock()
-            needsReplacementWrite = false
+            durableGeneration = attemptedGeneration
+            if dirtyGeneration == attemptedGeneration {
+                needsReplacementWrite = false
+            }
+            let result = makeFlushResultLocked(
+                outcome: .persisted,
+                attemptedGeneration: attemptedGeneration
+            )
             lock.unlock()
+            return result
         } catch {
             PersistenceLogger.log("保存随机权重失败: 写入错误")
-            DispatchQueue.main.async {
-                PersistenceLogger.notifyUser(title: "随机权重保存失败", subtitle: "请检查磁盘权限或空间")
+            if shouldNotifyWriteFailure(for: attemptedGeneration) {
+                DispatchQueue.main.async {
+                    PersistenceLogger.notifyUser(title: "随机权重保存失败", subtitle: "请检查磁盘权限或空间")
+                }
             }
+            return failedFlushResult(
+                generation: attemptedGeneration,
+                failure: .writeFailed
+            )
         }
+    }
+
+    /// Must be called while `lock` is held.
+    private func makeFlushResultLocked(
+        outcome: PersistenceFlushResult.Outcome,
+        attemptedGeneration: UInt64
+    ) -> PersistenceFlushResult {
+        PersistenceFlushResult(
+            outcome: outcome,
+            attemptedGeneration: attemptedGeneration,
+            durableGeneration: durableGeneration,
+            hasPendingChanges: isPersistenceDirtyLocked
+        )
+    }
+
+    private func failedFlushResult(
+        generation: UInt64,
+        failure: PersistenceFailure
+    ) -> PersistenceFlushResult {
+        lock.lock()
+        let result = makeFlushResultLocked(
+            outcome: .failed(failure),
+            attemptedGeneration: generation
+        )
+        lock.unlock()
+        return result
+    }
+
+    private func shouldNotifyWriteFailure(for generation: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard lastFailureNotificationGeneration != generation else { return false }
+        lastFailureNotificationGeneration = generation
+        return true
     }
 
     private func cacheFileURL() -> URL? {
         if let cacheFileURLOverride {
-            let dir = cacheFileURLOverride.deletingLastPathComponent()
-            if !FileManager.default.fileExists(atPath: dir.path) {
-                do {
-                    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                } catch {
-                    return nil
-                }
-            }
+            guard (try? DerivedCacheFileIO.ensureParentDirectory(
+                for: cacheFileURLOverride
+            )) != nil else { return nil }
             return cacheFileURLOverride
         }
 
         let fm = FileManager.default
         guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
         let dir = base.appendingPathComponent("MusicPlayer", isDirectory: true)
-        if !fm.fileExists(atPath: dir.path) {
-            do {
-                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            } catch {
-                return nil
+        let url = dir.appendingPathComponent(cacheFileName, isDirectory: false)
+        guard (try? DerivedCacheFileIO.ensureParentDirectory(for: url)) != nil else {
+            return nil
+        }
+        return url
+    }
+
+    private struct ResourceFootprint {
+        let entries: Int
+        let pathBytes: Int
+    }
+
+    private struct StoredLevelMutationProjection {
+        let changed: Bool
+        let entryDelta: Int
+        let pathByteDelta: Int
+    }
+
+    private static func isValidRuntimePath(_ path: String) -> Bool {
+        let bytes = path.utf8.count
+        guard !path.isEmpty,
+              path.hasPrefix("/"),
+              !path.utf8.contains(0),
+              bytes <= maximumPathBytes else {
+            return false
+        }
+        let canonical = PathKey.canonical(path: path)
+        return canonical.hasPrefix("/") && canonical.utf8.count <= maximumPathBytes
+    }
+
+    private static func projectStoredLevelMutation(
+        _ rawValue: Int,
+        canonicalKey: String,
+        in map: [String: Int]
+    ) -> StoredLevelMutationProjection {
+        let variants = Set([canonicalKey, PathKey.legacy(path: canonicalKey)])
+        let existingKeys = variants.filter { map[$0] != nil }
+        let storesValue = rawValue != Level.defaultLevel.rawValue
+        let entryDelta = (storesValue ? 1 : 0) - existingKeys.count
+        let removedBytes = existingKeys.reduce(into: 0) { partial, key in
+            partial += key.utf8.count
+        }
+        let pathByteDelta = (storesValue ? canonicalKey.utf8.count : 0) - removedBytes
+        let alreadyCanonical = existingKeys.count == 1
+            && existingKeys.first == canonicalKey
+            && map[canonicalKey] == rawValue
+        return StoredLevelMutationProjection(
+            changed: storesValue ? !alreadyCanonical : !existingKeys.isEmpty,
+            entryDelta: entryDelta,
+            pathByteDelta: pathByteDelta
+        )
+    }
+
+    private static func applyStoredLevelMutation(
+        _ rawValue: Int,
+        canonicalKey: String,
+        to map: inout [String: Int]
+    ) {
+        map.removeValue(forKey: canonicalKey)
+        let legacyKey = PathKey.legacy(path: canonicalKey)
+        if legacyKey != canonicalKey {
+            map.removeValue(forKey: legacyKey)
+        }
+        if rawValue != Level.defaultLevel.rawValue {
+            map[canonicalKey] = rawValue
+        }
+    }
+
+    /// Must be called with `lock` held.
+    private func capacityAllowsLocked(
+        _ projection: StoredLevelMutationProjection,
+        currentMapCount: Int,
+        maximumMapEntries: Int,
+        createsPlaylist: Bool
+    ) -> Bool {
+        guard projection.changed else { return true }
+        let nextMapCount = currentMapCount + projection.entryDelta
+        let nextTotalEntries = storedEntryCount + projection.entryDelta
+        let nextPathBytes = storedPathByteCount + projection.pathByteDelta
+        let nextPlaylistCount = playlistLevels.count + (createsPlaylist ? 1 : 0)
+        return nextMapCount >= 0
+            && nextMapCount <= maximumMapEntries
+            && nextTotalEntries >= 0
+            && nextTotalEntries <= Self.maximumTotalEntries
+            && nextPathBytes >= 0
+            && nextPathBytes <= Self.maximumAggregatePathBytes
+            && nextPlaylistCount <= Self.maximumPlaylistCount
+    }
+
+    /// Must be called with `lock` held after the corresponding map mutation.
+    private func applyResourceDeltaLocked(_ projection: StoredLevelMutationProjection) {
+        storedEntryCount += projection.entryDelta
+        storedPathByteCount += projection.pathByteDelta
+        assert(storedEntryCount >= 0 && storedPathByteCount >= 0)
+    }
+
+    private static func resourceFootprint(of map: [String: Int]) -> ResourceFootprint {
+        ResourceFootprint(
+            entries: map.count,
+            pathBytes: map.keys.reduce(into: 0) { partial, key in
+                partial += key.utf8.count
+            }
+        )
+    }
+
+    /// Must be called with `lock` held.
+    private func refreshResourceCountersLocked() {
+        var entries = queueLevels.count
+        var pathBytes = Self.resourceFootprint(of: queueLevels).pathBytes
+        for levels in playlistLevels.values {
+            let footprint = Self.resourceFootprint(of: levels)
+            entries += footprint.entries
+            pathBytes += footprint.pathBytes
+        }
+        storedEntryCount = entries
+        storedPathByteCount = pathBytes
+    }
+
+    /// Validates both resource limits and semantic invariants before a decoded
+    /// document can influence memory state or an in-memory snapshot can reach disk.
+    private static func validate(
+        _ file: CacheFile,
+        requireCanonicalSparseForm: Bool
+    ) -> Bool {
+        guard supportedFormatVersions.contains(file.version),
+              !requireCanonicalSparseForm || file.version == 3,
+              file.queueLevels.count <= maximumQueueEntries,
+              file.playlistLevels.count <= maximumPlaylistCount else {
+            return false
+        }
+
+        let permittedRawValues: ClosedRange<Int> = file.version == 1
+            ? -1 ... 4
+            : Level.minimumStoredRawValue ... Level.maximumStoredRawValue
+        var totalEntries = 0
+        var aggregatePathBytes = 0
+
+        func validateLevelMap(_ levels: [String: Int], maximumEntries: Int) -> Bool {
+            guard levels.count <= maximumEntries else { return false }
+            var canonicalKeys = Set<String>()
+            canonicalKeys.reserveCapacity(levels.count)
+            for (path, rawValue) in levels {
+                let pathBytes = path.utf8.count
+                guard !path.isEmpty,
+                      path.hasPrefix("/"),
+                      !path.utf8.contains(0),
+                      pathBytes <= PlaybackWeights.maximumPathBytes,
+                      permittedRawValues.contains(rawValue) else {
+                    return false
+                }
+
+                let canonicalPath = PathKey.canonical(path: path)
+                guard canonicalPath.hasPrefix("/"),
+                      canonicalPath.utf8.count <= PlaybackWeights.maximumPathBytes,
+                      canonicalKeys.insert(canonicalPath).inserted else {
+                    return false
+                }
+                if requireCanonicalSparseForm {
+                    guard path == canonicalPath,
+                          rawValue != Level.defaultLevel.rawValue else {
+                        return false
+                    }
+                }
+
+                let (nextPathBytes, pathOverflow) = aggregatePathBytes.addingReportingOverflow(pathBytes)
+                let (nextEntryCount, entryOverflow) = totalEntries.addingReportingOverflow(1)
+                guard !pathOverflow,
+                      !entryOverflow,
+                      nextPathBytes <= PlaybackWeights.maximumAggregatePathBytes,
+                      nextEntryCount <= PlaybackWeights.maximumTotalEntries else {
+                    return false
+                }
+                aggregatePathBytes = nextPathBytes
+                totalEntries = nextEntryCount
+            }
+            return true
+        }
+
+        guard validateLevelMap(file.queueLevels, maximumEntries: maximumQueueEntries) else {
+            return false
+        }
+
+        var canonicalPlaylistIDs = Set<String>()
+        canonicalPlaylistIDs.reserveCapacity(file.playlistLevels.count)
+        for (playlistID, levels) in file.playlistLevels {
+            guard let uuid = UUID(uuidString: playlistID),
+                  canonicalPlaylistIDs.insert(uuid.uuidString).inserted,
+                  (!requireCanonicalSparseForm || playlistID == uuid.uuidString),
+                  (!requireCanonicalSparseForm || !levels.isEmpty),
+                  validateLevelMap(levels, maximumEntries: maximumEntriesPerPlaylist) else {
+                return false
             }
         }
-        return dir.appendingPathComponent(cacheFileName, isDirectory: false)
+        return true
     }
 
     private func normalizePlaylistLevelMaps(
@@ -682,10 +1355,14 @@ final class PlaybackWeights: ObservableObject {
         guard !raw.isEmpty else { return [:] }
         var normalized: [String: [String: Int]] = [:]
         normalized.reserveCapacity(raw.count)
-        for (playlistID, levels) in raw {
+        for playlistID in raw.keys.sorted() {
+            guard let levels = raw[playlistID],
+                  let canonicalPlaylistID = UUID(uuidString: playlistID)?.uuidString else {
+                continue
+            }
             let normalizedLevels = normalizeLevelMap(levels, transform: transform)
             if !normalizedLevels.isEmpty {
-                normalized[playlistID] = normalizedLevels
+                normalized[canonicalPlaylistID] = normalizedLevels
             }
         }
         return normalized
@@ -698,7 +1375,8 @@ final class PlaybackWeights: ObservableObject {
         guard !raw.isEmpty else { return [:] }
         var normalized: [String: Int] = [:]
         normalized.reserveCapacity(raw.count)
-        for (path, level) in raw {
+        for path in raw.keys.sorted() {
+            guard let level = raw[path] else { continue }
             let key = PathKey.canonical(path: path)
             let clamped = normalizedStoredRaw(transform(level))
             if clamped != Level.defaultLevel.rawValue {
@@ -725,22 +1403,43 @@ final class PlaybackWeights: ObservableObject {
         PathKey.lookupKeys(for: url)
     }
 
-    private func removeKeyVariants(_ key: String, from map: inout [String: Int]) -> Bool {
-        let variants = [PathKey.canonical(path: key), PathKey.legacy(path: key)]
-        var removed = false
-        for variant in variants {
-            if map.removeValue(forKey: variant) != nil {
-                removed = true
+    private func applyRekeys(_ changes: [TrackRekey], to map: inout [String: Int]) -> Bool {
+        var changed = false
+        for change in changes {
+            let oldCanonical = Self.key(for: change.oldURL)
+            let newCanonical = Self.key(for: change.newURL)
+            let oldKeys = Self.lookupKeys(for: change.oldURL)
+            let newKeys = Self.lookupKeys(for: change.newURL)
+
+            if oldCanonical == newCanonical {
+                guard let value = oldKeys.compactMap({ map[$0] }).first else { continue }
+                for key in oldKeys where key != newCanonical {
+                    if map.removeValue(forKey: key) != nil { changed = true }
+                }
+                if map[newCanonical] != value {
+                    map[newCanonical] = value
+                    changed = true
+                }
+                continue
+            }
+
+            guard let sourceValue = oldKeys.compactMap({ map[$0] }).first else { continue }
+            let destinationValue = newKeys.compactMap({ map[$0] }).first
+
+            for key in oldKeys {
+                if map.removeValue(forKey: key) != nil { changed = true }
+            }
+            for key in newKeys where key != newCanonical {
+                if map.removeValue(forKey: key) != nil { changed = true }
+            }
+
+            let finalValue = destinationValue ?? sourceValue
+            if map[newCanonical] != finalValue {
+                map[newCanonical] = finalValue
+                changed = true
             }
         }
-        return removed
-    }
-
-    private func removeLegacyVariant(_ key: String, from map: inout [String: Int]) {
-        let canonical = PathKey.canonical(path: key)
-        let legacy = PathKey.legacy(path: key)
-        guard canonical != legacy else { return }
-        map.removeValue(forKey: legacy)
+        return changed
     }
 
     private func valueWithMigration(in map: inout [String: Int], lookupKeys: [String], canonicalKey: String) -> Int? {
@@ -749,9 +1448,19 @@ final class PlaybackWeights: ObservableObject {
         }
         for key in lookupKeys where key != canonicalKey {
             if let value = map[key] {
-                map[canonicalKey] = value
-                map.removeValue(forKey: key)
-                scheduleSave()
+                let projection = Self.projectStoredLevelMutation(
+                    value,
+                    canonicalKey: canonicalKey,
+                    in: map
+                )
+                Self.applyStoredLevelMutation(
+                    value,
+                    canonicalKey: canonicalKey,
+                    to: &map
+                )
+                applyResourceDeltaLocked(projection)
+                markDirtyLocked()
+                scheduleSave(resetRetryAttempt: true)
                 return value
             }
         }

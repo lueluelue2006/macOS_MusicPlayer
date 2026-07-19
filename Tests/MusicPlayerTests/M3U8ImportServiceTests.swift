@@ -1,7 +1,20 @@
+import Darwin
 import XCTest
 @testable import MusicPlayer
 
 final class M3U8ImportServiceTests: XCTestCase {
+    func testImportAcceptsReadableRegularPlaylistOwnedByAnotherUser() throws {
+        let fixture = URL(fileURLWithPath: "/etc/hosts")
+        var info = stat()
+        guard lstat(fixture.path, &info) == 0,
+              (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_uid != geteuid() else {
+            throw XCTSkip("This machine has no suitable readable foreign-owner fixture")
+        }
+
+        let result = try M3U8ImportService.importPlaylist(from: fixture)
+        XCTAssertEqual(result.playlistName, "hosts")
+    }
 
     private var tempDir: URL!
 
@@ -176,7 +189,7 @@ final class M3U8ImportServiceTests: XCTestCase {
         XCTAssertFalse(issue.message.isEmpty)
     }
 
-    func testImportDeduplicatesKeepsFirst() throws {
+    func testImportPreservesDuplicatesAndReportsThem() throws {
         let song = tempDir.appendingPathComponent("song.mp3")
         try Data().write(to: song)
 
@@ -186,7 +199,7 @@ final class M3U8ImportServiceTests: XCTestCase {
 
         let result = try M3U8ImportService.importPlaylist(from: m3u8File)
 
-        XCTAssertEqual(result.tracks.map(\.path), [song.path])
+        XCTAssertEqual(result.tracks.map(\.path), [song.path, song.path])
 
         let issue = try XCTUnwrap(result.issues.first)
         XCTAssertEqual(issue.kind, .duplicate)

@@ -9,6 +9,7 @@ final class PlaylistViewModel: ObservableObject {
     let playlistsStore: PlaylistsStore
     let sortState: SearchSortState
     let weights: PlaybackWeights
+    private let stopPlaybackForQueueClear: () -> Void
 
     private static let panelModeDefaultsKey = "userPlaylistPanelMode"
 
@@ -102,13 +103,17 @@ final class PlaylistViewModel: ObservableObject {
         playlistManager: PlaylistManager,
         playlistsStore: PlaylistsStore,
         sortState: SearchSortState? = nil,
-        weights: PlaybackWeights? = nil
+        weights: PlaybackWeights? = nil,
+        stopPlaybackForQueueClear: (() -> Void)? = nil
     ) {
         self.audioPlayer = audioPlayer
         self.playlistManager = playlistManager
         self.playlistsStore = playlistsStore
         self.sortState = sortState ?? .shared
         self.weights = weights ?? .shared
+        self.stopPlaybackForQueueClear = stopPlaybackForQueueClear ?? { [weak audioPlayer] in
+            audioPlayer?.stopAndClearCurrent()
+        }
         self.panelMode = PanelMode(
             rawValue: UserDefaults.standard.integer(forKey: Self.panelModeDefaultsKey)
         ) ?? .queue
@@ -175,9 +180,27 @@ final class PlaylistViewModel: ObservableObject {
         playlistManager.enqueueAddFiles(urls)
     }
 
-    func clearQueue() {
-        playlistManager.clearAllFiles()
-        audioPlayer.stopAndClearCurrent()
+    @discardableResult
+    func clearQueue() -> PlaylistManager.QueueClearResult {
+        let result = playlistManager.clearAllFiles()
+        guard result.didApply else {
+            PersistenceLogger.notifyUser(
+                title: "无法清空队列",
+                subtitle: "队列仍在恢复或处于只读保护，请稍后重试"
+            )
+            return result
+        }
+
+        stopPlaybackForQueueClear()
+        queueVisibleFiles.removeAll()
+        queueVisibleRevision &+= 1
+        if !result.isDurable {
+            PersistenceLogger.notifyUser(
+                title: "队列已清空",
+                subtitle: "磁盘保存尚未完成，应用会继续重试"
+            )
+        }
+        return result
     }
 
     func refreshAllMetadata() {
@@ -263,7 +286,27 @@ final class PlaylistViewModel: ObservableObject {
             okTitle: "创建",
             cancelTitle: "取消"
         )
-        _ = PlaylistCommands.createEmptyPlaylist(name: name ?? "", in: playlistsStore)
+        let mutation = PlaylistCommands.createEmptyPlaylist(
+            name: name ?? "",
+            in: playlistsStore
+        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            switch await self.playlistsStore.awaitDurability(of: mutation) {
+            case .committed, .unchanged:
+                break
+            case .rejected(let rejection):
+                PersistenceLogger.notifyUser(
+                    title: "无法创建歌单",
+                    subtitle: rejection.diagnosticMessage
+                )
+            case .persistenceFailed(let failure):
+                PersistenceLogger.notifyUser(
+                    title: "歌单尚未安全保存",
+                    subtitle: failure.diagnosticMessage
+                )
+            }
+        }
     }
 
     // MARK: - Search

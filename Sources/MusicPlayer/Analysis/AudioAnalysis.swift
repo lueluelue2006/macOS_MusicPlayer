@@ -131,7 +131,7 @@ enum AudioAnalysis {
 
     /// Create a temporary symlink with a corrected extension if `AVAudioFile(forReading:)` may fail due to
     /// extension/container mismatch. Returns `nil` if no hint is available or alias creation fails.
-    private static func makeAudioReadAliasIfNeeded(for url: URL) -> URL? {
+    static func makeAudioReadAliasIfNeeded(for url: URL) -> URL? {
         guard url.isFileURL else { return nil }
 
         let hint = AudioFileSniffer.avAudioPlayerFileTypeHint(at: url)

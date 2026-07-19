@@ -21,6 +21,61 @@ private final class LockedCounter: @unchecked Sendable {
 
 @MainActor
 final class ImmersivePlaybackIntegrationTests: XCTestCase {
+    func testLateColdAnalysisUpdatesCurrentTrackWithoutReplay() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-immersive-late-current-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let audioURL = directory.appendingPathComponent("late.wav")
+        try writeWAV(to: audioURL, duration: 4, audibleRange: 0.5 ..< 3.1)
+        let analyzer = ImmersivePlaybackAnalyzer(
+            cacheFileURL: nil,
+            configuration: ImmersivePlaybackAnalyzer.Configuration(analysisTimeout: 0.02),
+            analysisOperation: { _, _ in
+                Thread.sleep(forTimeInterval: 0.25)
+                return ImmersivePlaybackAnalyzer.AnalysisOutcome(
+                    bounds: PlaybackBounds(
+                        audibleStart: 0.5,
+                        audibleEnd: 3.1,
+                        physicalDuration: 4
+                    ),
+                    isCacheable: true
+                )
+            }
+        )
+        let player = AudioPlayer(
+            volumeCacheFileURLOverride: directory.appendingPathComponent("volume-cache.json"),
+            initialImmersivePlaybackEnabled: true,
+            immersivePlaybackAnalyzerOverride: analyzer
+        )
+        player.isNormalizationEnabled = false
+        defer { player.stopAndClearCurrent(clearLastPlayed: false) }
+
+        player.play(
+            makeAudioFile(audioURL, title: "late"),
+            autostart: false,
+            persist: false,
+            bypassConfirm: true
+        )
+        let loadedWithFallback = await waitUntil(timeout: 1) {
+            player.currentFile?.url == audioURL
+                && player.pendingPlaybackURL == nil
+                && player.activePlaybackBounds?.hasTrimmedEnd == false
+        }
+        XCTAssertTrue(loadedWithFallback)
+
+        let adoptedLateBounds = await waitUntil(timeout: 1) {
+            player.currentFile?.url == audioURL
+                && player.activePlaybackBounds?.audibleStart == 0.5
+                && player.activePlaybackBounds?.audibleEnd == 3.1
+        }
+        XCTAssertTrue(adoptedLateBounds)
+        XCTAssertFalse(player.isPlaying)
+    }
+
     func testLogicalBoundaryAdvancesToNextTrackExactlyOnce() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "musicplayer-immersive-integration-\(UUID().uuidString)",
@@ -92,6 +147,11 @@ final class ImmersivePlaybackIntegrationTests: XCTestCase {
                 && player.isPlaying
         }
         XCTAssertTrue(advanced)
+        XCTAssertEqual(
+            player.testActualPlayerVolume,
+            0.0,
+            "The preloaded handoff must remain hardware-silent under XCTest"
+        )
         try? await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(completions.read(), 1)
         XCTAssertEqual(manager.currentIndex, 1)

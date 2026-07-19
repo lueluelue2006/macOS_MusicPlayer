@@ -42,6 +42,23 @@ struct PlaylistsPanel: View {
     playlistsStore.playlist(for: playlistsStore.selectedPlaylistID)
   }
 
+  private var persistenceNotice: (title: String, detail: String, recoverable: Bool)? {
+    switch playlistsStore.persistenceState {
+    case .readOnly(let reason):
+      let recoverable: Bool
+      if case .corrupt(let backupURL) = reason {
+        recoverable = backupURL != nil
+      } else {
+        recoverable = false
+      }
+      return ("歌单已进入只读保护", reason.diagnosticMessage, recoverable)
+    case .dirty(_, let failure?):
+      return ("歌单尚未安全保存", failure.diagnosticMessage, false)
+    default:
+      return nil
+    }
+  }
+
   private var currentHighlightedURL: URL? {
     if audioPlayer.persistPlaybackState,
       playlistManager.currentIndex >= 0,
@@ -53,17 +70,22 @@ struct PlaylistsPanel: View {
   }
 
   var body: some View {
-    Group {
-      if isCompactRoot {
-        compactPlaylistLayout
-          .frame(maxWidth: .infinity, maxHeight: .infinity)
-      } else {
-        ViewThatFits(in: .horizontal) {
-          widePlaylistLayout
-            .frame(minWidth: 660, maxWidth: .infinity, maxHeight: .infinity)
-
+    VStack(spacing: 8) {
+      if let notice = persistenceNotice {
+        persistenceNoticeBanner(notice)
+      }
+      Group {
+        if isCompactRoot {
           compactPlaylistLayout
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+          ViewThatFits(in: .horizontal) {
+            widePlaylistLayout
+              .frame(minWidth: 660, maxWidth: .infinity, maxHeight: .infinity)
+
+            compactPlaylistLayout
+              .frame(maxWidth: .infinity, maxHeight: .infinity)
+          }
         }
       }
     }
@@ -111,6 +133,40 @@ struct PlaylistsPanel: View {
     .onChange(of: locateNowPlayingRequestID) { _ in
       handlePendingLocateNowPlayingRequest()
     }
+  }
+
+  private func persistenceNoticeBanner(
+    _ notice: (title: String, detail: String, recoverable: Bool)
+  ) -> some View {
+    HStack(spacing: 10) {
+      Image(systemName: "exclamationmark.shield.fill")
+        .foregroundStyle(Color.orange)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(notice.title)
+          .font(.system(size: 12, weight: .semibold))
+          .foregroundStyle(theme.stagePrimaryText)
+        Text(notice.detail)
+          .font(.system(size: 10))
+          .foregroundStyle(theme.stageTertiaryText)
+          .lineLimit(2)
+      }
+      Spacer(minLength: 8)
+      if notice.recoverable {
+        Button("保留备份并重建") {
+          recoverCorruptPlaylistStore()
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+      }
+    }
+    .padding(.horizontal, 12)
+    .padding(.vertical, 9)
+    .background(Color.orange.opacity(colorScheme == .dark ? 0.14 : 0.10))
+    .overlay {
+      RoundedRectangle(cornerRadius: 8, style: .continuous)
+        .stroke(Color.orange.opacity(0.35), lineWidth: 1)
+    }
+    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
   }
 
   private var widePlaylistLayout: some View {
@@ -161,7 +217,11 @@ struct PlaylistsPanel: View {
           Text("还没有歌单")
             .font(.subheadline)
             .foregroundColor(theme.mutedText)
-          Text("点击上方“新建歌单”开始使用。")
+          Text(
+            playlistsStore.isPersistenceReadOnly
+              ? "原始歌单文件已保留，当前不会写入任何修改。"
+              : "点击上方“新建歌单”开始使用。"
+          )
             .font(.caption)
             .foregroundColor(theme.mutedText.opacity(0.9))
             .fixedSize(horizontal: false, vertical: true)
@@ -255,7 +315,11 @@ struct PlaylistsPanel: View {
         }
         .frame(height: isCompactRoot ? 42 : 56)
       } else if playlistsStore.playlists.isEmpty {
-        Text("还没有歌单，点击上方“新建”开始使用。")
+        Text(
+          playlistsStore.isPersistenceReadOnly
+            ? "歌单存储处于只读保护，原始文件未被覆盖。"
+            : "还没有歌单，点击上方“新建”开始使用。"
+        )
           .font(.caption)
           .foregroundColor(theme.mutedText)
           .frame(height: isCompactRoot ? 42 : 56, alignment: .leading)
@@ -283,7 +347,7 @@ struct PlaylistsPanel: View {
         .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
-    .disabled(!playlistsStore.isReady)
+    .disabled(!playlistsStore.isReady || playlistsStore.isPersistenceReadOnly)
     .help("导入 M3U8 歌单")
     .accessibilityLabel("导入 M3U8 歌单")
   }
@@ -353,13 +417,16 @@ struct PlaylistsPanel: View {
     Button("设置歌单封面…") {
       choosePlaylistArtwork(playlist)
     }
+    .disabled(playlistsStore.isPersistenceReadOnly)
     Button("恢复默认封面") {
       resetPlaylistArtwork(playlist)
     }
+    .disabled(playlistsStore.isPersistenceReadOnly)
     Divider()
     Button("重命名…") {
       renamePlaylist(playlist)
     }
+    .disabled(playlistsStore.isPersistenceReadOnly)
     Button("导出 M3U8…") {
       exportPlaylistAsM3U8(playlist)
     }
@@ -367,6 +434,7 @@ struct PlaylistsPanel: View {
     Button("删除歌单", role: .destructive) {
       deletePlaylist(playlist)
     }
+    .disabled(playlistsStore.isPersistenceReadOnly)
   }
 
   @ViewBuilder
@@ -510,8 +578,26 @@ struct PlaylistsPanel: View {
       },
       deleteAction: { fileToDelete in
         NotificationCenter.default.post(name: .blurSearchField, object: nil)
-        playlistsStore.removeTrack(path: fileToDelete.url.path, from: playlist.id)
-        reloadSelectedPlaylist()
+        Task { @MainActor in
+          guard requireWritablePlaylistStore() else { return }
+          guard let trackID = UUID(uuidString: fileToDelete.id) else {
+            postToast(title: "无法移除歌曲", subtitle: "歌曲身份无效，请重新载入歌单", kind: "error")
+            return
+          }
+          let mutation = playlistsStore.removeTracksResult(
+            trackIDs: [trackID],
+            from: playlist.id
+          )
+          let outcome = await playlistsStore.awaitDurability(of: mutation)
+          switch outcome {
+          case .committed, .unchanged:
+            reloadSelectedPlaylist()
+          case .rejected(let rejection):
+            postToast(title: "无法移除歌曲", subtitle: rejection.diagnosticMessage, kind: "error")
+          case .persistenceFailed(let failure):
+            postToast(title: "歌曲尚未安全保存", subtitle: failure.diagnosticMessage, kind: "error")
+          }
+        }
       },
       editAction: { fileToEdit in
         NotificationCenter.default.post(name: .blurSearchField, object: nil)
@@ -627,15 +713,18 @@ struct PlaylistsPanel: View {
       }
     }
     .buttonStyle(.plain)
+    .disabled(playlistsStore.isPersistenceReadOnly)
     .help("更换“\(playlist.name)”的歌单封面")
     .accessibilityLabel("更换“\(playlist.name)”的歌单封面")
     .contextMenu {
       Button("选择图片…") {
         choosePlaylistArtwork(playlist)
       }
+      .disabled(playlistsStore.isPersistenceReadOnly)
       Button("恢复默认封面") {
         resetPlaylistArtwork(playlist)
       }
+      .disabled(playlistsStore.isPersistenceReadOnly)
     }
   }
 
@@ -682,7 +771,7 @@ struct PlaylistsPanel: View {
           )
       }
       .buttonStyle(.plain)
-      .disabled(playlistManager.audioFiles.isEmpty)
+      .disabled(playlistManager.audioFiles.isEmpty || playlistsStore.isPersistenceReadOnly)
       .help(playlistManager.audioFiles.isEmpty ? "队列为空：先在“队列”里导入一些歌曲" : "")
 
       Menu {
@@ -704,9 +793,11 @@ struct PlaylistsPanel: View {
     Button("设置歌单封面…") {
       choosePlaylistArtwork(playlist)
     }
+    .disabled(playlistsStore.isPersistenceReadOnly)
     Button("恢复默认封面") {
       resetPlaylistArtwork(playlist)
     }
+    .disabled(playlistsStore.isPersistenceReadOnly)
 
     Divider()
 
@@ -714,6 +805,7 @@ struct PlaylistsPanel: View {
       Button("添加正在播放") {
         addCurrentTrack(to: playlist)
       }
+      .disabled(playlistsStore.isPersistenceReadOnly)
     }
 
     if nowPlayingIDInPlaylist(playlist) != nil {
@@ -740,9 +832,19 @@ struct PlaylistsPanel: View {
       postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
       return
     }
-    Task {
-      _ = await playlistsStore.addTracks([url], to: playlist.id)
-      reloadSelectedPlaylist()
+    Task { @MainActor in
+      let mutation = await playlistsStore.addTracksResult([url], to: playlist.id)
+      let outcome = await playlistsStore.awaitDurability(of: mutation)
+      switch outcome {
+      case .committed(let summary), .unchanged(let summary):
+        reloadSelectedPlaylist()
+        let title = summary.affectedCount > 0 ? "已添加到歌单" : "没有新增歌曲"
+        postToast(title: title, subtitle: playlist.name, kind: "success")
+      case .rejected(let rejection):
+        postToast(title: "无法添加歌曲", subtitle: rejection.diagnosticMessage, kind: "error")
+      case .persistenceFailed(let failure):
+        postToast(title: "歌曲尚未安全保存", subtitle: failure.diagnosticMessage, kind: "error")
+      }
     }
   }
 
@@ -854,7 +956,38 @@ struct PlaylistsPanel: View {
   // MARK: - Actions
 
   @MainActor
+  private func requireWritablePlaylistStore() -> Bool {
+    guard case .readOnly(let reason) = playlistsStore.persistenceState else { return true }
+    postToast(title: "歌单处于只读保护", subtitle: reason.diagnosticMessage, kind: "warning")
+    return false
+  }
+
+  @MainActor
+  private func recoverCorruptPlaylistStore() {
+    let confirmed = DestructiveConfirmation.confirm(
+      title: "重建歌单库？",
+      message: "将从空白歌单库继续使用；损坏原文件的隔离备份会保留。音乐文件不会被删除。",
+      confirmTitle: "保留备份并重建",
+      cancelTitle: "取消"
+    )
+    guard confirmed else { return }
+    let mutation = playlistsStore.recoverCorruptStoreStartingEmpty()
+    Task { @MainActor in
+      switch await playlistsStore.awaitDurability(of: mutation) {
+      case .committed, .unchanged:
+        reloadSelectedPlaylist()
+        postToast(title: "歌单库已重建", subtitle: "损坏备份仍保留在本地", kind: "success")
+      case .rejected(let rejection):
+        postToast(title: "未能重建歌单库", subtitle: rejection.diagnosticMessage, kind: "error")
+      case .persistenceFailed(let failure):
+        postToast(title: "重建尚未安全保存", subtitle: failure.diagnosticMessage, kind: "error")
+      }
+    }
+  }
+
+  @MainActor
   private func openAddFromQueueSheet(targetPlaylistID: UserPlaylist.ID) {
+    guard requireWritablePlaylistStore() else { return }
     guard !playlistManager.audioFiles.isEmpty else {
       postToast(title: "队列为空", subtitle: "先在“队列”里导入一些歌曲", kind: "info")
       return
@@ -867,6 +1000,7 @@ struct PlaylistsPanel: View {
 
   @MainActor
   private func choosePlaylistArtwork(_ playlist: UserPlaylist) {
+    guard requireWritablePlaylistStore() else { return }
     let panel = NSOpenPanel()
     panel.title = "设置歌单封面"
     panel.message = "选择一张图片作为“\(playlist.name)”的歌单封面"
@@ -879,7 +1013,7 @@ struct PlaylistsPanel: View {
     guard panel.runModal() == .OK, let url = panel.url else { return }
     Task { @MainActor in
       do {
-        try await PlaylistArtworkStore.shared.importArtwork(from: url, for: playlist.id)
+        try await playlistsStore.importArtwork(from: url, for: playlist.id)
         artworkRevisions[playlist.id, default: 0] &+= 1
         postToast(title: "歌单封面已更新", subtitle: playlist.name, kind: "success")
       } catch {
@@ -894,9 +1028,10 @@ struct PlaylistsPanel: View {
 
   @MainActor
   private func resetPlaylistArtwork(_ playlist: UserPlaylist) {
+    guard requireWritablePlaylistStore() else { return }
     Task { @MainActor in
       do {
-        try await PlaylistArtworkStore.shared.removeCustomArtwork(for: playlist.id)
+        try await playlistsStore.resetArtwork(for: playlist.id)
         artworkRevisions[playlist.id, default: 0] &+= 1
         postToast(title: "已恢复默认歌单封面", subtitle: playlist.name, kind: "success")
       } catch {
@@ -911,6 +1046,7 @@ struct PlaylistsPanel: View {
 
   @MainActor
   private func renamePlaylist(_ playlist: UserPlaylist) {
+    guard requireWritablePlaylistStore() else { return }
     if let name = TextInputPrompt.prompt(
       title: "重命名歌单",
       message: "输入新的歌单名称",
@@ -918,12 +1054,24 @@ struct PlaylistsPanel: View {
       okTitle: "确定",
       cancelTitle: "取消"
     ) {
-      playlistsStore.renamePlaylist(playlist, to: name)
+      let mutation = playlistsStore.renamePlaylistResult(playlist, to: name)
+      Task { @MainActor in
+        let outcome = await playlistsStore.awaitDurability(of: mutation)
+        switch outcome {
+        case .committed, .unchanged:
+          break
+        case .rejected(let rejection):
+          postToast(title: "无法重命名歌单", subtitle: rejection.diagnosticMessage, kind: "error")
+        case .persistenceFailed(let failure):
+          postToast(title: "歌单名称尚未安全保存", subtitle: failure.diagnosticMessage, kind: "error")
+        }
+      }
     }
   }
 
   @MainActor
   private func deletePlaylist(_ playlist: UserPlaylist) {
+    guard requireWritablePlaylistStore() else { return }
     let confirmed = DestructiveConfirmation.confirm(
       title: "删除歌单？",
       message: "将删除歌单“\(playlist.name)”。不会删除任何音乐文件。",
@@ -934,11 +1082,19 @@ struct PlaylistsPanel: View {
     if playlistManager.playbackScope == .playlist(playlist.id) {
       playlistManager.setPlaybackScopeQueue()
     }
-    playlistsStore.deletePlaylist(playlist)
-    Task {
-      try? await PlaylistArtworkStore.shared.removeCustomArtwork(for: playlist.id)
+    let mutation = playlistsStore.deletePlaylistResult(playlist)
+    Task { @MainActor in
+      let outcome = await playlistsStore.awaitDurability(of: mutation)
+      switch outcome {
+      case .committed, .unchanged:
+        reloadSelectedPlaylist()
+        postToast(title: "歌单已删除", subtitle: playlist.name, kind: "success")
+      case .rejected(let rejection):
+        postToast(title: "无法删除歌单", subtitle: rejection.diagnosticMessage, kind: "error")
+      case .persistenceFailed(let failure):
+        postToast(title: "删除尚未安全保存", subtitle: failure.diagnosticMessage, kind: "error")
+      }
     }
-    reloadSelectedPlaylist()
   }
 
   @MainActor
@@ -968,7 +1124,12 @@ struct PlaylistsPanel: View {
       return
     }
 
-    playlistManager.setPlaybackScopePlaylist(playlist.id, trackURLsInOrder: playable.map(\.url))
+    playlistManager.setPlaybackScopePlaylist(
+      playlist.id,
+      trackURLsInOrder: playable.map(\.url),
+      trackIDsInOrder: playable.map(\.id),
+      selectedTrackID: file.id
+    )
     audioPlayer.selectOrResume(selected)
   }
 
@@ -986,7 +1147,8 @@ struct PlaylistsPanel: View {
 
     guard let playlist = selectedPlaylist else { return }
     let playlistID = playlist.id
-    let paths = playlist.tracks.map(\.path)
+    let storedTracks = playlist.tracks
+    let paths = storedTracks.map(\.path)
     guard !paths.isEmpty else {
       playlistManager.updatePlaybackScopePlaylistTracksIfActive(
         playlistID, trackURLsInOrder: [])
@@ -996,7 +1158,8 @@ struct PlaylistsPanel: View {
     isLoadingTracks = true
 
     let playlistManager = self.playlistManager
-    loadTask = Task.detached(priority: .background) { [paths, playlistManager, playlistID] in
+    loadTask = Task.detached(priority: .background) {
+      [paths, storedTracks, playlistManager, playlistID] in
       let fm = FileManager.default
       func key(for url: URL) -> String {
         url.standardizedFileURL.path
@@ -1033,7 +1196,12 @@ struct PlaylistsPanel: View {
                 workerResults.append(
                   (
                     idx,
-                    AudioFile(url: url, metadata: metadata, duration: nil),
+                    AudioFile(
+                      id: storedTracks[idx].id.uuidString,
+                      url: url,
+                      metadata: metadata,
+                      duration: nil
+                    ),
                     true
                   ))
                 continue
@@ -1046,7 +1214,12 @@ struct PlaylistsPanel: View {
               workerResults.append(
                 (
                   idx,
-                  AudioFile(url: url, metadata: metadata, duration: duration),
+                  AudioFile(
+                    id: storedTracks[idx].id.uuidString,
+                    url: url,
+                    metadata: metadata,
+                    duration: duration
+                  ),
                   false
                 ))
             }
@@ -1078,7 +1251,12 @@ struct PlaylistsPanel: View {
           let title = url.deletingPathExtension().lastPathComponent
           let meta = AudioMetadata(
             title: title, artist: "", album: "", year: nil, genre: nil, artwork: nil)
-          results[idx] = AudioFile(url: url, metadata: meta, duration: nil)
+          results[idx] = AudioFile(
+            id: storedTracks[idx].id.uuidString,
+            url: url,
+            metadata: meta,
+            duration: nil
+          )
         }
       }
 
@@ -1095,12 +1273,14 @@ struct PlaylistsPanel: View {
         self.playlistDuration = finalDuration
         self.isLoadingTracks = false
 
-        let playableURLs =
-          finalTracks
-          .filter { finalReasons[self.pathKey($0.url)] == nil }
-          .map(\.url)
+        let playableTracks = finalTracks.filter {
+          finalReasons[self.pathKey($0.url)] == nil
+        }
         self.playlistManager.updatePlaybackScopePlaylistTracksIfActive(
-          playlistID, trackURLsInOrder: playableURLs)
+          playlistID,
+          trackURLsInOrder: playableTracks.map(\.url),
+          trackIDsInOrder: playableTracks.map(\.id)
+        )
       }
     }
   }
@@ -1337,15 +1517,23 @@ struct PlaylistsPanel: View {
             return
           }
           let urls = selectedFiles.map(\.url)
-          Task {
-            let added = await playlistsStore.addTracks(urls, to: targetID)
-            showAddFromQueueSheet = false
-            reloadSelectedPlaylist()
-            postToast(title: "已添加 \(added) 首", subtitle: nil, kind: "success")
+          Task { @MainActor in
+            let mutation = await playlistsStore.addTracksResult(urls, to: targetID)
+            let outcome = await playlistsStore.awaitDurability(of: mutation)
+            switch outcome {
+            case .committed(let summary), .unchanged(let summary):
+              showAddFromQueueSheet = false
+              reloadSelectedPlaylist()
+              postToast(title: "已添加 \(summary.affectedCount) 首", subtitle: nil, kind: "success")
+            case .rejected(let rejection):
+              postToast(title: "无法添加歌曲", subtitle: rejection.diagnosticMessage, kind: "error")
+            case .persistenceFailed(let failure):
+              postToast(title: "歌曲尚未安全保存", subtitle: failure.diagnosticMessage, kind: "error")
+            }
           }
         }
         .keyboardShortcut(.defaultAction)
-        .disabled(selectedFiles.isEmpty)
+        .disabled(selectedFiles.isEmpty || playlistsStore.isPersistenceReadOnly)
       }
     }
     .onAppear {
@@ -1370,6 +1558,7 @@ struct PlaylistsPanel: View {
 
   @MainActor
   private func importM3U8Playlist() {
+    guard requireWritablePlaylistStore() else { return }
     let panel = NSOpenPanel()
     panel.title = "导入 M3U8 歌单"
     panel.message = "选择要导入的 M3U8 歌单文件"
@@ -1396,10 +1585,15 @@ struct PlaylistsPanel: View {
             issueCount: result.issues.count
           )
 
-          let createdID = await self.playlistsStore.createPlaylist(name: snapshot.name, tracks: result.tracks)
+          let mutation = await self.playlistsStore.createPlaylistResult(
+            name: snapshot.name,
+            tracks: result.tracks
+          )
+          let durable = await self.playlistsStore.awaitDurability(of: mutation)
 
           await MainActor.run {
-            if createdID != nil {
+            switch durable {
+            case .committed, .unchanged:
               self.reloadSelectedPlaylist()
 
               if snapshot.issueCount == 0 {
@@ -1421,10 +1615,16 @@ struct PlaylistsPanel: View {
                   kind: "warning"
                 )
               }
-            } else {
+            case .rejected(let rejection):
               self.postToast(
                 title: "导入未写入",
-                subtitle: "歌单可能处于只读保护状态",
+                subtitle: rejection.diagnosticMessage,
+                kind: "error"
+              )
+            case .persistenceFailed(let failure):
+              self.postToast(
+                title: "歌单尚未安全保存",
+                subtitle: failure.diagnosticMessage,
                 kind: "error"
               )
             }
@@ -1436,6 +1636,12 @@ struct PlaylistsPanel: View {
               self.postToast(
                 title: "无法读取 M3U8 文件",
                 subtitle: fileURL.lastPathComponent,
+                kind: "error"
+              )
+            case .capacityExceeded:
+              self.postToast(
+                title: "M3U8 文件过大",
+                subtitle: "请将歌单拆分到 50,000 首以内后重试",
                 kind: "error"
               )
             case .invalidUTF8:

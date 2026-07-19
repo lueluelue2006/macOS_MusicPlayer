@@ -4,6 +4,7 @@ import Foundation
 struct M3U8ServiceError: Error {
     enum Code: Equatable {
         case readFailed
+        case capacityExceeded
         case invalidUTF8
         case writeFailed
     }
@@ -19,6 +20,7 @@ struct M3U8ServiceError: Error {
 
 /// M3U8 import service with file validation and structured diagnostics
 enum M3U8ImportService {
+    private static let maximumImportBytes = 8 * 1_024 * 1_024
 
     struct ImportIssue {
         enum Kind: Equatable {
@@ -55,7 +57,14 @@ enum M3U8ImportService {
         // Read file content
         let data: Data
         do {
-            data = try Data(contentsOf: url)
+            data = try DerivedCacheFileIO.readBoundedRegularFile(
+                at: url,
+                maximumBytes: maximumImportBytes,
+                // User-selected playlists on shared/network volumes may have a
+                // different UID. Readability and regular-file checks are the
+                // relevant boundary; cache ownership rules do not apply here.
+                requireCurrentUserOwner: false
+            )
         } catch {
             throw M3U8ServiceError(code: .readFailed, underlyingError: error)
         }
@@ -68,11 +77,12 @@ enum M3U8ImportService {
         // Parse with codec
         let baseURL = url.deletingLastPathComponent()
         let parseResult = M3U8Codec.parse(content, baseURL: baseURL)
+        guard !parseResult.wasTruncated else {
+            throw M3U8ServiceError(code: .capacityExceeded)
+        }
 
         var validTracks: [UserPlaylist.Track] = []
         var issues: [ImportIssue] = []
-        var seenCanonicalPaths = Set<String>()
-        var duplicateLines = Set<Int>()
 
         // Process codec issues: translate duplicates, pass through others
         for codecIssue in parseResult.issues {
@@ -85,7 +95,6 @@ enum M3U8ImportService {
                     message: codecIssue.reason,
                     firstOccurrenceLineNumber: firstLine
                 ))
-                duplicateLines.insert(codecIssue.lineNumber)
             } else {
                 // Other codec issue (remote URL, unsupported scheme, etc.)
                 issues.append(ImportIssue(
@@ -100,19 +109,7 @@ enum M3U8ImportService {
 
         // Validate each entry
         for entry in parseResult.entries {
-            // Skip entries already marked as duplicates by codec
-            if duplicateLines.contains(entry.lineNumber) {
-                continue
-            }
-
             let entryURL = URL(fileURLWithPath: entry.path)
-            let canonicalPath = PathKey.canonical(for: entryURL)
-
-            // Track seen paths for deduplication
-            guard !seenCanonicalPaths.contains(canonicalPath) else {
-                // Should not happen if codec handled duplicates correctly
-                continue
-            }
 
             // Check if file exists
             var isDirectory: ObjCBool = false
@@ -165,7 +162,6 @@ enum M3U8ImportService {
             }
 
             // Valid track
-            seenCanonicalPaths.insert(canonicalPath)
             validTracks.append(UserPlaylist.Track(path: entry.path))
         }
 

@@ -47,11 +47,45 @@ struct SearchSortOption: Equatable, Codable, Sendable {
 final class SearchSortState: ObservableObject {
     static let shared = SearchSortState()
 
-    private let defaultsKey = "searchSort.options.v1"
+    enum PersistenceState: Equatable {
+        case writable
+        case protectedFuture(version: Int)
+        case protectedCorrupt
+    }
+
+    private struct Envelope: Codable {
+        let version: Int
+        let optionsByTarget: [String: SearchSortOption]
+    }
+
+    private struct VersionProbe: Decodable {
+        let version: Int?
+    }
+
+    nonisolated static let envelopeKey = "searchSort.options"
+    nonisolated static let legacyKey = "searchSort.options.v1"
+    nonisolated static let formatVersion = 1
+    nonisolated static let maximumEnvelopeBytes = 256 * 1_024
+    nonisolated static let corruptQuarantineKeys = [
+        "searchSort.options.quarantine.0",
+        "searchSort.options.quarantine.1",
+    ]
+
+    private let userDefaults: UserDefaults
+    private let envelopeKey: String
+    private let legacyKey: String
     @Published private var optionsByTarget: [String: SearchSortOption] = [:]
     @Published private(set) var revision: Int = 0
+    @Published private(set) var persistenceState: PersistenceState = .writable
 
-    private init() {
+    init(
+        userDefaults: UserDefaults = .standard,
+        envelopeKey: String = SearchSortState.envelopeKey,
+        legacyKey: String = SearchSortState.legacyKey
+    ) {
+        self.userDefaults = userDefaults
+        self.envelopeKey = envelopeKey
+        self.legacyKey = legacyKey
         load()
     }
 
@@ -60,21 +94,101 @@ final class SearchSortState: ObservableObject {
     }
 
     func setOption(_ option: SearchSortOption, for target: SearchFocusTarget) {
+        guard persistenceState == .writable else { return }
+        guard optionsByTarget[target.rawValue] != option else { return }
         optionsByTarget[target.rawValue] = option
         persist()
         revision += 1
     }
 
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
-              let decoded = try? JSONDecoder().decode([String: SearchSortOption].self, from: data)
-        else { return }
-        optionsByTarget = decoded
+        if let data = userDefaults.data(forKey: envelopeKey) {
+            guard data.count <= Self.maximumEnvelopeBytes else {
+                persistenceState = .protectedCorrupt
+                optionsByTarget = [:]
+                PersistenceLogger.log("搜索排序偏好超过安全上限，保留原数据并进入只读保护")
+                return
+            }
+            guard let probe = try? JSONDecoder().decode(VersionProbe.self, from: data),
+                  let version = probe.version else {
+                quarantineCorruptData(data, sourceKey: envelopeKey)
+                return
+            }
+            if version > Self.formatVersion {
+                persistenceState = .protectedFuture(version: version)
+                optionsByTarget = [:]
+                PersistenceLogger.log(
+                    "检测到未来搜索排序版本 \(version)，进入只读保护"
+                )
+                return
+            }
+            guard version == Self.formatVersion,
+                  let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
+                  Self.isValid(envelope.optionsByTarget) else {
+                quarantineCorruptData(data, sourceKey: envelopeKey)
+                return
+            }
+            optionsByTarget = envelope.optionsByTarget
+            return
+        }
+
+        guard let legacyData = userDefaults.data(forKey: legacyKey) else { return }
+        guard legacyData.count <= Self.maximumEnvelopeBytes,
+              let legacy = try? JSONDecoder().decode(
+            [String: SearchSortOption].self,
+            from: legacyData
+        ), Self.isValid(legacy) else {
+            quarantineCorruptData(legacyData, sourceKey: legacyKey)
+            return
+        }
+        optionsByTarget = legacy
+        persist()
+        if userDefaults.data(forKey: envelopeKey) != nil {
+            userDefaults.removeObject(forKey: legacyKey)
+        }
     }
 
     private func persist() {
-        guard let data = try? JSONEncoder().encode(optionsByTarget) else { return }
-        UserDefaults.standard.set(data, forKey: defaultsKey)
+        guard persistenceState == .writable else { return }
+        let envelope = Envelope(
+            version: Self.formatVersion,
+            optionsByTarget: optionsByTarget
+        )
+        guard let data = try? JSONEncoder().encode(envelope) else {
+            PersistenceLogger.log("编码搜索排序偏好失败")
+            return
+        }
+        guard data.count <= Self.maximumEnvelopeBytes else {
+            PersistenceLogger.log("搜索排序偏好超过安全上限")
+            return
+        }
+        userDefaults.set(data, forKey: envelopeKey)
+        if userDefaults.data(forKey: envelopeKey) != data {
+            PersistenceLogger.log("搜索排序偏好写入校验失败")
+        }
+    }
+
+    private func quarantineCorruptData(_ data: Data, sourceKey: String) {
+        let keys = Self.corruptQuarantineKeys
+        if let previous = userDefaults.data(forKey: keys[0]) {
+            userDefaults.set(previous, forKey: keys[1])
+        }
+        userDefaults.set(data, forKey: keys[0])
+        userDefaults.removeObject(forKey: sourceKey)
+        optionsByTarget = [:]
+        persistenceState = .writable
+        PersistenceLogger.log("搜索排序偏好损坏，已隔离并恢复安全默认值")
+    }
+
+    private static func isValid(_ options: [String: SearchSortOption]) -> Bool {
+        let allowedTargets: Set<String> = [
+            SearchFocusTarget.queue.rawValue,
+            SearchFocusTarget.playlists.rawValue,
+            SearchFocusTarget.addFromQueue.rawValue,
+            SearchFocusTarget.volumeAnalysis.rawValue,
+        ]
+        return options.count <= allowedTargets.count
+            && options.keys.allSatisfy(allowedTargets.contains)
     }
 }
 

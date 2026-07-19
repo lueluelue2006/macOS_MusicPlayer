@@ -1,26 +1,81 @@
+import Darwin
 import Foundation
 
 enum RecursiveImportScanner {
 
     // MARK: - Public API
 
+    /// Resource ceilings keep a malformed or unexpectedly large folder from turning
+    /// one import operation into an unbounded in-memory index of the filesystem.
+    struct Limits: Equatable {
+        static let production = Limits()
+
+        let maximumRootURLs: Int
+        let maximumDirectoryEntries: Int
+        let maximumDiscoveredItems: Int
+        let maximumScannedFiles: Int
+        let maximumAcceptedFiles: Int
+        let maximumTrackedFileIdentities: Int
+        let maximumVisitedDirectories: Int
+        let maximumPendingDirectories: Int
+        let maximumSkippedItems: Int
+
+        init(
+            maximumRootURLs: Int = 4_096,
+            maximumDirectoryEntries: Int = 50_000,
+            maximumDiscoveredItems: Int = 200_000,
+            maximumScannedFiles: Int = 100_000,
+            maximumAcceptedFiles: Int = 50_000,
+            maximumTrackedFileIdentities: Int = 100_000,
+            maximumVisitedDirectories: Int = 20_000,
+            maximumPendingDirectories: Int = 10_000,
+            maximumSkippedItems: Int = 2_000
+        ) {
+            self.maximumRootURLs = max(1, maximumRootURLs)
+            self.maximumDirectoryEntries = max(1, maximumDirectoryEntries)
+            self.maximumDiscoveredItems = max(1, maximumDiscoveredItems)
+            self.maximumScannedFiles = max(1, maximumScannedFiles)
+            self.maximumAcceptedFiles = max(1, maximumAcceptedFiles)
+            self.maximumTrackedFileIdentities = max(1, maximumTrackedFileIdentities)
+            self.maximumVisitedDirectories = max(1, maximumVisitedDirectories)
+            self.maximumPendingDirectories = max(1, maximumPendingDirectories)
+            self.maximumSkippedItems = max(0, maximumSkippedItems)
+        }
+    }
+
     static func scan(
         urls: [URL],
         recursive: Bool,
-        isCancelled: () -> Bool
+        isCancelled: () -> Bool,
+        limits: Limits = .production
     ) -> Result {
-        var context = ScanContext()
+        var context = ScanContext(limits: limits)
 
-        // Early cancellation check
         if isCancelled() {
             return context.buildResult(wasCancelled: true)
         }
 
-        // Scan each root in order
-        for rootURL in urls {
-            let cancelled = scanRoot(rootURL, recursive: recursive, context: &context, isCancelled: isCancelled)
-            if cancelled {
+        for (index, rootURL) in urls.enumerated() {
+            if isCancelled() {
                 return context.buildResult(wasCancelled: true)
+            }
+            guard index < limits.maximumRootURLs else {
+                context.stop(with: .rootURLLimitReached(limit: limits.maximumRootURLs))
+                break
+            }
+
+            switch scanRoot(
+                rootURL,
+                recursive: recursive,
+                context: &context,
+                isCancelled: isCancelled
+            ) {
+            case .finished:
+                continue
+            case .cancelled:
+                return context.buildResult(wasCancelled: true)
+            case .stopped:
+                return context.buildResult(wasCancelled: false)
             }
         }
 
@@ -35,6 +90,15 @@ enum RecursiveImportScanner {
         let unsupportedFormatCount: Int
         let totalScanned: Int
         let wasCancelled: Bool
+        let stopReason: StopReason?
+        let totalSkippedItemCount: Int
+        let omittedSkippedItemCount: Int
+        let totalDiscoveredItemCount: Int
+        let trackedFileIdentityCount: Int
+        let visitedDirectoryCount: Int
+        let peakPendingDirectoryCount: Int
+
+        var wasTruncated: Bool { stopReason != nil }
     }
 
     struct SkippedItem {
@@ -51,249 +115,356 @@ enum RecursiveImportScanner {
         case package
     }
 
+    enum StopReason: Equatable {
+        case rootURLLimitReached(limit: Int)
+        case directoryEntryLimitReached(path: String, limit: Int)
+        case discoveredItemLimitReached(limit: Int)
+        case scannedFileLimitReached(limit: Int)
+        case acceptedFileLimitReached(limit: Int)
+        case trackedFileIdentityLimitReached(limit: Int)
+        case visitedDirectoryLimitReached(limit: Int)
+        case pendingDirectoryLimitReached(limit: Int)
+    }
+
     // MARK: - Private Implementation
 
     private static let supportedExtensions: Set<String> = [
         "mp3", "m4a", "aac", "wav", "aif", "aiff", "aifc", "caf", "flac"
     ]
 
-    private struct ScanContext {
-        var filesByCanonicalPath: [String: URL] = [:]
-        var allSeenFilePaths: Set<String> = []
-        var skippedItems: [SkippedItem] = []
-        var unsupportedFormatCount: Int = 0
-        var totalScanned: Int = 0
-        var visitedDirectories: Set<String> = []
+    private enum ScanControl {
+        case finished
+        case cancelled
+        case stopped
+    }
 
-        mutating func recordFile(_ url: URL) {
-            let canonical = PathKey.canonical(for: url)
-            if filesByCanonicalPath[canonical] == nil {
-                filesByCanonicalPath[canonical] = url
+    private enum DirectoryReadResult {
+        case names([String])
+        case cancelled
+        case entryLimitReached
+        case unreadable
+    }
+
+    private struct ScanContext {
+        let limits: Limits
+        var filesByCanonicalPath: [String: URL] = [:]
+        var seenFilePaths: Set<String> = []
+        var skippedItems: [SkippedItem] = []
+        var unsupportedFormatCount = 0
+        var totalScanned = 0
+        var totalSkippedItemCount = 0
+        var totalDiscoveredItemCount = 0
+        var visitedDirectories: Set<String> = []
+        var peakPendingDirectoryCount = 0
+        var stopReason: StopReason?
+
+        mutating func stop(with reason: StopReason) {
+            if stopReason == nil {
+                stopReason = reason
             }
         }
 
         mutating func recordSkipped(path: String, reason: SkipReason) {
+            totalSkippedItemCount += 1
+            guard skippedItems.count < limits.maximumSkippedItems else { return }
             skippedItems.append(SkippedItem(path: path, reason: reason))
         }
 
-        mutating func recordUnsupportedFormat() {
-            unsupportedFormatCount += 1
-        }
-
-        mutating func incrementScanned() {
-            totalScanned += 1
-        }
-
-        mutating func markDirectoryVisited(_ url: URL) {
+        mutating func markDirectoryVisited(_ url: URL) -> Bool {
             let canonical = PathKey.canonical(for: url)
-            visitedDirectories.insert(canonical)
-        }
-
-        func isDirectoryVisited(_ url: URL) -> Bool {
-            let canonical = PathKey.canonical(for: url)
-            return visitedDirectories.contains(canonical)
-        }
-
-        mutating func markFileSeenIfNeeded(_ url: URL) -> Bool {
-            let canonical = PathKey.canonical(for: url)
-            if allSeenFilePaths.contains(canonical) {
-                return true // Already seen
+            if visitedDirectories.contains(canonical) {
+                return false
             }
-            allSeenFilePaths.insert(canonical)
-            return false
+            guard visitedDirectories.count < limits.maximumVisitedDirectories else {
+                stop(with: .visitedDirectoryLimitReached(limit: limits.maximumVisitedDirectories))
+                return false
+            }
+            visitedDirectories.insert(canonical)
+            return true
         }
 
         func buildResult(wasCancelled: Bool) -> Result {
-            // Sort files by canonical path for stable ordering
+            // Accepted files are capped, so this final ordering pass is bounded.
             let sortedFiles = filesByCanonicalPath.keys.sorted().compactMap { filesByCanonicalPath[$0] }
-
             return Result(
                 files: sortedFiles,
                 skipped: skippedItems,
                 unsupportedFormatCount: unsupportedFormatCount,
                 totalScanned: totalScanned,
-                wasCancelled: wasCancelled
+                wasCancelled: wasCancelled,
+                stopReason: stopReason,
+                totalSkippedItemCount: totalSkippedItemCount,
+                omittedSkippedItemCount: totalSkippedItemCount - skippedItems.count,
+                totalDiscoveredItemCount: totalDiscoveredItemCount,
+                trackedFileIdentityCount: seenFilePaths.count,
+                visitedDirectoryCount: visitedDirectories.count,
+                peakPendingDirectoryCount: peakPendingDirectoryCount
             )
         }
     }
 
-    /// Returns true if cancelled
+    /// A compacting FIFO releases processed URLs instead of retaining every
+    /// discovered subdirectory for the lifetime of a large scan.
+    private struct DirectoryQueue {
+        private var storage: [URL?] = []
+        private var head = 0
+
+        var count: Int { storage.count - head }
+
+        mutating func append(_ url: URL, limit: Int) -> Bool {
+            guard count < limit else { return false }
+            storage.append(url)
+            return true
+        }
+
+        mutating func popFirst() -> URL? {
+            guard head < storage.count else { return nil }
+            let result = storage[head]
+            storage[head] = nil
+            head += 1
+
+            if head >= 512, head * 2 >= storage.count {
+                storage.removeFirst(head)
+                head = 0
+            }
+            return result
+        }
+    }
+
     private static func scanRoot(
         _ url: URL,
         recursive: Bool,
         context: inout ScanContext,
         isCancelled: () -> Bool
-    ) -> Bool {
-        if isCancelled() {
-            return true
-        }
-
+    ) -> ScanControl {
         let fileManager = FileManager.default
-
-        // Check if URL exists and get its type
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
             context.recordSkipped(path: url.path, reason: .unreadable)
-            return false
+            return .finished
         }
 
-        // Check resource values for root
         guard let resourceValues = try? url.resourceValues(forKeys: [
             .isSymbolicLinkKey, .isPackageKey, .isHiddenKey
         ]) else {
             context.recordSkipped(path: url.path, reason: .unreadable)
-            return false
+            return .finished
         }
 
-        // Skip symbolic links at root level
         if resourceValues.isSymbolicLink == true {
             context.recordSkipped(path: url.path, reason: .symbolicLink)
-            return false
+            return .finished
         }
-
-        // Skip packages at root level
         if resourceValues.isPackage == true {
             context.recordSkipped(path: url.path, reason: .package)
-            return false
+            return .finished
         }
-
-        // Skip hidden at root level
         if resourceValues.isHidden == true {
             context.recordSkipped(path: url.path, reason: .hidden)
-            return false
+            return .finished
         }
 
         if isDirectory.boolValue {
-            return scanDirectory(url, recursive: recursive, context: &context, isCancelled: isCancelled)
-        } else {
-            processFile(url, context: &context)
-            return false
+            return scanDirectoryTree(
+                url,
+                recursive: recursive,
+                context: &context,
+                isCancelled: isCancelled
+            )
         }
+        return processFile(url, context: &context)
     }
 
-    /// Returns true if cancelled
-    private static func scanDirectory(
-        _ dirURL: URL,
+    private static func scanDirectoryTree(
+        _ rootURL: URL,
         recursive: Bool,
         context: inout ScanContext,
         isCancelled: () -> Bool
-    ) -> Bool {
-        // Check if already visited (deduplication)
-        if context.isDirectoryVisited(dirURL) {
-            context.recordSkipped(path: dirURL.path, reason: .duplicate)
-            return false
+    ) -> ScanControl {
+        var pending = DirectoryQueue()
+        guard pending.append(rootURL, limit: context.limits.maximumPendingDirectories) else {
+            context.stop(with: .pendingDirectoryLimitReached(limit: context.limits.maximumPendingDirectories))
+            return .stopped
         }
+        context.peakPendingDirectoryCount = 1
 
-        let fileManager = FileManager.default
+        while let directoryURL = pending.popFirst() {
+            if isCancelled() { return .cancelled }
 
-        // Read child names by path, then rebuild logical URLs from the caller-provided
-        // root so results preserve the caller's lexical path identity (URL-based
-        // enumeration would physically canonicalize e.g. /var -> /private/var).
-        guard let childNames = try? fileManager.contentsOfDirectory(atPath: dirURL.path) else {
-            context.recordSkipped(path: dirURL.path, reason: .unreadable)
-            return false
-        }
-        let contents = childNames.map { dirURL.appendingPathComponent($0) }
-
-        // Mark this directory as visited
-        context.markDirectoryVisited(dirURL)
-
-        // Sort contents by canonical path for stable ordering
-        let sortedContents = contents.sorted { url1, url2 in
-            PathKey.canonical(for: url1) < PathKey.canonical(for: url2)
-        }
-
-        // Collect subdirectories to scan if recursive
-        var subdirectories: [URL] = []
-
-        // Process each item
-        for url in sortedContents {
-            if isCancelled() {
-                return true
-            }
-
-            // Get resource values
-            guard let resourceValues = try? url.resourceValues(forKeys: [
-                .isDirectoryKey, .isSymbolicLinkKey, .isPackageKey, .isHiddenKey
-            ]) else {
+            let canonical = PathKey.canonical(for: directoryURL)
+            if context.visitedDirectories.contains(canonical) {
+                context.recordSkipped(path: directoryURL.path, reason: .duplicate)
                 continue
             }
-
-            // Skip symbolic links
-            if resourceValues.isSymbolicLink == true {
-                context.recordSkipped(path: url.path, reason: .symbolicLink)
-                continue
+            guard context.markDirectoryVisited(directoryURL) else {
+                return context.stopReason == nil ? .finished : .stopped
             }
 
-            // Skip packages (should already be filtered by options, but be defensive)
-            if resourceValues.isPackage == true {
-                context.recordSkipped(path: url.path, reason: .package)
-                continue
-            }
+            switch readSortedChildNames(
+                at: directoryURL,
+                maximumEntries: context.limits.maximumDirectoryEntries,
+                isCancelled: isCancelled
+            ) {
+            case let .names(childNames):
+                for childName in childNames {
+                    if isCancelled() { return .cancelled }
+                    guard context.totalDiscoveredItemCount < context.limits.maximumDiscoveredItems else {
+                        context.stop(with: .discoveredItemLimitReached(limit: context.limits.maximumDiscoveredItems))
+                        return .stopped
+                    }
+                    context.totalDiscoveredItemCount += 1
 
-            // Skip hidden items (should already be filtered, but be defensive)
-            if resourceValues.isHidden == true {
-                context.recordSkipped(path: url.path, reason: .hidden)
-                continue
-            }
+                    let url = directoryURL.appendingPathComponent(childName, isDirectory: false)
+                    guard let values = try? url.resourceValues(forKeys: [
+                        .isDirectoryKey, .isSymbolicLinkKey, .isPackageKey, .isHiddenKey
+                    ]) else {
+                        context.recordSkipped(path: url.path, reason: .unreadable)
+                        continue
+                    }
 
-            // Handle directories
-            if resourceValues.isDirectory == true {
-                if recursive {
-                    subdirectories.append(url)
+                    if values.isSymbolicLink == true {
+                        context.recordSkipped(path: url.path, reason: .symbolicLink)
+                        continue
+                    }
+                    if values.isPackage == true {
+                        context.recordSkipped(path: url.path, reason: .package)
+                        continue
+                    }
+                    if values.isHidden == true {
+                        context.recordSkipped(path: url.path, reason: .hidden)
+                        continue
+                    }
+
+                    if values.isDirectory == true {
+                        guard recursive else { continue }
+                        guard pending.append(url, limit: context.limits.maximumPendingDirectories) else {
+                            context.stop(with: .pendingDirectoryLimitReached(limit: context.limits.maximumPendingDirectories))
+                            return .stopped
+                        }
+                        context.peakPendingDirectoryCount = max(context.peakPendingDirectoryCount, pending.count)
+                        continue
+                    }
+
+                    switch processFile(url, context: &context) {
+                    case .finished:
+                        continue
+                    case .cancelled:
+                        return .cancelled
+                    case .stopped:
+                        return .stopped
+                    }
                 }
-                // For non-recursive, we don't add subdirectories to the list
-                continue
-            }
 
-            // Process regular files
-            processFile(url, context: &context)
-        }
-
-        // Recursively scan subdirectories if requested
-        if recursive {
-            for subdir in subdirectories {
-                let cancelled = scanDirectory(subdir, recursive: recursive, context: &context, isCancelled: isCancelled)
-                if cancelled {
-                    return true
-                }
+            case .cancelled:
+                return .cancelled
+            case .entryLimitReached:
+                context.stop(with: .directoryEntryLimitReached(
+                    path: directoryURL.path,
+                    limit: context.limits.maximumDirectoryEntries
+                ))
+                return .stopped
+            case .unreadable:
+                context.recordSkipped(path: directoryURL.path, reason: .unreadable)
             }
         }
 
-        return false
+        return .finished
     }
 
-    private static func processFile(_ url: URL, context: inout ScanContext) {
-        // Increment total scanned count for visible non-symlink files
-        context.incrementScanned()
+    /// Uses `readdir` rather than `contentsOfDirectory`, so the OS does not first
+    /// materialize an unbounded array. The bounded name buffer is sorted in place
+    /// to retain deterministic traversal and lexical URL identity.
+    private static func readSortedChildNames(
+        at directoryURL: URL,
+        maximumEntries: Int,
+        isCancelled: () -> Bool
+    ) -> DirectoryReadResult {
+        let descriptor = Darwin.open(
+            directoryURL.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard descriptor >= 0 else { return .unreadable }
 
-        // Check if already seen (deduplication across all examined files)
-        let isDuplicate = context.markFileSeenIfNeeded(url)
-        if isDuplicate {
-            context.recordSkipped(path: url.path, reason: .duplicate)
-            return
+        guard let directory = fdopendir(descriptor) else {
+            Darwin.close(descriptor)
+            return .unreadable
+        }
+        defer { closedir(directory) }
+
+        var names: [String] = []
+        names.reserveCapacity(min(maximumEntries, 512))
+        var entriesRead = 0
+
+        while true {
+            errno = 0
+            guard let entry = readdir(directory) else {
+                if errno != 0 { return .unreadable }
+                break
+            }
+
+            let name = withUnsafePointer(to: &entry.pointee.d_name) { pointer in
+                pointer.withMemoryRebound(
+                    to: CChar.self,
+                    capacity: Int(entry.pointee.d_namlen) + 1
+                ) { String(cString: $0) }
+            }
+            if name == "." || name == ".." { continue }
+
+            entriesRead += 1
+            if entriesRead.isMultiple(of: 64), isCancelled() {
+                return .cancelled
+            }
+            guard names.count < maximumEntries else {
+                return .entryLimitReached
+            }
+            names.append(name)
         }
 
-        // Check extension (case-insensitive)
+        names.sort()
+        return .names(names)
+    }
+
+    private static func processFile(_ url: URL, context: inout ScanContext) -> ScanControl {
+        guard context.totalScanned < context.limits.maximumScannedFiles else {
+            context.stop(with: .scannedFileLimitReached(limit: context.limits.maximumScannedFiles))
+            return .stopped
+        }
+        context.totalScanned += 1
+
+        let canonical = PathKey.canonical(for: url)
+        if context.seenFilePaths.contains(canonical) {
+            context.recordSkipped(path: url.path, reason: .duplicate)
+            return .finished
+        }
+        guard context.seenFilePaths.count < context.limits.maximumTrackedFileIdentities else {
+            context.stop(with: .trackedFileIdentityLimitReached(
+                limit: context.limits.maximumTrackedFileIdentities
+            ))
+            return .stopped
+        }
+        context.seenFilePaths.insert(canonical)
+
         let ext = url.pathExtension.lowercased()
         guard supportedExtensions.contains(ext) else {
-            context.recordUnsupportedFormat()
-            return
+            context.unsupportedFormatCount += 1
+            return .finished
         }
 
-        // Check readability
         guard FileManager.default.isReadableFile(atPath: url.path) else {
             context.recordSkipped(path: url.path, reason: .unreadable)
-            return
+            return .finished
         }
 
-        // Check for disguised non-audio files
-        if let _ = AudioFileSniffer.nonAudioReasonIfClearlyText(at: url) {
+        if AudioFileSniffer.nonAudioReasonIfClearlyText(at: url) != nil {
             context.recordSkipped(path: url.path, reason: .obviousNonAudio)
-            return
+            return .finished
         }
 
-        // Accept the file
-        context.recordFile(url)
+        guard context.filesByCanonicalPath.count < context.limits.maximumAcceptedFiles else {
+            context.stop(with: .acceptedFileLimitReached(limit: context.limits.maximumAcceptedFiles))
+            return .stopped
+        }
+        context.filesByCanonicalPath[canonical] = url
+        return .finished
     }
 }

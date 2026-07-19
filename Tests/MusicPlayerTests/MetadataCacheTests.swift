@@ -22,8 +22,8 @@ final class MetadataCacheTests: XCTestCase {
                 title: "Test Song",
                 artist: "Test Artist",
                 album: "Test Album",
-                year: nil,
-                genre: nil,
+                year: "2026",
+                genre: "Pop",
                 artwork: nil
             )
             await cache.storeBasicMetadata(metadata, for: url)
@@ -33,6 +33,8 @@ final class MetadataCacheTests: XCTestCase {
             XCTAssertEqual(unwrapped.title, "Test Song")
             XCTAssertEqual(unwrapped.artist, "Test Artist")
             XCTAssertEqual(unwrapped.album, "Test Album")
+            XCTAssertEqual(unwrapped.year, "2026")
+            XCTAssertEqual(unwrapped.genre, "Pop")
         }
     }
 
@@ -108,8 +110,7 @@ final class MetadataCacheTests: XCTestCase {
                     artwork: nil
                 )
                 await writer.storeBasicMetadata(metadata, for: url)
-                // Wait for debounced save
-                try await Task.sleep(nanoseconds: 600_000_000)
+                await writer.flushForTesting()
             }
 
             let reader = MetadataCache(cacheFileURLOverride: cacheURL)
@@ -201,7 +202,7 @@ final class MetadataCacheTests: XCTestCase {
             let retrieved1 = await cache.cachedMetadataIfValid(for: url)
             XCTAssertNil(retrieved1, "Should reject metadata with Unicode replacement character")
 
-            // Test multiple question marks
+            // Literal question marks are valid metadata, not evidence of corruption.
             let questionMarks = AudioMetadata(
                 title: "??????",
                 artist: "Artist",
@@ -212,9 +213,9 @@ final class MetadataCacheTests: XCTestCase {
             )
             await cache.storeBasicMetadata(questionMarks, for: url)
             let retrieved2 = await cache.cachedMetadataIfValid(for: url)
-            XCTAssertNil(retrieved2, "Should reject metadata with corrupted question marks")
+            XCTAssertEqual(retrieved2?.title, "??????")
 
-            // Test high ratio of question marks (>= 40%)
+            // A high question-mark ratio is valid as well.
             let highRatio = AudioMetadata(
                 title: "So???ng",
                 artist: "Artist",
@@ -225,7 +226,7 @@ final class MetadataCacheTests: XCTestCase {
             )
             await cache.storeBasicMetadata(highRatio, for: url)
             let retrieved3 = await cache.cachedMetadataIfValid(for: url)
-            XCTAssertNil(retrieved3, "Should reject metadata with high ratio of question marks")
+            XCTAssertEqual(retrieved3?.title, "So???ng")
 
             // Test valid metadata with few question marks (< 40% ratio)
             let validWithQuestion = AudioMetadata(
@@ -264,11 +265,15 @@ final class MetadataCacheTests: XCTestCase {
                 "artist": "Legacy Artist",
                 "album": "Legacy Album",
                 "fileSize": fileSize,
-                "mtimeNs": mtimeNs
+                "mtimeNs": mtimeNs,
+                "inode": (attrs[.systemFileNumber] as? NSNumber).map { $0.int64Value as Any } ?? NSNull(),
+                "year": "2026",
+                "genre": "Pop",
+                "lastAccessedAt": Int64(Date().timeIntervalSince1970)
             ]
 
             let cacheFile: [String: Any] = [
-                "version": 1,
+                "version": 2,
                 "entries": [legacyKey: legacyEntry]
             ]
 
@@ -283,10 +288,12 @@ final class MetadataCacheTests: XCTestCase {
             XCTAssertEqual(unwrapped.title, "Legacy Song")
             XCTAssertEqual(unwrapped.artist, "Legacy Artist")
             XCTAssertEqual(unwrapped.album, "Legacy Album")
+            XCTAssertEqual(unwrapped.year, "2026")
+            XCTAssertEqual(unwrapped.genre, "Pop")
         }
     }
 
-    func testFutureVersionPreservesOriginalBytes() async throws {
+    func testFutureVersionIsQuarantinedAndCurrentCacheRemainsWritable() async throws {
         try await withTemporaryCache { cacheURL, directory in
             let url = directory.appendingPathComponent("track.mp3")
             try Data("audio".utf8).write(to: url)
@@ -315,12 +322,15 @@ final class MetadataCacheTests: XCTestCase {
             await cache.storeBasicMetadata(metadata, for: url)
             await cache.flushForTesting()
 
-            let afterBytes = try Data(contentsOf: cacheURL)
-            XCTAssertEqual(afterBytes, originalBytes, "Future version file must remain unchanged")
+            let active = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as? [String: Any]
+            XCTAssertEqual(active?["version"] as? Int, 2)
+            let quarantined = try quarantineFiles(nextTo: cacheURL)
+            XCTAssertEqual(quarantined.count, 1)
+            XCTAssertEqual(try Data(contentsOf: quarantined[0]), originalBytes)
         }
     }
 
-    func testUnknownFormatPreservesOriginalBytes() async throws {
+    func testUnknownFormatIsQuarantinedAndRebuilt() async throws {
         try await withTemporaryCache { cacheURL, directory in
             let url = directory.appendingPathComponent("track.mp3")
             try Data("audio".utf8).write(to: url)
@@ -342,12 +352,15 @@ final class MetadataCacheTests: XCTestCase {
             await cache.storeBasicMetadata(metadata, for: url)
             await cache.flushForTesting()
 
-            let afterBytes = try Data(contentsOf: cacheURL)
-            XCTAssertEqual(afterBytes, corruptedCache, "Unknown format file must remain unchanged")
+            let active = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as? [String: Any]
+            XCTAssertEqual(active?["version"] as? Int, 2)
+            let quarantined = try quarantineFiles(nextTo: cacheURL)
+            XCTAssertEqual(quarantined.count, 1)
+            XCTAssertEqual(try Data(contentsOf: quarantined[0]), corruptedCache)
         }
     }
 
-    func testFutureVersionPreservesAfterRemoveAll() async throws {
+    func testClearPersistenceReplacesFutureVersion() async throws {
         try await withTemporaryCache { cacheURL, directory in
             let futureCache = """
             {
@@ -359,11 +372,82 @@ final class MetadataCacheTests: XCTestCase {
             try originalBytes.write(to: cacheURL, options: .atomic)
 
             let cache = MetadataCache(cacheFileURLOverride: cacheURL)
-            await cache.removeAll()
-            await cache.flushForTesting()
+            let result = await cache.clearPersistence()
 
-            let afterBytes = try Data(contentsOf: cacheURL)
-            XCTAssertEqual(afterBytes, originalBytes, "Future version file must survive removeAll")
+            guard case .success(let report) = result else {
+                return XCTFail("Expected clear to succeed")
+            }
+            XCTAssertEqual(report.quarantinedFileCount, 0, "Load already quarantines a readable future file")
+            let active = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as? [String: Any]
+            XCTAssertEqual(active?["version"] as? Int, 2)
+            XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(quarantineFiles(nextTo: cacheURL).first)), originalBytes)
+        }
+    }
+
+    func testSameSizeAndMtimeWithDifferentInodeInvalidatesMetadata() async throws {
+        try await withTemporaryCache { cacheURL, directory in
+            let cache = MetadataCache(cacheFileURLOverride: cacheURL)
+            let url = directory.appendingPathComponent("track.mp3")
+            let stored = FileValidationSnapshot(exists: true, fileSize: 100, mtimeNs: 200, inode: 1)
+            let replaced = FileValidationSnapshot(exists: true, fileSize: 100, mtimeNs: 200, inode: 2)
+            let metadata = AudioMetadata(
+                title: "Original",
+                artist: "Artist",
+                album: "Album",
+                year: "2025",
+                genre: "Pop",
+                artwork: nil
+            )
+
+            await cache.storeBasicMetadata(metadata, for: url, snapshot: stored)
+            let result = await cache.cachedMetadataIfValid(for: url, snapshot: replaced)
+            XCTAssertNil(result)
+        }
+    }
+
+    func testEntryLimitPrunesToLowWatermark() async throws {
+        try await withTemporaryCache { cacheURL, directory in
+            let limits = DerivedCacheLimits(maximumEntries: 3, lowWatermark: 2, maximumFileBytes: 16_384)
+            let cache = MetadataCache(
+                cacheFileURLOverride: cacheURL,
+                limits: limits,
+                now: { Date(timeIntervalSince1970: 1_000) }
+            )
+            let snapshot = FileValidationSnapshot(exists: true, fileSize: 1, mtimeNs: 2, inode: 3)
+            for index in 0..<4 {
+                let metadata = AudioMetadata(
+                    title: "Song \(index)", artist: "Artist", album: "Album",
+                    year: nil, genre: nil, artwork: nil
+                )
+                await cache.storeBasicMetadata(
+                    metadata,
+                    for: directory.appendingPathComponent("track\(index).mp3"),
+                    snapshot: snapshot
+                )
+            }
+            let result = await cache.flushPersistence()
+            guard case .success(let report) = result else {
+                return XCTFail("Expected flush to succeed")
+            }
+            XCTAssertEqual(report.entryCount, 2)
+            XCTAssertGreaterThanOrEqual(report.prunedEntryCount, 2)
+        }
+    }
+
+    func testOversizedCacheIsQuarantinedWithFiniteRetention() async throws {
+        try await withTemporaryCache { cacheURL, _ in
+            let limits = DerivedCacheLimits(maximumEntries: 3, lowWatermark: 2, maximumFileBytes: 1_024)
+            try Data(repeating: 0x41, count: 2_048).write(to: cacheURL)
+            let original = try Data(contentsOf: cacheURL)
+            let cache = MetadataCache(cacheFileURLOverride: cacheURL, limits: limits)
+
+            _ = await cache.flushPersistence()
+
+            let quarantined = try quarantineFiles(nextTo: cacheURL)
+            XCTAssertEqual(quarantined.count, 1)
+            XCTAssertEqual(try Data(contentsOf: quarantined[0]), original)
+            let active = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as? [String: Any]
+            XCTAssertEqual(active?["version"] as? Int, 2)
         }
     }
 
@@ -379,5 +463,17 @@ final class MetadataCacheTests: XCTestCase {
 
         let cacheURL = directory.appendingPathComponent("metadata-cache.json")
         try await body(cacheURL, directory)
+    }
+
+    private func quarantineFiles(nextTo cacheURL: URL) throws -> [URL] {
+        let directory = cacheURL.deletingLastPathComponent().appendingPathComponent(
+            DerivedCacheFileIO.quarantineDirectoryName,
+            isDirectory: true
+        )
+        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+        return try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 }

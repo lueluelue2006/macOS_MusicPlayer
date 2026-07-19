@@ -16,6 +16,8 @@ struct VolumeNormalizationAnalysisView: View {
   @State private var visibleRows: [AnalysisTrackRow] = []
   @State private var visibleRowIndexByID: [String: Int] = [:]
   @State private var cachedFileIDs: Set<String> = []
+  @State private var cacheRefreshTask: Task<Void, Never>?
+  @State private var cacheRefreshGeneration: UInt64 = 0
   @State private var previousSearchTarget: SearchFocusTarget = .queue
   @FocusState private var isSearchFieldFocused: Bool
 
@@ -224,14 +226,14 @@ struct VolumeNormalizationAnalysisView: View {
 
         VStack(alignment: .leading, spacing: 14) {
           sliderSetting(
-            title: "目标响度（RMS）",
-            value: String(format: "%.1f dB", audioPlayer.normalizationTargetLevelDb),
+            title: "目标综合响度",
+            value: String(format: "%.1f LUFS", audioPlayer.normalizationTargetLUFS),
             binding: targetLevelBinding,
             range: -30 ... -8,
             step: 0.5
           )
           .disabled(!audioPlayer.isNormalizationEnabled)
-          .help("该目标基于当前的 RMS(dB) 算法，不等同于 LUFS/EBU R128。")
+          .help("按 ITU-R BS.1770 综合响度调节；峰值保护使用过采样估算值。")
 
           sliderSetting(
             title: "淡入时长",
@@ -442,9 +444,9 @@ struct VolumeNormalizationAnalysisView: View {
 
   private var targetLevelBinding: Binding<Double> {
     Binding(
-      get: { Double(audioPlayer.normalizationTargetLevelDb) },
+      get: { Double(audioPlayer.normalizationTargetLUFS) },
       set: {
-        audioPlayer.normalizationTargetLevelDb = Float($0)
+        audioPlayer.normalizationTargetLUFS = Float($0)
         audioPlayer.saveNormalizationTargetLevelPreference()
         audioPlayer.reapplyVolumeNormalizationForCurrentFile(smoothIfPlaying: true)
       }
@@ -468,49 +470,25 @@ struct VolumeNormalizationAnalysisView: View {
   /// queue/query/sort/weight/cache changes. Progress publications can re-render status
   /// without rescanning the playlist or taking one cache lock per row.
   private func refreshAllDerivedData() {
-    cachedFileIDs = currentQueueCachedFileIDs()
-    rebuildVisibleRows()
+    scheduleCacheDerivedDataRefresh()
   }
 
   private func refreshCacheDerivedData() {
-    let newCachedFileIDs = currentQueueCachedFileIDs()
-    let addedIDs = newCachedFileIDs.subtracting(cachedFileIDs)
-    let removedIDs = cachedFileIDs.subtracting(newCachedFileIDs)
-
-    guard !addedIDs.isEmpty || !removedIDs.isEmpty else { return }
-    cachedFileIDs = newCachedFileIDs
-
-    // Removals are uncommon (normally an explicit clear) and can reintroduce rows,
-    // so rebuild ordering then. Normal analysis additions update only affected rows.
-    guard removedIDs.isEmpty else {
-      rebuildVisibleRows()
-      return
-    }
-
-    if showOnlyMissing {
-      visibleRows.removeAll { addedIDs.contains($0.id) }
-      rebuildVisibleRowIndex()
-      return
-    }
-
-    for id in addedIDs {
-      guard let index = visibleRowIndexByID[id] else { continue }
-      visibleRows[index].isAnalyzed = true
-    }
+    scheduleCacheDerivedDataRefresh()
   }
 
-  private func currentQueueCachedFileIDs() -> Set<String> {
-    // Take one locked snapshot, then resolve all queue membership lock-free.
-    let cacheKeys = audioPlayer.volumeNormalizationCacheKeysSnapshot()
-    var result = Set<String>()
-    result.reserveCapacity(min(cacheKeys.count, playlistManager.audioFiles.count))
-
-    for file in playlistManager.audioFiles {
-      if cacheKeys.contains(file.id) || cacheKeys.contains(file.id.lowercased()) {
-        result.insert(file.id)
-      }
+  private func scheduleCacheDerivedDataRefresh() {
+    cacheRefreshGeneration &+= 1
+    let generation = cacheRefreshGeneration
+    let urls = playlistManager.audioFiles.map(\.url)
+    cacheRefreshTask?.cancel()
+    cacheRefreshTask = Task { @MainActor in
+      let refreshed = await audioPlayer.volumeNormalizationValidCacheKeysAsync(for: urls)
+      guard !Task.isCancelled, cacheRefreshGeneration == generation else { return }
+      cachedFileIDs = refreshed
+      rebuildVisibleRows()
+      cacheRefreshTask = nil
     }
-    return result
   }
 
   private func rebuildVisibleRows() {
@@ -558,7 +536,36 @@ struct VolumeNormalizationAnalysisView: View {
       cancelTitle: "不清除"
     )
     guard confirmed else { return }
-    audioPlayer.clearVolumeCache()
+    switch audioPlayer.clearVolumeCache() {
+    case .cleared:
+      return
+    case .failed(let message):
+      PersistenceLogger.notifyUser(title: "缓存清除失败", subtitle: message)
+    case .requiresConfirmation(let reason):
+      let forceConfirmed = DestructiveConfirmation.confirm(
+        title: "删除受保护的缓存？",
+        message: protectedCacheMessage(reason),
+        confirmTitle: "仍然删除",
+        cancelTitle: "保留"
+      )
+      guard forceConfirmed else { return }
+      if case .failed(let message) = audioPlayer.clearVolumeCache(forceProtectedData: true) {
+        PersistenceLogger.notifyUser(title: "缓存清除失败", subtitle: message)
+      }
+    }
+  }
+
+  private func protectedCacheMessage(_ reason: ProtectedVolumeCacheReason) -> String {
+    switch reason {
+    case .futureLegacyJSON(let version):
+      return "发现由更高版本创建的音量缓存（版本 \(version)）。删除后，其中的数据不能由当前版本恢复。"
+    case .unknownLegacyJSON:
+      return "现有音量缓存格式无法识别。删除会移除原文件，无法由当前版本恢复。"
+    case .futureDatabase(let version):
+      return "发现更高版本的音量数据库（版本 \(version)）。删除后，其中的数据不能由当前版本恢复。"
+    case .foreignDatabase:
+      return "该数据库不属于当前音量缓存格式。删除会移除原数据库，无法恢复。"
+    }
   }
 
   private func handleAppear() {
@@ -568,6 +575,9 @@ struct VolumeNormalizationAnalysisView: View {
   }
 
   private func restoreSearchFocusContext() {
+    cacheRefreshGeneration &+= 1
+    cacheRefreshTask?.cancel()
+    cacheRefreshTask = nil
     guard AppFocusState.shared.activeSearchTarget == .volumeAnalysis else { return }
     AppFocusState.shared.activeSearchTarget = previousSearchTarget
     AppFocusState.shared.isSearchFocused = false

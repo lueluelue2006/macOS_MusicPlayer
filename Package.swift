@@ -27,7 +27,8 @@ let package = Package(
             name: "MusicPlayer",
             dependencies: ["MusicPlayerIPC"],
             linkerSettings: [
-                .linkedFramework("CoreAudio")
+                .linkedFramework("CoreAudio"),
+                .linkedLibrary("sqlite3")
             ]
         ),
         .executableTarget(

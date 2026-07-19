@@ -175,23 +175,12 @@ enum RegressionTests {
     }
 
     private static func testPlaybackScopeRestoreFromPlaylist() async -> Bool {
-        let defaults = UserDefaults.standard
+        let suiteName = "musicplayer.regression.scope.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else { return false }
         let kindKey = "userPlaybackScopeKind"
         let playlistIDKey = "userPlaybackScopePlaylistID"
-
-        let originalKind = defaults.string(forKey: kindKey)
-        let originalPlaylistID = defaults.string(forKey: playlistIDKey)
         defer {
-            if let originalKind {
-                defaults.set(originalKind, forKey: kindKey)
-            } else {
-                defaults.removeObject(forKey: kindKey)
-            }
-            if let originalPlaylistID {
-                defaults.set(originalPlaylistID, forKey: playlistIDKey)
-            } else {
-                defaults.removeObject(forKey: playlistIDKey)
-            }
+            defaults.removePersistentDomain(forName: suiteName)
         }
 
         let fm = FileManager.default
@@ -210,9 +199,13 @@ enum RegressionTests {
                 return instance
             }
 
-            let manager = PlaylistManager(disablePersistence: true)
             defaults.set("playlist", forKey: kindKey)
             defaults.set(playlist.id.uuidString, forKey: playlistIDKey)
+            let preferences = AppPreferencesStore(userDefaults: defaults)
+            let manager = PlaylistManager(
+                disablePersistence: true,
+                appPreferencesStore: preferences
+            )
 
             await manager.restorePlaybackScopeIfNeeded(playlistsStore: store)
 
@@ -368,13 +361,13 @@ enum RegressionTests {
               PlaybackWeights.Level.defaultLevel == .green,
               weights.level(for: url, scope: .queue) == .green else { return false }
 
-        weights.setLevel(.white, for: url, scope: .queue)
+        _ = weights.setLevel(.white, for: url, scope: .queue)
         guard weights.level(for: url, scope: .queue) == .white else { return false }
 
-        weights.setLevel(.green, for: url, scope: .queue)
+        _ = weights.setLevel(.green, for: url, scope: .queue)
         guard weights.level(for: url, scope: .queue) == .green else { return false }
 
-        weights.setLevel(.white, for: url, scope: .playlist(playlistID))
+        _ = weights.setLevel(.white, for: url, scope: .playlist(playlistID))
         let sync = weights.syncPlaylistOverridesToQueue(from: playlistID)
         return sync.total == 1 &&
             sync.changed == 1 &&

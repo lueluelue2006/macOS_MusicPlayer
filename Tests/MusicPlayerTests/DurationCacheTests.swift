@@ -191,10 +191,13 @@ final class DurationCacheTests: XCTestCase {
             // Should migrate legacy key to canonical on first access
             let duration = await cache.cachedDurationIfValid(for: url)
             XCTAssertNotNil(duration)
+            await cache.flushForTesting()
+            let migrated = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as? [String: Any]
+            XCTAssertEqual(migrated?["version"] as? Int, 3)
         }
     }
 
-    func testFutureVersionPreservesOriginalBytes() async throws {
+    func testFutureVersionIsQuarantinedAndCurrentCacheRemainsWritable() async throws {
         try await withTemporaryCache { cacheURL, directory in
             let url = directory.appendingPathComponent("track.mp3")
             try Data("audio".utf8).write(to: url)
@@ -215,12 +218,15 @@ final class DurationCacheTests: XCTestCase {
             await cache.storeDuration(123.45, for: url)
             await cache.flushForTesting()
 
-            let afterBytes = try Data(contentsOf: cacheURL)
-            XCTAssertEqual(afterBytes, originalBytes, "Future version file must remain unchanged")
+            let active = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as? [String: Any]
+            XCTAssertEqual(active?["version"] as? Int, 3)
+            let quarantined = try quarantineFiles(nextTo: cacheURL)
+            XCTAssertEqual(quarantined.count, 1)
+            XCTAssertEqual(try Data(contentsOf: quarantined[0]), originalBytes)
         }
     }
 
-    func testUnknownFormatPreservesOriginalBytes() async throws {
+    func testUnknownFormatIsQuarantinedAndRebuilt() async throws {
         try await withTemporaryCache { cacheURL, directory in
             let url = directory.appendingPathComponent("track.mp3")
             try Data("audio".utf8).write(to: url)
@@ -234,12 +240,15 @@ final class DurationCacheTests: XCTestCase {
             await cache.storeDuration(123.45, for: url)
             await cache.flushForTesting()
 
-            let afterBytes = try Data(contentsOf: cacheURL)
-            XCTAssertEqual(afterBytes, corruptedCache, "Unknown format file must remain unchanged")
+            let active = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as? [String: Any]
+            XCTAssertEqual(active?["version"] as? Int, 3)
+            let quarantined = try quarantineFiles(nextTo: cacheURL)
+            XCTAssertEqual(quarantined.count, 1)
+            XCTAssertEqual(try Data(contentsOf: quarantined[0]), corruptedCache)
         }
     }
 
-    func testFutureVersionPreservesAfterRemoveAll() async throws {
+    func testClearPersistenceReplacesFutureVersion() async throws {
         try await withTemporaryCache { cacheURL, directory in
             let futureCache = """
             {
@@ -251,11 +260,57 @@ final class DurationCacheTests: XCTestCase {
             try originalBytes.write(to: cacheURL, options: .atomic)
 
             let cache = DurationCache(cacheFileURLOverride: cacheURL)
-            await cache.removeAll()
-            await cache.flushForTesting()
+            let result = await cache.clearPersistence()
 
-            let afterBytes = try Data(contentsOf: cacheURL)
-            XCTAssertEqual(afterBytes, originalBytes, "Future version file must survive removeAll")
+            guard case .success = result else {
+                return XCTFail("Expected clear to succeed")
+            }
+            let active = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as? [String: Any]
+            XCTAssertEqual(active?["version"] as? Int, 3)
+            XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(quarantineFiles(nextTo: cacheURL).first)), originalBytes)
+        }
+    }
+
+    func testEntryLimitPrunesToLowWatermark() async throws {
+        try await withTemporaryCache { cacheURL, directory in
+            let limits = DerivedCacheLimits(maximumEntries: 3, lowWatermark: 2, maximumFileBytes: 16_384)
+            let cache = DurationCache(
+                cacheFileURLOverride: cacheURL,
+                limits: limits,
+                now: { Date(timeIntervalSince1970: 1_000) }
+            )
+            let snapshot = FileValidationSnapshot(exists: true, fileSize: 1, mtimeNs: 2, inode: 3)
+            for index in 0..<4 {
+                await cache.storeDuration(
+                    Double(index + 1),
+                    for: directory.appendingPathComponent("track\(index).mp3"),
+                    snapshot: snapshot
+                )
+            }
+
+            let result = await cache.flushPersistence()
+            guard case .success(let report) = result else {
+                return XCTFail("Expected flush to succeed")
+            }
+            XCTAssertEqual(report.entryCount, 2)
+            XCTAssertGreaterThanOrEqual(report.prunedEntryCount, 2)
+        }
+    }
+
+    func testOversizedCacheIsQuarantinedAndRebuilt() async throws {
+        try await withTemporaryCache { cacheURL, _ in
+            let limits = DerivedCacheLimits(maximumEntries: 3, lowWatermark: 2, maximumFileBytes: 1_024)
+            try Data(repeating: 0x42, count: 2_048).write(to: cacheURL)
+            let original = try Data(contentsOf: cacheURL)
+            let cache = DurationCache(cacheFileURLOverride: cacheURL, limits: limits)
+
+            _ = await cache.flushPersistence()
+
+            let quarantined = try quarantineFiles(nextTo: cacheURL)
+            XCTAssertEqual(quarantined.count, 1)
+            XCTAssertEqual(try Data(contentsOf: quarantined[0]), original)
+            let active = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as? [String: Any]
+            XCTAssertEqual(active?["version"] as? Int, 3)
         }
     }
 
@@ -271,5 +326,17 @@ final class DurationCacheTests: XCTestCase {
 
         let cacheURL = directory.appendingPathComponent("duration-cache.json")
         try await body(cacheURL, directory)
+    }
+
+    private func quarantineFiles(nextTo cacheURL: URL) throws -> [URL] {
+        let directory = cacheURL.deletingLastPathComponent().appendingPathComponent(
+            DerivedCacheFileIO.quarantineDirectoryName,
+            isDirectory: true
+        )
+        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+        return try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 }

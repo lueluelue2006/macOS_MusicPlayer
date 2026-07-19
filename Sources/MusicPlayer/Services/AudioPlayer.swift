@@ -13,6 +13,10 @@ private struct WeakAudioPlayerBox: @unchecked Sendable {
     weak var player: AudioPlayer?
 }
 
+private struct WeakAVAudioPlayerBox: @unchecked Sendable {
+    weak var player: AVAudioPlayer?
+}
+
 final class AudioPlayer: NSObject, ObservableObject {
     enum PlaybackMode: String, CaseIterable, Sendable {
         case shuffle
@@ -72,6 +76,7 @@ final class AudioPlayer: NSObject, ObservableObject {
     private let immersivePlaybackAnalyzer: ImmersivePlaybackAnalyzer
     private var immersiveAnalysisTask: Task<Void, Never>?
     private var immersiveEndTask: Task<Void, Never>?
+    private var pendingLateImmersiveBounds: (url: URL, bounds: PlaybackBounds)?
     private var unexpectedStopReconciliationTask: Task<Void, Never>?
     @Published private(set) var activePlaybackBounds: PlaybackBounds?
     private var completedLoadGeneration: UInt64?
@@ -94,81 +99,31 @@ final class AudioPlayer: NSObject, ObservableObject {
     // private let audioFile = AVAudioFile?.none
     
     private var lastSavedTime: TimeInterval = 0
-    // 音量均衡缓存：存储测得响度及文件指纹，避免同一路径文件被替换后继续套用旧结果。
-    private struct VolumeCacheEntry: Codable, Equatable {
-        let loudnessDb: Float
-        let fileSize: Int64?
-        let modificationTime: TimeInterval?
-        let modificationTimeNanoseconds: Int64?
-        let fileIdentifier: UInt64?
-        let updatedAt: TimeInterval
-
-        var hasFileSignature: Bool {
-            fileSize != nil && modificationTimeNanoseconds != nil
-        }
-    }
-
-    private struct VolumeCacheSignature: Equatable {
-        let fileSize: Int64
-        let modificationTimeNanoseconds: Int64
-        let fileIdentifier: UInt64?
-    }
-
-    private var fileLoudnessCache: [String: VolumeCacheEntry] = [:]
-    private var volumeAnalysisRetryAfter: [String: TimeInterval] = [:]
+    // Derived loudness data is persisted incrementally in SQLite. The in-memory
+    // working set is bounded inside VolumeAnalysisStore and is never the source
+    // of truth for a whole music library.
+    private let volumeAnalysisStore: VolumeAnalysisStore?
+    private let volumeAnalysisPersistenceAvailable: Bool
+    private let volumeCacheEpochLock = NSLock()
     private var volumeCacheEpoch: UInt64 = 0
-    private var volumeCacheEntryCapacity: Int?
-    private var isVolumeCacheReadOnly = false
-    private let volumeCacheLock = NSLock()
-    private let volumeCacheSaveLock = NSLock()
-    private let volumeCachePersistenceQueue = DispatchQueue(
-        label: "audio.volume-cache.persistence",
-        qos: .utility
-    )
-    private var volumeCacheSaveRevision: UInt64 = 0
-    private var volumeCacheSaveWorkItem: DispatchWorkItem?
+    private struct SessionLoudnessEntry {
+        let snapshot: FileValidationSnapshot
+        let measurement: LoudnessMeasurement
+        var accessSequence: UInt64
+    }
+    private let sessionLoudnessLock = NSLock()
+    private var sessionLoudnessEntries: [String: SessionLoudnessEntry] = [:]
+    private var sessionLoudnessAccessSequence: UInt64 = 0
+    private let sessionLoudnessCapacity = 128
     @Published private(set) var volumeNormalizationCacheCount: Int = 0
     private let normalizationQueue = DispatchQueue(label: "audio.normalization", qos: .utility)
     private let volumeAnalysisLock = NSLock()
     private var normalizationInFlight: Set<String> = []      // 避免同一文件重复分析
     private let volumeCacheKey = "volumeNormalizationCache"  // 旧版 UserDefaults 增益缓存迁移键
-    private let volumeCacheFileName = "volume-cache.json"
-    private let volumeCacheFileURLOverride: URL?
-    private let disablesVolumeCachePersistence: Bool
     private let playbackStateStore: PlaybackStateStore
-    private let volumeCacheFormatVersion = 3
-    private let maxVolumeCacheEntries = 5_000
-    private let maxVolumeCacheEncodedBytes = 8 * 1_024 * 1_024
-    private let maxVolumeCacheProbeBytes = 16 * 1_024 * 1_024
-    private let failedVolumeAnalysisRetryDelay: TimeInterval = 15 * 60
-    private let maxVolumeAnalysisRetryEntries = 5_000
-    private struct VolumeCacheFile: Codable {
-        let version: Int
-        let entriesByPath: [String: VolumeCacheEntry]
-        let storageConstrained: Bool?
-        let entryCapacity: Int?
-
-        init(
-            version: Int,
-            entriesByPath: [String: VolumeCacheEntry],
-            storageConstrained: Bool?,
-            entryCapacity: Int? = nil
-        ) {
-            self.version = version
-            self.entriesByPath = entriesByPath
-            self.storageConstrained = storageConstrained
-            self.entryCapacity = entryCapacity
-        }
-    }
-    private struct VolumeCacheVersionProbe: Codable {
-        let version: Int?
-    }
-    private struct LegacyVolumeCacheFile: Codable {
-        let version: Int
-        let loudnessDbByPath: [String: Float]
-    }
-    private let legacyVolumeCacheTargetLevelDb: Float = -16.0
-    private let maxNormalizationGain: Float = 2.0
+    private let appPreferencesStore: AppPreferencesStore
+    private let shouldPersistUserPreferences: Bool
+    private var didNotifyProtectedCoherentPreferences = false
     @Published var analyzeVolumesDuringPlayback: Bool = false
     private let userAnalyzeVolumesDuringPlaybackKey = "userAnalyzeVolumesDuringPlayback"
     @Published var autoPreanalyzeVolumesWhenIdle: Bool = true
@@ -193,26 +148,31 @@ final class AudioPlayer: NSObject, ObservableObject {
         case analyzed
         case failed
     }
-    private struct VolumePreanalysisTarget {
-        let url: URL
-        let evictCacheKeyOnSuccess: String?
-    }
     private var volumePreanalysisStartReason: VolumePreanalysisStartReason = .manual
 
     var isAutoIdleVolumePreanalysisActive: Bool {
         volumePreanalysisStartReason == .autoIdle && volumePreanalysisTask != nil
     }
-    private let userVolumeKey = "userPreferredVolume"       // 用户设置的主音量键
     private let userNormalizationKey = "userNormalizationEnabled" // 音量均衡开关
-    @Published var normalizationTargetLevelDb: Float = -16.0 // 目标响度（dB，基于当前 RMS 算法）
-    private let userNormalizationTargetLevelDbKey = "userNormalizationTargetLevelDb"
+    private let normalizationTargetLock = NSLock()
+    private var normalizationTargetSnapshot: Float = LoudnessNormalizationPolicy.defaultTargetLUFS
+    @Published var normalizationTargetLUFS: Float = LoudnessNormalizationPolicy.defaultTargetLUFS {
+        didSet {
+            normalizationTargetLock.lock()
+            normalizationTargetSnapshot = normalizationTargetLUFS
+            normalizationTargetLock.unlock()
+        }
+    }
+    private let userNormalizationTargetLUFSKey = "userNormalizationTargetLUFS"
+    // IPC compatibility while clients migrate from the historical RMS name.
+    var normalizationTargetLevelDb: Float {
+        get { normalizationTargetLUFS }
+        set { normalizationTargetLUFS = newValue }
+    }
     @Published var normalizationFadeDuration: Double = 0.6 // 应用均衡增益时的淡入时长（秒）
     private let userNormalizationFadeDurationKey = "userNormalizationFadeDuration"
     @Published var requireVolumeAnalysisBeforePlayback: Bool = false // 无缓存时先分析再播放
     private let userRequireVolumeAnalysisBeforePlaybackKey = "userRequireVolumeAnalysisBeforePlayback"
-    private let userPlaybackModeKey = "userPlaybackMode"
-    private let userLoopingKey = "userLoopingEnabled"             // 单曲循环开关
-    private let userShuffleKey = "userShuffleEnabled"             // 随机播放开关
     private var wasPlayingBeforeInterruption = false
     // 在耳机/路由变化导致的自动暂停后，记录是否应在耳机恢复时自动续播
     var shouldAutoResumeAfterRoute: Bool = false
@@ -250,6 +210,12 @@ final class AudioPlayer: NSObject, ObservableObject {
         Swift.max(min, Swift.min(max, value))
     }
 
+    private func currentNormalizationTargetLUFS() -> Float {
+        normalizationTargetLock.lock()
+        defer { normalizationTargetLock.unlock() }
+        return normalizationTargetSnapshot
+    }
+
     /// 用于“跨启动恢复/初始定位”的 seek time 规整：
     /// - 若 time 明显超出 duration（例如来自上一首歌的残留进度），则回退到 0，避免被 clamp 到末尾导致“进度拉到最后”。
     /// - 另外避免设置到精确 duration（部分情况下会表现为立刻播放完）。
@@ -273,103 +239,84 @@ final class AudioPlayer: NSObject, ObservableObject {
         PathKey.lookupKeys(for: url)
     }
 
-    private func volumeCacheSignature(for url: URL) -> VolumeCacheSignature? {
+    private func cachedLoudnessMeasurement(for url: URL) -> LoudnessMeasurement? {
+        if let session = sessionLoudnessMeasurement(for: url) {
+            return session
+        }
         let snapshot = FileValidationSnapshot.load(for: url)
-        guard snapshot.exists else { return nil }
-        return VolumeCacheSignature(
-            fileSize: snapshot.fileSize,
-            modificationTimeNanoseconds: snapshot.mtimeNs,
-            fileIdentifier: snapshot.inode.map { UInt64(bitPattern: $0) }
-        )
+        guard let measurement = volumeAnalysisStore?.measurement(for: url) else { return nil }
+        storeSessionLoudness(measurement, for: url, snapshot: snapshot)
+        return measurement
     }
 
-    private func volumeCacheEntry(
-        loudnessDb: Float,
-        signature: VolumeCacheSignature
-    ) -> VolumeCacheEntry {
-        return VolumeCacheEntry(
-            loudnessDb: loudnessDb,
-            fileSize: signature.fileSize,
-            modificationTime: Double(signature.modificationTimeNanoseconds) / 1_000_000_000,
-            modificationTimeNanoseconds: signature.modificationTimeNanoseconds,
-            fileIdentifier: signature.fileIdentifier,
-            updatedAt: Date().timeIntervalSince1970
-        )
-    }
-
-    private func volumeCacheEntryIsValid(
-        _ entry: VolumeCacheEntry,
-        for signature: VolumeCacheSignature?
-    ) -> Bool {
-        guard entry.hasFileSignature,
-              let signature,
-              let expectedSize = entry.fileSize,
-              expectedSize == signature.fileSize,
-              let expectedTime = entry.modificationTimeNanoseconds,
-              expectedTime == signature.modificationTimeNanoseconds else { return false }
-
-        // Treat appearance/disappearance of an inode as a signature change too.
-        // That keeps a transient stat failure from certifying stale derived data.
-        return entry.fileIdentifier == signature.fileIdentifier
-    }
-
-    private func cachedLoudnessAndMigrate(for url: URL) -> Float? {
-        let keys = volumeCacheLookupKeys(for: url)
-        guard let canonical = keys.first else { return nil }
-        let signature = volumeCacheSignature(for: url)
-        var cacheChanged = false
-
-        let value: Float? = withVolumeCacheLock {
-            var matchedKey: String?
-            var entry: VolumeCacheEntry?
-            for key in keys {
-                if let candidate = fileLoudnessCache[key] {
-                    matchedKey = key
-                    entry = candidate
-                    break
-                }
-            }
-            guard let matchedKey, let entry else { return nil }
-
-            // Unsigned v2/legacy entries and transient stat failures are misses;
-            // neither can prove that the file at this path is the analyzed file.
-            guard volumeCacheEntryIsValid(entry, for: signature) else {
-                fileLoudnessCache.removeValue(forKey: matchedKey)
-                volumeAnalysisRetryAfter.removeValue(forKey: canonical)
-                cacheChanged = true
+    private func sessionLoudnessMeasurement(for url: URL) -> LoudnessMeasurement? {
+        let key = volumeCacheKey(for: url)
+        let snapshot = FileValidationSnapshot.load(for: url)
+        sessionLoudnessLock.lock()
+        sessionLoudnessAccessSequence &+= 1
+        if var entry = sessionLoudnessEntries[key] {
+            guard entry.snapshot == snapshot else {
+                sessionLoudnessEntries.removeValue(forKey: key)
+                sessionLoudnessLock.unlock()
                 return nil
             }
-
-            if matchedKey != canonical {
-                fileLoudnessCache.removeValue(forKey: matchedKey)
-                cacheChanged = true
-            }
-            if cacheChanged {
-                fileLoudnessCache[canonical] = entry
-            }
-            return entry.loudnessDb
+            entry.accessSequence = sessionLoudnessAccessSequence
+            sessionLoudnessEntries[key] = entry
+            sessionLoudnessLock.unlock()
+            return entry.measurement
         }
+        sessionLoudnessLock.unlock()
+        return nil
+    }
 
-        if cacheChanged {
-            saveVolumeCache()
-            let count = withVolumeCacheLock { fileLoudnessCache.count }
-            DispatchQueue.main.async { [weak self] in
-                self?.volumeNormalizationCacheCount = count
-            }
+    private func storeSessionLoudness(
+        _ measurement: LoudnessMeasurement,
+        for url: URL,
+        snapshot: FileValidationSnapshot
+    ) {
+        let key = volumeCacheKey(for: url)
+        sessionLoudnessLock.lock()
+        sessionLoudnessAccessSequence &+= 1
+        sessionLoudnessEntries[key] = SessionLoudnessEntry(
+            snapshot: snapshot,
+            measurement: measurement,
+            accessSequence: sessionLoudnessAccessSequence
+        )
+        if sessionLoudnessEntries.count > sessionLoudnessCapacity,
+           let oldest = sessionLoudnessEntries.min(by: {
+               if $0.value.accessSequence == $1.value.accessSequence { return $0.key < $1.key }
+               return $0.value.accessSequence < $1.value.accessSequence
+           })?.key {
+            sessionLoudnessEntries.removeValue(forKey: oldest)
         }
-        return value
+        sessionLoudnessLock.unlock()
+    }
+
+    private func clearSessionLoudnessCache() {
+        sessionLoudnessLock.lock()
+        sessionLoudnessEntries.removeAll(keepingCapacity: false)
+        sessionLoudnessAccessSequence = 0
+        sessionLoudnessLock.unlock()
+    }
+
+    private func currentVolumeCacheEpoch() -> UInt64 {
+        volumeCacheEpochLock.lock()
+        defer { volumeCacheEpochLock.unlock() }
+        return volumeCacheEpoch
+    }
+
+    @discardableResult
+    private func bumpVolumeCacheEpoch() -> UInt64 {
+        volumeCacheEpochLock.lock()
+        defer { volumeCacheEpochLock.unlock() }
+        volumeCacheEpoch &+= 1
+        return volumeCacheEpoch
     }
 
     private func debugLog(_ message: @autoclosure () -> String) {
 #if DEBUG
         print(message())
 #endif
-    }
-
-    private func withVolumeCacheLock<T>(_ body: () -> T) -> T {
-        volumeCacheLock.lock()
-        defer { volumeCacheLock.unlock() }
-        return body()
     }
 
     private func bumpVolumePreanalysisGeneration() -> UInt64 {
@@ -425,42 +372,116 @@ final class AudioPlayer: NSObject, ObservableObject {
             || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     }
 
+    private static func makeDefaultVolumeAnalysisStore() -> VolumeAnalysisStore? {
+        let fileManager = FileManager.default
+        guard let base = fileManager.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else { return nil }
+        let directory = base.appendingPathComponent("MusicPlayer", isDirectory: true)
+        let databaseURL = directory.appendingPathComponent(
+            "volume-analysis.sqlite3",
+            isDirectory: false
+        )
+        let legacyURL = directory.appendingPathComponent("volume-cache.json", isDirectory: false)
+        do {
+            return try VolumeAnalysisStore(databaseURL: databaseURL, legacyJSONURL: legacyURL)
+        } catch {
+            PersistenceLogger.log("初始化音量分析数据库失败：\(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private static func makeVolumeAnalysisStore(
+        legacyOrDatabaseURL url: URL,
+        analysisCapacity: Int,
+        now: @escaping @Sendable () -> TimeInterval
+    ) -> VolumeAnalysisStore? {
+        let isDatabase = url.pathExtension.lowercased() == "sqlite3"
+        let databaseURL = isDatabase
+            ? url
+            : url.deletingPathExtension().appendingPathExtension("sqlite3")
+        do {
+            return try VolumeAnalysisStore(
+                databaseURL: databaseURL,
+                legacyJSONURL: isDatabase ? nil : url,
+                analysisCapacity: analysisCapacity,
+                now: now
+            )
+        } catch {
+            PersistenceLogger.log("初始化测试音量分析数据库失败：\(error.localizedDescription)")
+            return nil
+        }
+    }
+
     override init() {
         let isTesting = Self.isRunningUnderXCTest
         immersivePlaybackAnalyzer = isTesting
             ? ImmersivePlaybackAnalyzer(cacheFileURL: nil)
             : ImmersivePlaybackAnalyzer()
-        volumeCacheFileURLOverride = nil
-        disablesVolumeCachePersistence = isTesting
+        let volumeStore = isTesting ? nil : Self.makeDefaultVolumeAnalysisStore()
+        volumeAnalysisStore = volumeStore
+        volumeAnalysisPersistenceAvailable = isTesting || volumeStore != nil
         playbackStateStore = PlaybackStateStore(disablesPersistence: isTesting)
+        appPreferencesStore = .shared
+        shouldPersistUserPreferences = !isTesting
         super.init()
         testModeSilent = isTesting
-        finishInitialization(loadUserPreferences: true)
+        finishInitialization(loadUserPreferences: !isTesting)
     }
 
     init(
         volumeCacheFileURLOverride: URL,
         immersiveCacheFileURLOverride: URL? = nil,
-        initialImmersivePlaybackEnabled: Bool = false
+        initialImmersivePlaybackEnabled: Bool = false,
+        volumeAnalysisCapacity: Int = 20_000,
+        volumeAnalysisNow: @escaping @Sendable () -> TimeInterval = {
+            Date().timeIntervalSince1970
+        },
+        appPreferencesStore: AppPreferencesStore = .shared,
+        loadUserPreferences: Bool = false,
+        immersivePlaybackAnalyzerOverride: ImmersivePlaybackAnalyzer? = nil
     ) {
-        immersivePlaybackAnalyzer = ImmersivePlaybackAnalyzer(
-            cacheFileURL: immersiveCacheFileURLOverride
+        immersivePlaybackAnalyzer = immersivePlaybackAnalyzerOverride
+            ?? ImmersivePlaybackAnalyzer(cacheFileURL: immersiveCacheFileURLOverride)
+        let volumeStore = Self.makeVolumeAnalysisStore(
+            legacyOrDatabaseURL: volumeCacheFileURLOverride,
+            analysisCapacity: volumeAnalysisCapacity,
+            now: volumeAnalysisNow
         )
-        self.volumeCacheFileURLOverride = volumeCacheFileURLOverride
-        disablesVolumeCachePersistence = false
+        volumeAnalysisStore = volumeStore
+        volumeAnalysisPersistenceAvailable = volumeStore != nil
         playbackStateStore = PlaybackStateStore(disablesPersistence: true)
+        self.appPreferencesStore = appPreferencesStore
+        shouldPersistUserPreferences = loadUserPreferences
         super.init()
         testModeSilent = Self.isRunningUnderXCTest
         isImmersivePlaybackEnabled = initialImmersivePlaybackEnabled
-        finishInitialization(loadUserPreferences: false)
+        finishInitialization(loadUserPreferences: loadUserPreferences)
     }
 
     private func finishInitialization(loadUserPreferences: Bool) {
         configureAudioSession()
         observeAudioSessionNotifications()
-        loadVolumeCache()  // 加载持久化的音量缓存
+        volumeNormalizationCacheCount = 0
+        if let volumeAnalysisStore {
+            normalizationQueue.async { [weak self] in
+                let count = volumeAnalysisStore.analysisCount
+                DispatchQueue.main.async {
+                    self?.volumeNormalizationCacheCount = count
+                }
+            }
+        } else if !volumeAnalysisPersistenceAvailable {
+            PersistenceLogger.log("音量分析数据库不可用，已降级为有界会话缓存")
+            DispatchQueue.main.async {
+                PersistenceLogger.notifyUser(
+                    title: "音量分析缓存不可写",
+                    subtitle: "当前播放仍会均衡，重启后可能需要重新分析"
+                )
+            }
+        }
         guard loadUserPreferences else { return }
-        loadUserVolume()   // 加载用户设置的主音量
+        loadCoherentPlayerPreferences()
         loadUserPlaybackSwitches() // 加载均衡/循环/随机开关
         loadNormalizationTargetLevelPreference()
         loadNormalizationFadeDurationPreference()
@@ -495,16 +516,16 @@ final class AudioPlayer: NSObject, ObservableObject {
 
     private func loadNormalizationTargetLevelPreference() {
         let d = UserDefaults.standard
-        if d.object(forKey: userNormalizationTargetLevelDbKey) != nil {
-            let v = d.float(forKey: userNormalizationTargetLevelDbKey)
-            normalizationTargetLevelDb = clamp(v, min: -30.0, max: -8.0)
+        if d.object(forKey: userNormalizationTargetLUFSKey) != nil {
+            let v = d.float(forKey: userNormalizationTargetLUFSKey)
+            normalizationTargetLUFS = clamp(v, min: -30.0, max: -8.0)
         }
     }
 
     func saveNormalizationTargetLevelPreference() {
-        normalizationTargetLevelDb = clamp(normalizationTargetLevelDb, min: -30.0, max: -8.0)
+        normalizationTargetLUFS = clamp(normalizationTargetLUFS, min: -30.0, max: -8.0)
         let d = UserDefaults.standard
-        d.set(normalizationTargetLevelDb, forKey: userNormalizationTargetLevelDbKey)
+        d.set(normalizationTargetLUFS, forKey: userNormalizationTargetLUFSKey)
     }
 
     private func loadNormalizationFadeDurationPreference() {
@@ -881,6 +902,27 @@ final class AudioPlayer: NSObject, ObservableObject {
         )
     }
 
+    private func updatePreloadedBoundsIfMatching(
+        _ bounds: PlaybackBounds,
+        url: URL,
+        player: AVAudioPlayer,
+        generation: UInt64
+    ) {
+        preloadLock.lock()
+        defer { preloadLock.unlock() }
+        guard generation == preloadGeneration,
+              let entry = preloadedNext,
+              entry.generation == generation,
+              entry.url == url,
+              entry.player === player else { return }
+        preloadedNext = PreloadedNext(
+            url: entry.url,
+            player: entry.player,
+            playbackBounds: bounds,
+            generation: entry.generation
+        )
+    }
+
     private func beginPreload(for url: URL) -> UInt64 {
         preloadLock.lock()
         preloadGeneration &+= 1
@@ -954,7 +996,23 @@ final class AudioPlayer: NSObject, ObservableObject {
                 if Task.isCancelled { return }
                 let playbackBounds: PlaybackBounds?
                 if capturedImmersivePlaybackEnabled {
-                    playbackBounds = await self.immersivePlaybackAnalyzer.bounds(for: url)
+                    playbackBounds = await self.immersivePlaybackAnalyzer.bounds(
+                        for: url,
+                        onLateBounds: { [weak self, weak p] bounds in
+                            guard let self, let p else { return }
+                            self.updatePreloadedBoundsIfMatching(
+                                bounds,
+                                url: url,
+                                player: p,
+                                generation: generation
+                            )
+                            self.handleLateImmersiveBounds(
+                                bounds,
+                                for: url,
+                                player: p
+                            )
+                        }
+                    )
                 } else {
                     playbackBounds = nil
                 }
@@ -1060,6 +1118,41 @@ final class AudioPlayer: NSObject, ObservableObject {
         )
     }
 
+    private func handleLateImmersiveBounds(
+        _ bounds: PlaybackBounds,
+        for url: URL,
+        player capturedPlayer: AVAudioPlayer
+    ) {
+        let owner = WeakAudioPlayerBox(player: self)
+        let playerBox = WeakAVAudioPlayerBox(player: capturedPlayer)
+        Task { @MainActor in
+            guard let self = owner.player else { return }
+            guard self.isImmersivePlaybackEnabled else { return }
+
+            guard let currentPlayer = playerBox.player,
+                  self.player === currentPlayer,
+                  self.currentFile?.url == url else {
+                if self.pendingPlaybackURL == url {
+                    self.pendingLateImmersiveBounds = (url, bounds)
+                }
+                return
+            }
+            guard self.completedLoadGeneration != self.activePlayerGeneration else { return }
+
+            let validatedBounds = self.validatedPlaybackBounds(
+                bounds,
+                duration: currentPlayer.duration
+            )
+            self.activePlaybackBounds = validatedBounds
+            currentPlayer.numberOfLoops = 0
+            if currentPlayer.currentTime < validatedBounds.audibleStart {
+                currentPlayer.currentTime = validatedBounds.audibleStart
+                self.playbackClock.currentTime = validatedBounds.audibleStart
+            }
+            self.scheduleImmersiveEndIfNeeded()
+        }
+    }
+
     private func analyzeBoundsForCurrentTrack() {
         immersiveAnalysisTask?.cancel()
         immersiveAnalysisTask = nil
@@ -1071,7 +1164,17 @@ final class AudioPlayer: NSObject, ObservableObject {
         let generation = activePlayerGeneration
         immersiveAnalysisTask = Task { [weak self] in
             guard let self else { return }
-            let bounds = await self.immersivePlaybackAnalyzer.bounds(for: url)
+            let bounds = await self.immersivePlaybackAnalyzer.bounds(
+                for: url,
+                onLateBounds: { [weak self, weak capturedPlayer] bounds in
+                    guard let self, let capturedPlayer else { return }
+                    self.handleLateImmersiveBounds(
+                        bounds,
+                        for: url,
+                        player: capturedPlayer
+                    )
+                }
+            )
             if Task.isCancelled { return }
             await MainActor.run { [weak self] in
                 guard let self else { return }
@@ -1307,6 +1410,7 @@ final class AudioPlayer: NSObject, ObservableObject {
         setPlaybackIntent(autostart)
         immersiveAnalysisTask?.cancel()
         immersiveAnalysisTask = nil
+        pendingLateImmersiveBounds = nil
         immersiveEndTask?.cancel()
         immersiveEndTask = nil
 
@@ -1445,7 +1549,17 @@ final class AudioPlayer: NSObject, ObservableObject {
                     if let preloadedBounds {
                         playbackBounds = preloadedBounds
                     } else {
-                        playbackBounds = await self.immersivePlaybackAnalyzer.bounds(for: url)
+                        playbackBounds = await self.immersivePlaybackAnalyzer.bounds(
+                            for: url,
+                            onLateBounds: { [weak self, weak newPlayer] bounds in
+                                guard let self, let newPlayer else { return }
+                                self.handleLateImmersiveBounds(
+                                    bounds,
+                                    for: url,
+                                    player: newPlayer
+                                )
+                            }
+                        )
                     }
                 } else {
                     playbackBounds = nil
@@ -1488,7 +1602,18 @@ final class AudioPlayer: NSObject, ObservableObject {
                     self.currentFile = file
                     self.playbackClock.duration = newPlayer.duration
                     self.lastSavedTime = 0
-                    self.applyLoadedPlaybackBounds(playbackBounds, to: newPlayer, url: url)
+                    let lateBounds: PlaybackBounds?
+                    if self.pendingLateImmersiveBounds?.url == url {
+                        lateBounds = self.pendingLateImmersiveBounds?.bounds
+                    } else {
+                        lateBounds = nil
+                    }
+                    self.pendingLateImmersiveBounds = nil
+                    self.applyLoadedPlaybackBounds(
+                        lateBounds ?? playbackBounds,
+                        to: newPlayer,
+                        url: url
+                    )
                     let shouldStart = self.isPlaybackRequested
                     let requiresDeferredNormalization = shouldStart
                         && self.isNormalizationEnabled
@@ -2077,13 +2202,14 @@ final class AudioPlayer: NSObject, ObservableObject {
     }
     
     func setVolume(_ newVolume: Float) {
-        volume = max(0, min(1, newVolume))
-        saveUserVolume()   // 持久化保存主音量
+        volume = newVolume.isFinite ? max(0, min(1, newVolume)) : 0.5
+        saveUserVolume()
         updatePlayerVolume()
     }
 
     func setPlaybackRate(_ newRate: Float) {
-        playbackRate = clampPlaybackRate(newRate)
+        playbackRate = newRate.isFinite ? clampPlaybackRate(newRate) : 1
+        savePlaybackRatePreference()
         updatePlayerRate()
         scheduleImmersiveEndIfNeeded()
     }
@@ -2149,12 +2275,18 @@ final class AudioPlayer: NSObject, ObservableObject {
         }
     }
 
-    func clearImmersivePlaybackCache() async {
-        await immersivePlaybackAnalyzer.removeAll()
-        guard isImmersivePlaybackEnabled else { return }
-        await MainActor.run { [weak self] in
-            self?.analyzeBoundsForCurrentTrack()
+    @discardableResult
+    func clearImmersivePlaybackCache() async -> Result<
+        ImmersivePlaybackAnalyzer.CacheClearReport,
+        ImmersivePlaybackAnalyzer.CachePersistenceError
+    > {
+        let result = await immersivePlaybackAnalyzer.removeAll()
+        if case .success = result, isImmersivePlaybackEnabled {
+            await MainActor.run { [weak self] in
+                self?.analyzeBoundsForCurrentTrack()
+            }
         }
+        return result
     }
 
     func flushImmersivePlaybackCachePersistence(timeout: TimeInterval = 2) {
@@ -2353,21 +2485,35 @@ final class AudioPlayer: NSObject, ObservableObject {
     
     // MARK: - 保存和加载上次播放的歌曲
     private func saveLastPlayedFile(_ file: AudioFile, initialTime: TimeInterval? = nil) {
-        playbackStateStore.saveFile(file.url, initialTime: initialTime)
+        playbackStateStore.saveState(fileURL: file.url, time: initialTime ?? 0)
     }
 
     private func clearLastPlayedFileIfMatching(_ url: URL) {
         playbackStateStore.clearIfMatching(url)
     }
     
-		    private func saveCurrentProgress() {
-		        guard currentFile != nil else { return }
-		        // 临时播放（不持久化）时不保存播放进度
-		        guard persistPlaybackState else { return }
-		        let time = playbackClock.currentTime
-		        playbackStateStore.saveProgress(time)
-		        debugLog("保存播放进度: \(time) 秒")
-		    }
+			    private func saveCurrentProgress() {
+			        guard let currentFile else { return }
+			        // 临时播放（不持久化）时不保存播放进度
+			        guard persistPlaybackState else { return }
+			        let time = player?.currentTime ?? playbackClock.currentTime
+			        playbackStateStore.saveState(fileURL: currentFile.url, time: time)
+			        debugLog("保存播放进度: \(time) 秒")
+			    }
+
+    @discardableResult
+    func flushPlaybackStatePersistence() -> Bool {
+        saveCurrentProgress()
+        return playbackStateStore.flush()
+    }
+
+    @discardableResult
+    func rekeyPersistedPlaybackState(
+        from oldURL: URL,
+        to newURL: URL
+    ) -> PlaybackStateStore.RekeyResult {
+        playbackStateStore.rekeyIfMatching(from: oldURL, to: newURL)
+    }
     
 	    func loadLastPlayedFile() {
 	        guard let state = playbackStateStore.loadState() else {
@@ -2659,17 +2805,14 @@ extension AudioPlayer {
         applyVolumeNormalization(for: url, mode: mode)
     }
 
-    private func normalizationGain(forMeasuredLevelDb levelDb: Float) -> Float {
-        let exponent = Double((normalizationTargetLevelDb - levelDb) / 20.0)
-        let gain = pow(10.0, exponent)
-        guard gain.isFinite, gain > 0 else { return 1.0 }
-        return min(Float(gain), maxNormalizationGain)
-    }
-
     private func desiredPlayerVolume(for url: URL) -> Float {
         if !isNormalizationEnabled { return volume }
-        if let levelDb = cachedLoudnessAndMigrate(for: url) {
-            return min(volume * normalizationGain(forMeasuredLevelDb: levelDb), 1.0)
+        if let measurement = cachedLoudnessMeasurement(for: url) {
+            return LoudnessNormalizationPolicy.outputVolume(
+                userVolume: volume,
+                measurement: measurement,
+                targetLUFS: currentNormalizationTargetLUFS()
+            )
         }
         return volume
     }
@@ -2747,7 +2890,7 @@ extension AudioPlayer {
             // 若均衡已关闭，不再后台分析
             guard isNormalizationEnabled else { return }
 
-            let hasCache = cachedLoudnessAndMigrate(for: url) != nil
+            let hasCache = cachedLoudnessMeasurement(for: url) != nil
             // 若已有缓存，无需再排队分析
             guard !hasCache else { return }
             guard allowBackgroundAnalysis else { return }
@@ -2807,546 +2950,153 @@ extension AudioPlayer {
         cancellationCheck: (() -> Bool)? = nil,
         evictCacheKeyOnSuccess: String? = nil
     ) -> Float {
-            let fileKey = volumeCacheKey(for: url)
-            let cacheEpochAtRequest = withVolumeCacheLock { volumeCacheEpoch }
-            
-            // 检查缓存
-            if let cachedLevelDb = cachedLoudnessAndMigrate(for: url) {
-                return normalizationGain(forMeasuredLevelDb: cachedLevelDb)
-            }
+        _ = persist // SQLite commits each derived result incrementally.
+        _ = evictCacheKeyOnSuccess // Capacity eviction is owned by the store's LRU.
+        let cacheEpochAtRequest = currentVolumeCacheEpoch()
+        // UI preferences may change while a utility-queue scan is running.
+        // Use one lock-protected value for the complete request; the persisted
+        // measurement remains target-independent and can be reapplied later.
+        let targetLUFS = currentNormalizationTargetLUFS()
 
-            // All full-track loudness scans share one lane. This keeps playback,
-            // manual analysis, and idle analysis from decoding multiple songs at once.
-            volumeAnalysisLock.lock()
-            defer { volumeAnalysisLock.unlock() }
-            if cancellationCheck?() == true || Task.isCancelled { return 1.0 }
-            guard withVolumeCacheLock({ volumeCacheEpoch }) == cacheEpochAtRequest else {
-                return 1.0
-            }
-            if let cachedLevelDb = cachedLoudnessAndMigrate(for: url) {
-                return normalizationGain(forMeasuredLevelDb: cachedLevelDb)
-            }
-            guard let signatureBeforeAnalysis = volumeCacheSignature(for: url) else {
-                return 1.0
-            }
-
-		        // 分析音频文件响度（RMS, dB）
-			        guard let measuredLevelDb = analyzeAudioLevel(for: url, cancellationCheck: cancellationCheck) else {
-                    if cancellationCheck?() == true { return 1.0 }
-		                debugLog("音量均衡分析失败：\(url.lastPathComponent)（将使用原始音量）")
-		                return 1.0
-			            }
-	        if cancellationCheck?() == true || Task.isCancelled { return 1.0 }
-	        guard let signatureAfterAnalysis = volumeCacheSignature(for: url),
-	              signatureBeforeAnalysis == signatureAfterAnalysis else {
-	            debugLog("响度分析期间文件发生变化，丢弃结果：\(url.lastPathComponent)")
-	            return 1.0
-	        }
-		        let gain = normalizationGain(forMeasuredLevelDb: measuredLevelDb)
-
-	        // 缓存“测得响度”和轻量文件指纹；缓存始终有界。
-	        let entry = volumeCacheEntry(
-	            loudnessDb: measuredLevelDb,
-	            signature: signatureAfterAnalysis
-	        )
-	        let newCount: Int? = withVolumeCacheLock {
-	            guard volumeCacheEpoch == cacheEpochAtRequest else { return nil }
-	            fileLoudnessCache[fileKey] = entry
-	            if let evictionKey = evictCacheKeyOnSuccess, evictionKey != fileKey {
-	                fileLoudnessCache.removeValue(forKey: evictionKey)
-	                volumeAnalysisRetryAfter.removeValue(forKey: evictionKey)
-	            }
-	            volumeAnalysisRetryAfter.removeValue(forKey: fileKey)
-	            if fileLoudnessCache.count > maxVolumeCacheEntries {
-	                fileLoudnessCache = prunedVolumeCacheEntries(
-	                    fileLoudnessCache,
-	                    limit: maxVolumeCacheEntries
-	                )
-	            }
-	            return fileLoudnessCache.count
-	        }
-	        guard let newCount else { return 1.0 }
-	        DispatchQueue.main.async { [weak self] in
-	            self?.volumeNormalizationCacheCount = newCount
-	        }
-	        if persist {
-	            saveVolumeCache()  // 持久化保存
-	        }
-	        
-		        debugLog("文件: \(url.lastPathComponent), RMS: \(measuredLevelDb)dB, 目标: \(normalizationTargetLevelDb)dB, 增益: \(gain)")
-
-		        return gain
-			    }
-	    
-	    /// 分析音频文件的音量水平：顺序读取整首歌曲计算 RMS
-	    func analyzeAudioLevel(for url: URL, cancellationCheck: (() -> Bool)? = nil) -> Float? {
-        AudioAnalysis.analyzeRMSLoudness(for: url, cancellationCheck: cancellationCheck)
-    }
-
-    /// 清除音量缓存
-    func clearVolumeCache() {
-        cancelVolumeNormalizationPreanalysis()
-        _ = bumpPlaybackAnalysisGeneration()
-        withVolumeCacheLock {
-            volumeCacheEpoch &+= 1
-            fileLoudnessCache.removeAll()
-            volumeAnalysisRetryAfter.removeAll()
-            volumeCacheEntryCapacity = nil
-        }
-        DispatchQueue.main.async { [weak self] in
-            self?.volumeNormalizationCacheCount = 0
-        }
-        // Serialize clear behind any in-flight atomic write, then replace it with
-        // the empty state. An older writer can no longer resurrect cleared data.
-        invalidateScheduledVolumeCacheSave()
-        volumeCachePersistenceQueue.sync { [weak self] in
-            guard let self else { return }
-            let readOnly = withVolumeCacheLock { self.isVolumeCacheReadOnly }
-            if !readOnly, let url = self.volumeCacheURL() {
-                try? FileManager.default.removeItem(at: url)
-            }
-            _ = self.writeVolumeCacheNow()
-        }
-    }
-    
-    /// 加载持久化的音量缓存
-    private func loadVolumeCache() {
-        guard let url = volumeCacheURL() else { return }
-
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: url.path) else {
-            // Disk cache file does not exist: fall back to UserDefaults migration if applicable
-            loadVolumeCacheFromUserDefaultsFallback()
-            return
-        }
-
-        // File exists: stat size
-        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
-              let fileSize = values.fileSize else {
-            // File exists but cannot stat: enter read-only and preserve
-            withVolumeCacheLock {
-                isVolumeCacheReadOnly = true
-            }
-            PersistenceLogger.log("音量缓存文件存在但无法读取属性，进入只读模式保护数据")
-            return
-        }
-
-        if fileSize > maxVolumeCacheProbeBytes {
-            // File too large to safely probe: conservatively enter read-only and preserve
-            withVolumeCacheLock {
-                isVolumeCacheReadOnly = true
-            }
-            PersistenceLogger.log("音量缓存文件超过探测上限 (\(fileSize) bytes)，无法安全判定版本，进入只读模式保护数据")
-            return
-        }
-
-        // Read full data within probe limit
-        guard let data = try? Data(contentsOf: url) else {
-            // File exists but cannot read: enter read-only and preserve
-            withVolumeCacheLock {
-                isVolumeCacheReadOnly = true
-            }
-            PersistenceLogger.log("音量缓存文件存在但无法读取内容，进入只读模式保护数据")
-            return
-        }
-
-        // Probe version first to detect future schemas
-        if let probe = try? JSONDecoder().decode(VolumeCacheVersionProbe.self, from: data),
-           let version = probe.version,
-           version > volumeCacheFormatVersion {
-            withVolumeCacheLock {
-                isVolumeCacheReadOnly = true
-            }
-            PersistenceLogger.log("检测到未来音量缓存版本 \(version)（当前支持 \(volumeCacheFormatVersion)），进入只读模式保护数据")
-            DispatchQueue.main.async {
-                PersistenceLogger.notifyUser(
-                    title: "音量缓存版本过新",
-                    subtitle: "可能由新版本创建，当前版本只读保护"
-                )
-            }
-            return
-        }
-
-        // 优先从磁盘读取带文件指纹的 v3 JSON 缓存。
-        if let decoded = try? JSONDecoder().decode(VolumeCacheFile.self, from: data),
-           decoded.version == volumeCacheFormatVersion {
-            // Confirmed v3: safe to apply oversized derived cache policy
-            if fileSize > maxVolumeCacheEncodedBytes {
-                try? FileManager.default.removeItem(at: url)
-                debugLog("丢弃超过上限的响度缓存：\(fileSize) bytes")
-                return
-            }
-
-            let normalized = prunedVolumeCacheEntries(
-                normalizeVolumeCacheEntries(decoded.entriesByPath),
-                limit: maxVolumeCacheEntries
+        if let cached = cachedLoudnessMeasurement(for: url) {
+            return LoudnessNormalizationPolicy.outputVolume(
+                userVolume: 1,
+                measurement: cached,
+                targetLUFS: targetLUFS
             )
-            withVolumeCacheLock {
-                fileLoudnessCache = normalized
-                if let persistedCapacity = decoded.entryCapacity {
-                    volumeCacheEntryCapacity = max(
-                        normalized.count,
-                        min(maxVolumeCacheEntries, persistedCapacity)
-                    )
-                } else if decoded.storageConstrained == true {
-                    volumeCacheEntryCapacity = normalized.count
-                } else {
-                    volumeCacheEntryCapacity = nil
+        }
+
+        // All full-track scans share one lane, keeping memory and decoder pressure bounded.
+        volumeAnalysisLock.lock()
+        defer { volumeAnalysisLock.unlock() }
+        if cancellationCheck?() == true || Task.isCancelled { return 1 }
+        guard currentVolumeCacheEpoch() == cacheEpochAtRequest else { return 1 }
+        if let cached = cachedLoudnessMeasurement(for: url) {
+            return LoudnessNormalizationPolicy.outputVolume(
+                userVolume: 1,
+                measurement: cached,
+                targetLUFS: targetLUFS
+            )
+        }
+
+        let snapshotBefore = FileValidationSnapshot.load(for: url)
+        guard snapshotBefore.exists else { return 1 }
+        let result = analyzeAudioLevel(for: url, cancellationCheck: cancellationCheck)
+        guard case .success(let measurement) = result else {
+            if case .failure(let error) = result {
+                volumeAnalysisStore?.recordFailure(error, for: url, snapshot: snapshotBefore)
+                if error != .cancelled {
+                    debugLog("音量均衡分析失败：\(url.lastPathComponent)（\(error.localizedDescription)）")
                 }
             }
-            volumeNormalizationCacheCount = normalized.count
-            debugLog("加载了 \(normalized.count) 个文件的响度缓存")
-            if normalized != decoded.entriesByPath || data.count > maxVolumeCacheEncodedBytes {
-                // 统一键格式并去重后回写，避免后续因路径格式差异导致缓存 miss。
-                saveVolumeCache()
-            }
-            return
+            return 1
+        }
+        if cancellationCheck?() == true || Task.isCancelled { return 1 }
+        let snapshotAfter = FileValidationSnapshot.load(for: url)
+        guard snapshotBefore == snapshotAfter,
+              currentVolumeCacheEpoch() == cacheEpochAtRequest else {
+            debugLog("响度分析期间文件发生变化，丢弃结果：\(url.lastPathComponent)")
+            return 1
         }
 
-        // v2 文件只有响度字典。先无损迁移；首次命中时再补文件指纹，
-        // 避免启动阶段对整个曲库逐个 stat。
-        if let legacyFile = try? JSONDecoder().decode(LegacyVolumeCacheFile.self, from: data),
-           legacyFile.version == 2 {
-            // Confirmed v2: safe to apply oversized derived cache policy
-            if fileSize > maxVolumeCacheEncodedBytes {
-                try? FileManager.default.removeItem(at: url)
-                debugLog("丢弃超过上限的响度缓存：\(fileSize) bytes")
-                return
-            }
+        // A valid analysis must affect this playback session even when SQLite
+        // is temporarily read-only or the disk is full.
+        storeSessionLoudness(measurement, for: url, snapshot: snapshotAfter)
 
-            let migrated = volumeCacheEntries(
-                fromLoudnessValues: legacyFile.loudnessDbByPath
-            )
-            withVolumeCacheLock {
-                fileLoudnessCache = migrated
-            }
-            volumeNormalizationCacheCount = migrated.count
-            saveVolumeCache()
-            debugLog("已迁移 v2 音量缓存文件：\(migrated.count) 项")
-            return
-        }
-
-        // 更早版本可能直接保存“增益字典”或“响度字典”。
-        if let legacy = try? JSONDecoder().decode([String: Float].self, from: data) {
-            // Confirmed legacy dict: safe to apply oversized derived cache policy
-            if fileSize > maxVolumeCacheEncodedBytes {
-                try? FileManager.default.removeItem(at: url)
-                debugLog("丢弃超过上限的响度缓存：\(fileSize) bytes")
-                return
-            }
-
-            let migrated = volumeCacheEntries(fromLegacyValues: legacy)
-            withVolumeCacheLock {
-                fileLoudnessCache = migrated
-            }
-            volumeNormalizationCacheCount = migrated.count
-            saveVolumeCache()
-            debugLog("已迁移旧版音量缓存文件：\(migrated.count) 项")
-            return
-        }
-
-        // Unknown or corrupted format: enter read-only to preserve
-        withVolumeCacheLock {
-            isVolumeCacheReadOnly = true
-        }
-        PersistenceLogger.log("音量缓存文件格式未知或损坏，进入只读模式保护数据")
-    }
-
-    private func loadVolumeCacheFromUserDefaultsFallback() {
-        // Tests and isolated callers using an explicit cache URL must not read or
-        // mutate the real app's legacy UserDefaults cache.
-        if volumeCacheFileURLOverride != nil || disablesVolumeCachePersistence {
-            volumeNormalizationCacheCount = withVolumeCacheLock { fileLoudnessCache.count }
-            return
-        }
-
-        // 兼容旧版 UserDefaults 缓存：加载后迁移到磁盘（旧版存的是“增益”）
-        let d = UserDefaults.standard
-        if let cachedData = d.dictionary(forKey: volumeCacheKey) as? [String: Float] {
-            let migrated = volumeCacheEntries(fromLegacyValues: cachedData)
-            withVolumeCacheLock {
-                fileLoudnessCache = migrated
-            }
-            volumeNormalizationCacheCount = migrated.count
-            if writeVolumeCacheNow() {
-                d.removeObject(forKey: volumeCacheKey)
-            }
-            debugLog("从旧版偏好迁移了 \(migrated.count) 个文件的响度缓存")
-            return
-        }
-
-        if volumeNormalizationCacheCount == 0 {
-            volumeNormalizationCacheCount = withVolumeCacheLock { fileLoudnessCache.count }
-        }
-    }
-
-    /// 将旧版缓存（增益）迁移为“响度(dB)”缓存。
-    private func migrateLegacyVolumeCache(_ legacy: [String: Float]) -> [String: Float] {
-        // 若存在负数，基本可判定为“响度(dB)”而非旧版增益，直接复用
-        if legacy.values.contains(where: { $0 < 0 }) {
-            return legacy
-        }
-
-        var migrated: [String: Float] = [:]
-        migrated.reserveCapacity(legacy.count)
-        for (path, gain) in legacy {
-            guard gain.isFinite, gain > 0 else { continue }
-            // 旧版对增益做了上限（maxNormalizationGain）；若命中上限则信息不足，跳过以触发重新分析
-            if gain >= (maxNormalizationGain * 0.999) {
-                continue
-            }
-            let loudness = legacyVolumeCacheTargetLevelDb - Float(20.0 * log10(Double(gain)))
-            migrated[path] = loudness
-        }
-        return migrated
-    }
-
-    private func volumeCacheEntries(fromLegacyValues raw: [String: Float]) -> [String: VolumeCacheEntry] {
-        volumeCacheEntries(fromLoudnessValues: migrateLegacyVolumeCache(raw))
-    }
-
-    private func volumeCacheEntries(
-        fromLoudnessValues loudnessValues: [String: Float]
-    ) -> [String: VolumeCacheEntry] {
-        let now = Date().timeIntervalSince1970
-        var entries: [String: VolumeCacheEntry] = [:]
-        entries.reserveCapacity(min(loudnessValues.count, maxVolumeCacheEntries))
-        for (path, loudnessDb) in loudnessValues where loudnessDb.isFinite {
-            entries[path] = VolumeCacheEntry(
-                loudnessDb: loudnessDb,
-                fileSize: nil,
-                modificationTime: nil,
-                modificationTimeNanoseconds: nil,
-                fileIdentifier: nil,
-                updatedAt: now
-            )
-        }
-        return prunedVolumeCacheEntries(
-            normalizeVolumeCacheEntries(entries),
-            limit: maxVolumeCacheEntries
-        )
-    }
-
-    private func normalizeVolumeCacheEntries(
-        _ raw: [String: VolumeCacheEntry]
-    ) -> [String: VolumeCacheEntry] {
-        guard !raw.isEmpty else { return [:] }
-        var normalized: [String: VolumeCacheEntry] = [:]
-        normalized.reserveCapacity(raw.count)
-        for (path, entry) in raw {
-            guard entry.loudnessDb.isFinite, entry.updatedAt.isFinite else { continue }
-            let key = PathKey.canonical(path: path)
-            if let existing = normalized[key], existing.updatedAt > entry.updatedAt {
-                continue
-            }
-            normalized[key] = entry
-        }
-        return normalized
-    }
-
-    private func prunedVolumeCacheEntries(
-        _ entries: [String: VolumeCacheEntry],
-        limit: Int
-    ) -> [String: VolumeCacheEntry] {
-        guard limit > 0, entries.count > limit else { return limit > 0 ? entries : [:] }
-        return Dictionary(
-            uniqueKeysWithValues: entries
-                .sorted { lhs, rhs in
-                    if lhs.value.updatedAt == rhs.value.updatedAt {
-                        return lhs.key < rhs.key
-                    }
-                    return lhs.value.updatedAt > rhs.value.updatedAt
-                }
-                .prefix(limit)
-                .map { ($0.key, $0.value) }
-        )
-    }
-    
-    /// 保存音量缓存到持久化存储
-    private func saveVolumeCache() {
-        let workItem: DispatchWorkItem
-        let previousWorkItem: DispatchWorkItem?
-        volumeCacheSaveLock.lock()
-        volumeCacheSaveRevision &+= 1
-        let revision = volumeCacheSaveRevision
-        previousWorkItem = volumeCacheSaveWorkItem
-        workItem = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.volumeCacheSaveLock.lock()
-            let isLatest = self.volumeCacheSaveRevision == revision
-            if isLatest {
-                self.volumeCacheSaveWorkItem = nil
-            }
-            self.volumeCacheSaveLock.unlock()
-            guard isLatest else { return }
-            self.writeVolumeCacheNow()
-        }
-        volumeCacheSaveWorkItem = workItem
-        volumeCacheSaveLock.unlock()
-        previousWorkItem?.cancel()
-        volumeCachePersistenceQueue.asyncAfter(deadline: .now() + 1.0, execute: workItem)
-    }
-
-    private func invalidateScheduledVolumeCacheSave() {
-        volumeCacheSaveLock.lock()
-        volumeCacheSaveRevision &+= 1
-        let pending = volumeCacheSaveWorkItem
-        volumeCacheSaveWorkItem = nil
-        volumeCacheSaveLock.unlock()
-        pending?.cancel()
-    }
-
-    @discardableResult
-    private func writeVolumeCacheNow() -> Bool {
-        let readOnly = withVolumeCacheLock { isVolumeCacheReadOnly }
-        guard !readOnly else { return false }
-        guard let url = volumeCacheURL() else { return false }
-
-        do {
-            let cacheState: (
-                entries: [String: VolumeCacheEntry],
-                entryCapacity: Int?
-            ) = withVolumeCacheLock {
-                if fileLoudnessCache.count > maxVolumeCacheEntries {
-                    fileLoudnessCache = prunedVolumeCacheEntries(
-                        fileLoudnessCache,
-                        limit: maxVolumeCacheEntries
-                    )
-                }
-                return (fileLoudnessCache, volumeCacheEntryCapacity)
-            }
-            var snapshot = cacheState.entries
-            var entryCapacity = cacheState.entryCapacity
-            var storageConstrained = entryCapacity != nil
-            var payload = VolumeCacheFile(
-                version: volumeCacheFormatVersion,
-                entriesByPath: snapshot,
-                storageConstrained: storageConstrained,
-                entryCapacity: entryCapacity
-            )
-            var data = try JSONEncoder().encode(payload)
-
-            // Count bounds handle normal libraries; this loop makes the byte bound
-            // strict even when path lengths are highly uneven.
-            let original = snapshot
-            while data.count > maxVolumeCacheEncodedBytes, !snapshot.isEmpty {
-                let estimatedLimit = Int(
-                    Double(snapshot.count)
-                        * Double(maxVolumeCacheEncodedBytes)
-                        * 0.9
-                        / Double(data.count)
-                )
-                let nextLimit = max(0, min(snapshot.count - 1, estimatedLimit))
-                snapshot = prunedVolumeCacheEntries(snapshot, limit: nextLimit)
-                storageConstrained = true
-                entryCapacity = snapshot.count
-                payload = VolumeCacheFile(
-                    version: volumeCacheFormatVersion,
-                    entriesByPath: snapshot,
-                    storageConstrained: storageConstrained,
-                    entryCapacity: entryCapacity
-                )
-                data = try JSONEncoder().encode(payload)
-            }
-
-            if let knownCapacity = entryCapacity,
-               snapshot.count > knownCapacity,
-               data.count <= maxVolumeCacheEncodedBytes {
-                entryCapacity = snapshot.count
-                storageConstrained = true
-                payload = VolumeCacheFile(
-                    version: volumeCacheFormatVersion,
-                    entriesByPath: snapshot,
-                    storageConstrained: storageConstrained,
-                    entryCapacity: entryCapacity
-                )
-                data = try JSONEncoder().encode(payload)
-            }
-
-            let removedKeys = Set(original.keys).subtracting(snapshot.keys)
-            let count = withVolumeCacheLock { () -> Int in
-                    volumeCacheEntryCapacity = entryCapacity
-                    for key in removedKeys where fileLoudnessCache[key] == original[key] {
-                        fileLoudnessCache.removeValue(forKey: key)
-                    }
-                    return fileLoudnessCache.count
-            }
-            if snapshot.count != original.count {
+        if let store = volumeAnalysisStore {
+            switch store.save(measurement: measurement, for: url, snapshot: snapshotAfter) {
+            case .success(let count):
                 DispatchQueue.main.async { [weak self] in
                     self?.volumeNormalizationCacheCount = count
                 }
+            case .failure(let error):
+                // Persistence is an optimization; a valid in-memory result may
+                // still normalize the current playback request.
+                debugLog(error.message)
             }
-
-            try data.write(to: url, options: .atomic)
-            debugLog("保存了 \(snapshot.count) 个文件的响度缓存到磁盘")
-            return true
-        } catch {
-            debugLog("保存音量缓存失败: \(error)")
-            return false
         }
+
+        let integratedDescription = measurement.integratedLoudnessLUFS.map {
+            String(format: "%.2f", $0)
+        } ?? "silence"
+        debugLog(
+            "文件: \(url.lastPathComponent), integrated: "
+                + "\(integratedDescription) LUFS, "
+                + "estimated peak: \(measurement.estimatedTruePeakDbTP), "
+                + "目标: \(targetLUFS) LUFS"
+        )
+        return LoudnessNormalizationPolicy.outputVolume(
+            userVolume: 1,
+            measurement: measurement,
+            targetLUFS: targetLUFS
+        )
     }
 
-    func flushVolumeCachePersistence() {
-        invalidateScheduledVolumeCacheSave()
-        _ = volumeCachePersistenceQueue.sync { [weak self] in
-            self?.writeVolumeCacheNow()
+    func analyzeAudioLevel(
+        for url: URL,
+        cancellationCheck: (() -> Bool)? = nil
+    ) -> Result<LoudnessMeasurement, LoudnessAnalysisError> {
+        LoudnessAnalyzer.analyze(url: url, cancellationCheck: cancellationCheck)
+    }
+
+
+    @discardableResult
+    func clearVolumeCache(forceProtectedData: Bool = false) -> VolumeCacheClearResult {
+        cancelVolumeNormalizationPreanalysis()
+        _ = bumpPlaybackAnalysisGeneration()
+        _ = bumpVolumeCacheEpoch()
+        let result = volumeAnalysisStore?.clear(forceProtectedData: forceProtectedData)
+            ?? (volumeAnalysisPersistenceAvailable
+                ? .cleared(analysisCount: 0, failureCount: 0, removedProtectedLegacy: false)
+                : .failed("音量分析数据库不可用"))
+        if case .cleared = result {
+            clearSessionLoudnessCache()
+            DispatchQueue.main.async { [weak self] in
+                self?.volumeNormalizationCacheCount = 0
+            }
         }
+        return result
+    }
+
+    @discardableResult
+    func flushVolumeCachePersistence() -> VolumeCacheFlushResult {
+        volumeAnalysisStore?.flush()
+            ?? (volumeAnalysisPersistenceAvailable ? .flushed : .failed("音量分析数据库不可用"))
     }
 
     func hasVolumeNormalizationCache(for url: URL) -> Bool {
-        cachedLoudnessAndMigrate(for: url) != nil
+        cachedLoudnessMeasurement(for: url) != nil
     }
 
     func hasMissingVolumeNormalizationCache<URLs: Sequence>(in urls: URLs) -> Bool
     where URLs.Element == URL {
-        let now = Date().timeIntervalSince1970
-        let state = withVolumeCacheLock {
-            (
-                entries: fileLoudnessCache,
-                entryCapacity: volumeCacheEntryCapacity,
-                retryAfter: volumeAnalysisRetryAfter
-            )
-        }
-        let effectiveCapacity = min(
-            maxVolumeCacheEntries,
-            state.entryCapacity ?? maxVolumeCacheEntries
-        )
-        let canGrow = state.entries.count < effectiveCapacity
-        var orphanKeys = canGrow ? Set<String>() : Set(state.entries.keys)
-        var sawMissing = false
-        for url in urls {
-            let key = volumeCacheKey(for: url)
-            guard let entry = state.entries[key] else {
-                guard state.retryAfter[key, default: 0] <= now else { continue }
-                if canGrow { return true }
-                sawMissing = true
-                continue
-            }
-            orphanKeys.remove(key)
-            if !entry.hasFileSignature,
-               state.retryAfter[key, default: 0] <= now {
+        if let store = volumeAnalysisStore {
+            for url in urls
+            where cachedLoudnessMeasurement(for: url) == nil && store.shouldRetryAnalysis(for: url) {
                 return true
             }
+            return false
         }
-        return sawMissing && !orphanKeys.isEmpty
+        for url in urls where cachedLoudnessMeasurement(for: url) == nil {
+            return true
+        }
+        return false
     }
 
     var nextVolumeNormalizationRetryDate: Date? {
-        let now = Date().timeIntervalSince1970
-        let next = withVolumeCacheLock {
-            volumeAnalysisRetryAfter.values.filter { $0 > now }.min()
-        }
-        return next.map { Date(timeIntervalSince1970: $0) }
+        volumeAnalysisStore?.nextRetryDate
     }
 
-    func volumeNormalizationCacheKeysSnapshot() -> Set<String> {
-        withVolumeCacheLock {
-            Set(
-                fileLoudnessCache.compactMap { key, entry in
-                    entry.hasFileSignature ? key : nil
-                }
-            )
+    func volumeNormalizationValidCacheKeysAsync(for urls: [URL]) async -> Set<String> {
+        let store = volumeAnalysisStore
+        let persisted = await Task.detached(priority: .utility) {
+            store?.validPathKeys(for: urls) ?? []
+        }.value
+        var result = persisted
+        for url in urls where sessionLoudnessMeasurement(for: url) != nil {
+            result.insert(volumeCacheKey(for: url))
         }
+        return result
     }
 
     func startVolumeNormalizationPreanalysis<URLs: Sequence>(
@@ -3358,95 +3108,36 @@ extension AudioPlayer {
         volumePreanalysisTask?.cancel()
         volumePreanalysisTask = nil
 
-        let targets: [VolumePreanalysisTarget]
-        switch reason {
-        case .manual:
-            var seen = Set<String>()
-            targets = urls.compactMap { url in
-                guard seen.insert(volumeCacheKey(for: url)).inserted else { return nil }
-                return VolumePreanalysisTarget(url: url, evictCacheKeyOnSuccess: nil)
+        var seen = Set<String>()
+        var targets: [URL] = []
+        let limit = reason == .autoIdle ? 2 : Int.max
+        for url in urls {
+            let key = volumeCacheKey(for: url)
+            guard seen.insert(key).inserted,
+                  !hasVolumeNormalizationCache(for: url) else { continue }
+            if reason == .autoIdle,
+               let volumeAnalysisStore,
+               !volumeAnalysisStore.shouldRetryAnalysis(for: url) {
+                continue
             }
-        case .autoIdle:
-            let now = Date().timeIntervalSince1970
-            let state = withVolumeCacheLock {
-                volumeAnalysisRetryAfter = volumeAnalysisRetryAfter.filter { $0.value > now }
-                return (
-                    entries: fileLoudnessCache,
-                    retryAfter: volumeAnalysisRetryAfter,
-                    entryCapacity: volumeCacheEntryCapacity
-                )
-            }
-            let effectiveCapacity = min(
-                maxVolumeCacheEntries,
-                state.entryCapacity ?? maxVolumeCacheEntries
-            )
-            let canGrow = state.entries.count < effectiveCapacity
-            var orphanKeys = canGrow ? Set<String>() : Set(state.entries.keys)
-            var unsignedTargets: [(key: String, url: URL)] = []
-            var missingTargets: [(key: String, url: URL)] = []
-            var candidateKeys = Set<String>()
-            for url in urls {
-                let key = volumeCacheKey(for: url)
-                if let entry = state.entries[key] {
-                    orphanKeys.remove(key)
-                    guard !entry.hasFileSignature,
-                          unsignedTargets.count < 2,
-                          state.retryAfter[key, default: 0] <= now,
-                          candidateKeys.insert(key).inserted else { continue }
-                    unsignedTargets.append((key, url))
-                } else {
-                    guard missingTargets.count < 2,
-                          state.retryAfter[key, default: 0] <= now,
-                          candidateKeys.insert(key).inserted else { continue }
-                    missingTargets.append((key, url))
-                }
-                if canGrow, unsignedTargets.count + missingTargets.count >= 2 { break }
-            }
-
-            var selected = unsignedTargets.prefix(2).map {
-                VolumePreanalysisTarget(url: $0.url, evictCacheKeyOnSuccess: nil)
-            }
-            let remainingSlots = max(0, 2 - selected.count)
-            if remainingSlots > 0 {
-                if canGrow {
-                    selected.append(contentsOf: missingTargets.prefix(remainingSlots).map {
-                        VolumePreanalysisTarget(url: $0.url, evictCacheKeyOnSuccess: nil)
-                    })
-                } else if !orphanKeys.isEmpty {
-                    let desiredReplacements = min(remainingSlots, missingTargets.count, orphanKeys.count)
-                    let sortedOrphanKeys: [String] = orphanKeys.sorted { lhs, rhs in
-                        let lhsDate = state.entries[lhs]?.updatedAt ?? 0
-                        let rhsDate = state.entries[rhs]?.updatedAt ?? 0
-                        return lhsDate < rhsDate
-                    }
-                    let replacementTargets = zip(
-                        missingTargets.prefix(desiredReplacements),
-                        sortedOrphanKeys.prefix(desiredReplacements)
-                    ).map { missing, evictionKey in
-                        VolumePreanalysisTarget(
-                            url: missing.url,
-                            evictCacheKeyOnSuccess: evictionKey
-                        )
-                    }
-                    selected.append(contentsOf: replacementTargets)
-                }
-            }
-            targets = selected
+            targets.append(url)
+            if targets.count == limit { break }
         }
+
         guard !targets.isEmpty else {
+            volumePreanalysisStartReason = .manual
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                guard self.currentVolumePreanalysisGeneration() == generation else { return }
+                guard let self,
+                      self.currentVolumePreanalysisGeneration() == generation else { return }
                 self.isVolumePreanalysisRunning = false
                 self.volumePreanalysisCurrentFileName = ""
             }
-            volumePreanalysisStartReason = .manual
             return
         }
 
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            guard self.currentVolumePreanalysisGeneration() == generation else { return }
+            guard let self,
+                  self.currentVolumePreanalysisGeneration() == generation else { return }
             self.isVolumePreanalysisRunning = true
             self.volumePreanalysisTotal = targets.count
             self.volumePreanalysisCompleted = 0
@@ -3458,25 +3149,19 @@ extension AudioPlayer {
             let analysisQueue = self.normalizationQueue
             let playerBox = WeakAudioPlayerBox(player: self)
             var completed = 0
-            var analyzed = 0
-            var lastCheckpointAt = Date()
-            for target in targets {
-                let url = target.url
-                if Task.isCancelled { break }
-                if self.currentVolumePreanalysisGeneration() != generation { break }
+            for url in targets {
+                if Task.isCancelled
+                    || self.currentVolumePreanalysisGeneration() != generation { break }
                 await MainActor.run {
-                    if self.currentVolumePreanalysisGeneration() != generation { return }
+                    guard self.currentVolumePreanalysisGeneration() == generation else { return }
                     self.volumePreanalysisCurrentFileName = url.lastPathComponent
                 }
 
                 let result = await withCheckedContinuation {
                     (continuation: CheckedContinuation<VolumePreanalysisItemResult, Never>) in
                     analysisQueue.async { [playerBox] in
-                        guard let player = playerBox.player else {
-                            continuation.resume(returning: .failed)
-                            return
-                        }
-                        if player.currentVolumePreanalysisGeneration() != generation {
+                        guard let player = playerBox.player,
+                              player.currentVolumePreanalysisGeneration() == generation else {
                             continuation.resume(returning: .failed)
                             return
                         }
@@ -3486,66 +3171,34 @@ extension AudioPlayer {
                         }
                         _ = player.calculateNormalizedVolume(
                             for: url,
-                            persist: false,
                             cancellationCheck: { [playerBox] in
                                 guard let player = playerBox.player else { return true }
                                 return player.currentVolumePreanalysisGeneration() != generation
-                            },
-                            evictCacheKeyOnSuccess: target.evictCacheKeyOnSuccess
+                            }
                         )
-                        let key = player.volumeCacheKey(for: url)
-                        let didCache = player.withVolumeCacheLock {
-                            player.fileLoudnessCache[key] != nil
-                        }
-                        continuation.resume(returning: didCache ? .analyzed : .failed)
+                        continuation.resume(
+                            returning: player.hasVolumeNormalizationCache(for: url)
+                                ? .analyzed
+                                : .failed
+                        )
                     }
                 }
 
-                if Task.isCancelled { break }
-                if self.currentVolumePreanalysisGeneration() != generation { break }
+                if Task.isCancelled
+                    || self.currentVolumePreanalysisGeneration() != generation { break }
                 completed += 1
-                let key = self.volumeCacheKey(for: url)
-                switch result {
-                case .alreadyCached:
-                    break
-                case .analyzed:
-                    analyzed += 1
-                    self.withVolumeCacheLock { () -> Void in
-                        _ = self.volumeAnalysisRetryAfter.removeValue(forKey: key)
-                    }
-                case .failed:
-                    self.withVolumeCacheLock {
-                        self.volumeAnalysisRetryAfter[key] = Date().timeIntervalSince1970
-                            + self.failedVolumeAnalysisRetryDelay
-                        if self.volumeAnalysisRetryAfter.count > self.maxVolumeAnalysisRetryEntries {
-                            self.volumeAnalysisRetryAfter = Dictionary(
-                                uniqueKeysWithValues: self.volumeAnalysisRetryAfter
-                                    .sorted { $0.value > $1.value }
-                                    .prefix(self.maxVolumeAnalysisRetryEntries)
-                                    .map { ($0.key, $0.value) }
-                            )
-                        }
-                    }
-                }
-                if analyzed > 0,
-                   (analyzed.isMultiple(of: 16)
-                    || Date().timeIntervalSince(lastCheckpointAt) >= 60) {
-                    self.saveVolumeCache()
-                    lastCheckpointAt = Date()
-                }
                 let completedSnapshot = completed
-                let cacheCount = self.withVolumeCacheLock { self.fileLoudnessCache.count }
+                let cacheCount = self.volumeAnalysisStore?.analysisCount ?? 0
                 await MainActor.run {
-                    if self.currentVolumePreanalysisGeneration() != generation { return }
+                    guard self.currentVolumePreanalysisGeneration() == generation else { return }
                     self.volumePreanalysisCompleted = completedSnapshot
                     self.volumeNormalizationCacheCount = cacheCount
                 }
+                _ = result
             }
-            if analyzed > 0 {
-                self.saveVolumeCache()
-            }
+
             await MainActor.run {
-                if self.currentVolumePreanalysisGeneration() != generation { return }
+                guard self.currentVolumePreanalysisGeneration() == generation else { return }
                 self.volumePreanalysisTask = nil
                 self.isVolumePreanalysisRunning = false
                 self.volumePreanalysisCurrentFileName = ""
@@ -3558,29 +3211,42 @@ extension AudioPlayer {
         let generation = bumpVolumePreanalysisGeneration()
         volumePreanalysisTask?.cancel()
         volumePreanalysisTask = nil
-        saveVolumeCache()
         volumePreanalysisStartReason = .manual
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            guard self.currentVolumePreanalysisGeneration() == generation else { return }
+            guard let self,
+                  self.currentVolumePreanalysisGeneration() == generation else { return }
             self.isVolumePreanalysisRunning = false
             self.volumePreanalysisCurrentFileName = ""
         }
     }
 
-    /// 读取用户主音量设置
-    private func loadUserVolume() {
-        let userDefaults = UserDefaults.standard
-        if userDefaults.object(forKey: userVolumeKey) != nil {
-            let stored = userDefaults.float(forKey: userVolumeKey)
-            volume = max(0, min(1, stored))
-        }
+    private func loadCoherentPlayerPreferences() {
+        let preferences = appPreferencesStore.load()
+        volume = preferences.volume
+        playbackRate = preferences.playbackRate
+        playbackMode = PlaybackMode(rawValue: preferences.playbackMode.rawValue) ?? .shuffle
     }
 
-    /// 保存用户主音量设置
     private func saveUserVolume() {
-        let userDefaults = UserDefaults.standard
-        userDefaults.set(volume, forKey: userVolumeKey)
+        guard shouldPersistUserPreferences else { return }
+        guard appPreferencesStore.persistenceState == .writable else {
+            volume = appPreferencesStore.load().volume
+            notifyProtectedCoherentPreferencesIfNeeded()
+            return
+        }
+        _ = appPreferencesStore.update { $0.volume = volume }
+        appPreferencesStore.schedulePersistence()
+    }
+
+    private func savePlaybackRatePreference() {
+        guard shouldPersistUserPreferences else { return }
+        guard appPreferencesStore.persistenceState == .writable else {
+            playbackRate = appPreferencesStore.load().playbackRate
+            notifyProtectedCoherentPreferencesIfNeeded()
+            return
+        }
+        _ = appPreferencesStore.update { $0.playbackRate = playbackRate }
+        appPreferencesStore.schedulePersistence()
     }
 
     /// 加载用户的播放控制开关
@@ -3589,23 +3255,9 @@ extension AudioPlayer {
         if d.object(forKey: userNormalizationKey) != nil {
             isNormalizationEnabled = d.bool(forKey: userNormalizationKey)
         }
-        let legacyLooping = d.object(forKey: userLoopingKey) == nil
-            ? false
-            : d.bool(forKey: userLoopingKey)
-        let legacyShuffling = d.object(forKey: userShuffleKey) == nil
-            ? true
-            : d.bool(forKey: userShuffleKey)
-        playbackMode = Self.resolvedPlaybackMode(
-            storedRawValue: d.string(forKey: userPlaybackModeKey),
-            legacyLooping: legacyLooping,
-            legacyShuffling: legacyShuffling
-        )
         if d.object(forKey: userImmersivePlaybackEnabledKey) != nil {
             isImmersivePlaybackEnabled = d.bool(forKey: userImmersivePlaybackEnabledKey)
         }
-        // Persist the canonical value and complementary legacy keys together,
-        // so upgrades and downgrades cannot restore an invalid combination.
-        savePlaybackModePreference()
         updateLoopSetting()
     }
 
@@ -3615,10 +3267,31 @@ extension AudioPlayer {
     }
 
     private func savePlaybackModePreference() {
-        let d = UserDefaults.standard
-        d.set(playbackMode.rawValue, forKey: userPlaybackModeKey)
-        d.set(isLooping, forKey: userLoopingKey)
-        d.set(isShuffling, forKey: userShuffleKey)
+        guard shouldPersistUserPreferences,
+              let mode = AppPreferencesStore.PlaybackMode(rawValue: playbackMode.rawValue) else { return }
+        guard appPreferencesStore.persistenceState == .writable else {
+            playbackMode = PlaybackMode(rawValue: appPreferencesStore.load().playbackMode.rawValue) ?? .shuffle
+            updateLoopSetting()
+            notifyProtectedCoherentPreferencesIfNeeded()
+            return
+        }
+        _ = appPreferencesStore.update { $0.playbackMode = mode }
+        _ = appPreferencesStore.persist()
+    }
+
+    private func notifyProtectedCoherentPreferencesIfNeeded() {
+        guard !didNotifyProtectedCoherentPreferences else { return }
+        didNotifyProtectedCoherentPreferences = true
+        PersistenceLogger.notifyUser(
+            title: "播放器偏好处于只读保护模式",
+            subtitle: "设置已恢复为安全的持久值"
+        )
+    }
+
+    @discardableResult
+    func flushUserPreferencesPersistence() -> Result<Void, AppPreferencesStore.PersistenceError> {
+        guard shouldPersistUserPreferences else { return .success(()) }
+        return appPreferencesStore.flush()
     }
 
     private func saveImmersivePlaybackPreference() {
@@ -3651,38 +3324,6 @@ extension AudioPlayer {
         d.set(notifyDeviceSwitchSilent, forKey: userNotifyDeviceSwitchSilentKey)
     }
 
-    // MARK: - 文件路径辅助
-    private func appSupportDirectory() -> URL? {
-        let fm = FileManager.default
-        guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            return nil
-        }
-        let dir = base.appendingPathComponent("MusicPlayer", isDirectory: true)
-        if !fm.fileExists(atPath: dir.path) {
-            do {
-                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            } catch {
-                debugLog("创建应用支持目录失败: \(error)")
-                return nil
-            }
-        }
-        return dir
-    }
-
-    private func volumeCacheURL() -> URL? {
-        guard !disablesVolumeCachePersistence else { return nil }
-        if let volumeCacheFileURLOverride {
-            let directory = volumeCacheFileURLOverride.deletingLastPathComponent()
-            if !FileManager.default.fileExists(atPath: directory.path) {
-                try? FileManager.default.createDirectory(
-                    at: directory,
-                    withIntermediateDirectories: true
-                )
-            }
-            return volumeCacheFileURLOverride
-        }
-        return appSupportDirectory()?.appendingPathComponent(volumeCacheFileName, isDirectory: false)
-    }
 }
 
 extension Notification.Name {

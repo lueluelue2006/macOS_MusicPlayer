@@ -277,7 +277,10 @@ final class PlaybackWeightsTests: XCTestCase {
 
             let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
             XCTAssertEqual(weights.level(for: trackURL, scope: .queue), .green)
-            weights.flushPersistence()
+            XCTAssertEqual(
+                weights.flushPersistence().outcome,
+                .rejectedReadOnly(.unsupportedVersion(99))
+            )
 
             XCTAssertEqual(try Data(contentsOf: cacheURL), originalData)
         }
@@ -366,7 +369,8 @@ final class PlaybackWeightsTests: XCTestCase {
             if case .quarantinedCorrupt(let backupURL) = weights.persistenceState {
                 XCTAssertTrue(FileManager.default.fileExists(atPath: backupURL.path))
                 XCTAssertEqual(try Data(contentsOf: backupURL), corruptData)
-                XCTAssertTrue(backupURL.lastPathComponent.hasPrefix("playback-weights.quarantined-"))
+                XCTAssertEqual(backupURL.deletingLastPathComponent().lastPathComponent, "CacheQuarantine")
+                XCTAssertTrue(backupURL.lastPathComponent.hasPrefix("playback-weights.corrupt."))
             } else {
                 XCTFail("Expected quarantinedCorrupt state, got \(weights.persistenceState)")
             }
@@ -413,6 +417,131 @@ final class PlaybackWeightsTests: XCTestCase {
         }
     }
 
+    func testOversizedCacheRemainsByteForByteAndReadOnly() throws {
+        try withTemporaryCache { cacheURL, directory in
+            FileManager.default.createFile(atPath: cacheURL.path, contents: Data("oversized".utf8))
+            let handle = try FileHandle(forWritingTo: cacheURL)
+            try handle.truncate(atOffset: UInt64(16 * 1_024 * 1_024 + 1))
+            try handle.close()
+            let originalFingerprint = try streamingFingerprint(of: cacheURL)
+
+            let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            XCTAssertEqual(weights.persistenceState, .readOnlyPreserved(.unreadable))
+            XCTAssertEqual(
+                weights.setLevel(.red, for: directory.appendingPathComponent("track.mp3"), scope: .queue),
+                .rejectedReadOnly(.unreadable)
+            )
+            let flush = weights.flushPersistence()
+            XCTAssertEqual(flush.outcome, .rejectedReadOnly(.unreadable))
+            let finalFingerprint = try streamingFingerprint(of: cacheURL)
+            XCTAssertEqual(finalFingerprint.byteCount, originalFingerprint.byteCount)
+            XCTAssertEqual(finalFingerprint.hash, originalFingerprint.hash)
+        }
+    }
+
+    func testSymlinkCacheAndTargetRemainUnchangedAndReadOnly() throws {
+        try withTemporaryCache { cacheURL, directory in
+            let targetURL = directory.appendingPathComponent("target.json")
+            let targetData = Data(#"{"version":3,"queueLevels":{},"playlistLevels":{}}"#.utf8)
+            try targetData.write(to: targetURL)
+            try FileManager.default.createSymbolicLink(
+                at: cacheURL,
+                withDestinationURL: targetURL
+            )
+
+            let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            XCTAssertEqual(weights.persistenceState, .readOnlyPreserved(.unreadable))
+            XCTAssertEqual(
+                weights.setLevel(.red, for: directory.appendingPathComponent("track.mp3"), scope: .queue),
+                .rejectedReadOnly(.unreadable)
+            )
+            XCTAssertEqual(weights.flushPersistence().outcome, .rejectedReadOnly(.unreadable))
+            XCTAssertEqual(try Data(contentsOf: targetURL), targetData)
+            XCTAssertEqual(
+                try FileManager.default.destinationOfSymbolicLink(atPath: cacheURL.path),
+                targetURL.path
+            )
+        }
+    }
+
+    func testSemanticInvariantViolationIsQuarantined() throws {
+        let invalidFixtures = [
+            Data(#"{"version":3,"queueLevels":{"relative.mp3":5},"playlistLevels":{}}"#.utf8),
+            Data(#"{"version":3,"queueLevels":{"/track.mp3":99},"playlistLevels":{}}"#.utf8),
+            Data(#"{"version":3,"queueLevels":{},"playlistLevels":{"not-a-uuid":{"/track.mp3":5}}}"#.utf8),
+        ]
+
+        for originalData in invalidFixtures {
+            try withTemporaryCache { cacheURL, _ in
+                try originalData.write(to: cacheURL)
+                let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
+                guard case .quarantinedCorrupt(let backupURL) = weights.persistenceState else {
+                    return XCTFail("Expected invariant violation to be quarantined")
+                }
+                XCTAssertEqual(try Data(contentsOf: backupURL), originalData)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: cacheURL.path))
+            }
+        }
+    }
+
+    func testQuarantineRetentionIsBoundedAndKeepsNewestDestination() throws {
+        try withTemporaryCache { cacheURL, directory in
+            var newestBackupURL: URL?
+            var newestData = Data()
+            for index in 0 ..< 3 {
+                newestData = Data("corrupt-\(index)".utf8)
+                try newestData.write(to: cacheURL)
+                let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
+                guard case .quarantinedCorrupt(let backupURL) = weights.persistenceState else {
+                    return XCTFail("Expected corrupt cache to be quarantined")
+                }
+                newestBackupURL = backupURL
+            }
+
+            let quarantineDirectory = directory.appendingPathComponent("CacheQuarantine")
+            let retained = try FileManager.default.contentsOfDirectory(
+                at: quarantineDirectory,
+                includingPropertiesForKeys: nil
+            ).filter { $0.lastPathComponent.hasPrefix("playback-weights.corrupt.") }
+            XCTAssertEqual(retained.count, 2)
+            let newest = try XCTUnwrap(newestBackupURL)
+            XCTAssertTrue(
+                retained.contains { $0.lastPathComponent == newest.lastPathComponent }
+            )
+            XCTAssertEqual(try Data(contentsOf: newest), newestData)
+        }
+    }
+
+    func testSecureDefaultWriterUsesPrivatePermissions() throws {
+        try withTemporaryCache { cacheURL, directory in
+            let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            XCTAssertEqual(
+                weights.setLevel(.red, for: directory.appendingPathComponent("track.mp3"), scope: .queue),
+                .applied
+            )
+            XCTAssertTrue(weights.flushPersistence().isDurable)
+
+            let fileAttributes = try FileManager.default.attributesOfItem(atPath: cacheURL.path)
+            let directoryAttributes = try FileManager.default.attributesOfItem(atPath: directory.path)
+            XCTAssertEqual((fileAttributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+            XCTAssertEqual((directoryAttributes[.posixPermissions] as? NSNumber)?.intValue, 0o700)
+        }
+    }
+
+    func testOversizedRuntimePathIsRejectedWithoutDirtyingPersistence() throws {
+        try withTemporaryCache { cacheURL, _ in
+            let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            let oversizedPath = "/" + String(repeating: "a", count: 16 * 1_024)
+            XCTAssertEqual(
+                weights.setLevelRaw(Int.max, forKey: oversizedPath, scope: .queue),
+                .rejectedReadOnly(.capacityExceeded)
+            )
+            XCTAssertFalse(weights.hasPendingPersistence)
+            XCTAssertEqual(weights.flushPersistence().outcome, .alreadyCurrent)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: cacheURL.path))
+        }
+    }
+
     func testFlushPreventsCancelledDebounceFromWritingAgain() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "musicplayer-playback-weights-flush-\(UUID().uuidString)",
@@ -439,6 +568,202 @@ final class PlaybackWeightsTests: XCTestCase {
         XCTAssertEqual(try decodeEnvelope(at: cacheURL), marker)
     }
 
+    func testBatchTrackRemovalAcrossPlaylistsPublishesOnceAndPersists() async throws {
+        try await withTemporaryCacheAsync { cacheURL, directory in
+            let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            let firstPlaylistID = UUID()
+            let secondPlaylistID = UUID()
+            let firstURL = directory.appendingPathComponent("first.mp3")
+            let secondURL = directory.appendingPathComponent("second.mp3")
+            let thirdURL = directory.appendingPathComponent("third.mp3")
+
+            _ = weights.setLevel(.red, for: firstURL, scope: .playlist(firstPlaylistID))
+            _ = weights.setLevel(.gold, for: secondURL, scope: .playlist(firstPlaylistID))
+            _ = weights.setLevel(.purple, for: thirdURL, scope: .playlist(secondPlaylistID))
+            _ = weights.flushPersistence()
+
+            let notification = expectation(description: "one batch notification")
+            notification.assertForOverFulfill = true
+            let token = NotificationCenter.default.addObserver(
+                forName: .playbackWeightsDidChange,
+                object: weights,
+                queue: nil
+            ) { _ in
+                notification.fulfill()
+            }
+            defer { NotificationCenter.default.removeObserver(token) }
+
+            let startingRevision = weights.revision
+            let result = weights.removeTracks([
+                .init(playlistID: firstPlaylistID, trackURLs: [firstURL, secondURL, firstURL]),
+                .init(playlistID: secondPlaylistID, trackURLs: [thirdURL]),
+            ])
+
+            XCTAssertEqual(result, .applied)
+            XCTAssertEqual(weights.revision, startingRevision + 1)
+            await fulfillment(of: [notification], timeout: 1.0)
+            XCTAssertEqual(weights.level(for: firstURL, scope: .playlist(firstPlaylistID)), .green)
+            XCTAssertEqual(weights.level(for: secondURL, scope: .playlist(firstPlaylistID)), .green)
+            XCTAssertEqual(weights.level(for: thirdURL, scope: .playlist(secondPlaylistID)), .green)
+
+            let flush = weights.flushPersistence()
+            XCTAssertTrue(flush.isDurable)
+            let reloaded = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            XCTAssertEqual(reloaded.level(for: firstURL, scope: .playlist(firstPlaylistID)), .green)
+            XCTAssertEqual(reloaded.level(for: thirdURL, scope: .playlist(secondPlaylistID)), .green)
+        }
+    }
+
+    func testBatchPlaylistRemovalPublishesOnceAndPersists() throws {
+        try withTemporaryCache { cacheURL, directory in
+            let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            let firstPlaylistID = UUID()
+            let secondPlaylistID = UUID()
+            let retainedPlaylistID = UUID()
+            let trackURL = directory.appendingPathComponent("playlist-batch.mp3")
+
+            _ = weights.setLevel(.red, for: trackURL, scope: .playlist(firstPlaylistID))
+            _ = weights.setLevel(.gold, for: trackURL, scope: .playlist(secondPlaylistID))
+            _ = weights.setLevel(.purple, for: trackURL, scope: .playlist(retainedPlaylistID))
+            _ = weights.flushPersistence()
+
+            let startingRevision = weights.revision
+            let result = weights.removePlaylists([
+                firstPlaylistID,
+                secondPlaylistID,
+                firstPlaylistID,
+            ])
+
+            XCTAssertEqual(result, .applied)
+            XCTAssertEqual(weights.revision, startingRevision + 1)
+            XCTAssertEqual(weights.level(for: trackURL, scope: .playlist(firstPlaylistID)), .green)
+            XCTAssertEqual(weights.level(for: trackURL, scope: .playlist(secondPlaylistID)), .green)
+            XCTAssertEqual(weights.level(for: trackURL, scope: .playlist(retainedPlaylistID)), .purple)
+            XCTAssertTrue(weights.flushPersistence().isDurable)
+
+            let envelope = try decodeEnvelope(at: cacheURL)
+            XCTAssertNil(envelope.playlistLevels[firstPlaylistID.uuidString])
+            XCTAssertNil(envelope.playlistLevels[secondPlaylistID.uuidString])
+            XCTAssertNotNil(envelope.playlistLevels[retainedPlaylistID.uuidString])
+        }
+    }
+
+    func testBatchRekeyMovesEveryScopeOnceAndPreservesDestinationOverride() throws {
+        try withTemporaryCache { cacheURL, directory in
+            let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            let playlistID = UUID()
+            let oldURL = directory.appendingPathComponent("before.mp3")
+            let newURL = directory.appendingPathComponent("after.mp3")
+
+            _ = weights.setLevel(.white, for: oldURL, scope: .queue)
+            _ = weights.setLevel(.red, for: oldURL, scope: .playlist(playlistID))
+            _ = weights.setLevel(.gold, for: newURL, scope: .playlist(playlistID))
+            _ = weights.flushPersistence()
+
+            let startingRevision = weights.revision
+            let result = weights.rekeyTracks([
+                .init(oldURL: oldURL, newURL: newURL),
+                .init(oldURL: oldURL, newURL: newURL),
+            ])
+
+            XCTAssertEqual(result, .applied)
+            XCTAssertEqual(weights.revision, startingRevision + 1)
+            XCTAssertEqual(weights.level(for: oldURL, scope: .queue), .green)
+            XCTAssertEqual(weights.level(for: newURL, scope: .queue), .white)
+            XCTAssertEqual(weights.level(for: oldURL, scope: .playlist(playlistID)), .green)
+            XCTAssertEqual(weights.level(for: newURL, scope: .playlist(playlistID)), .gold)
+            XCTAssertTrue(weights.flushPersistence().isDurable)
+
+            let reloaded = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            XCTAssertEqual(reloaded.level(for: newURL, scope: .queue), .white)
+            XCTAssertEqual(reloaded.level(for: newURL, scope: .playlist(playlistID)), .gold)
+        }
+    }
+
+    func testWriteFailureKeepsDirtyGenerationAndNextFlushRetries() throws {
+        try withTemporaryCache { cacheURL, directory in
+            let writer = FailOncePlaybackWeightsWriter()
+            let weights = PlaybackWeights(
+                cacheFileURLOverride: cacheURL,
+                fileWriter: writer.write,
+                persistenceDebounceInterval: 60,
+                maximumAutomaticRetryAttempts: 0
+            )
+            let trackURL = directory.appendingPathComponent("retry.mp3")
+
+            _ = weights.setLevel(.red, for: trackURL, scope: .queue)
+            let failed = weights.flushPersistence()
+
+            XCTAssertEqual(failed.outcome, .failed(.writeFailed))
+            XCTAssertEqual(failed.attemptedGeneration, 1)
+            XCTAssertEqual(failed.durableGeneration, 0)
+            XCTAssertTrue(failed.hasPendingChanges)
+            XCTAssertTrue(weights.hasPendingPersistence)
+
+            let retried = weights.flushPersistence()
+            XCTAssertEqual(retried.outcome, .persisted)
+            XCTAssertEqual(retried.attemptedGeneration, 1)
+            XCTAssertEqual(retried.durableGeneration, 1)
+            XCTAssertFalse(retried.hasPendingChanges)
+            XCTAssertTrue(retried.isDurable)
+            XCTAssertFalse(weights.hasPendingPersistence)
+
+            let reloaded = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            XCTAssertEqual(reloaded.level(for: trackURL, scope: .queue), .red)
+        }
+    }
+
+    func testFailedDebouncedWriteAutomaticallyRetriesDirtyGeneration() async throws {
+        try await withTemporaryCacheAsync { cacheURL, directory in
+            let writer = FailOncePlaybackWeightsWriter()
+            let weights = PlaybackWeights(
+                cacheFileURLOverride: cacheURL,
+                fileWriter: writer.write,
+                persistenceDebounceInterval: 0.01,
+                persistenceRetryBaseInterval: 0.01,
+                maximumAutomaticRetryAttempts: 1
+            )
+            let trackURL = directory.appendingPathComponent("automatic-retry.mp3")
+
+            _ = weights.setLevel(.blue, for: trackURL, scope: .queue)
+
+            let deadline = Date().addingTimeInterval(1)
+            while weights.hasPendingPersistence && Date() < deadline {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+
+            XCTAssertFalse(weights.hasPendingPersistence)
+            XCTAssertEqual(writer.attemptCount, 2)
+            let reloaded = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            XCTAssertEqual(reloaded.level(for: trackURL, scope: .queue), .blue)
+        }
+    }
+
+    func testBackgroundMutationPublishesNotificationOnMainThread() async throws {
+        try await withTemporaryCacheAsync { cacheURL, directory in
+            let weights = PlaybackWeights(cacheFileURLOverride: cacheURL)
+            let trackURL = directory.appendingPathComponent("background.mp3")
+            let notification = expectation(description: "main-thread notification")
+            let token = NotificationCenter.default.addObserver(
+                forName: .playbackWeightsDidChange,
+                object: weights,
+                queue: nil
+            ) { _ in
+                XCTAssertTrue(Thread.isMainThread)
+                notification.fulfill()
+            }
+            defer { NotificationCenter.default.removeObserver(token) }
+
+            DispatchQueue.global(qos: .utility).async {
+                _ = weights.setLevel(.red, for: trackURL, scope: .queue)
+            }
+
+            await fulfillment(of: [notification], timeout: 1.0)
+            XCTAssertEqual(weights.revision, 1)
+            XCTAssertTrue(weights.flushPersistence().isDurable)
+        }
+    }
+
     private func withTemporaryCache(
         _ body: (URL, URL) throws -> Void
     ) throws {
@@ -451,7 +776,63 @@ final class PlaybackWeightsTests: XCTestCase {
         try body(directory.appendingPathComponent("playback-weights.json"), directory)
     }
 
+    private func withTemporaryCacheAsync(
+        _ body: (URL, URL) async throws -> Void
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-playback-weights-async-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try await body(directory.appendingPathComponent("playback-weights.json"), directory)
+    }
+
     private func decodeEnvelope(at url: URL) throws -> CacheEnvelope {
         try JSONDecoder().decode(CacheEnvelope.self, from: Data(contentsOf: url))
+    }
+
+    private func streamingFingerprint(of url: URL) throws -> (byteCount: UInt64, hash: UInt64) {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var byteCount: UInt64 = 0
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        while let chunk = try handle.read(upToCount: 64 * 1_024), !chunk.isEmpty {
+            byteCount += UInt64(chunk.count)
+            for byte in chunk {
+                hash ^= UInt64(byte)
+                hash &*= 1_099_511_628_211
+            }
+        }
+        return (byteCount, hash)
+    }
+}
+
+private final class FailOncePlaybackWeightsWriter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var shouldFail = true
+    private var _attemptCount = 0
+
+    var attemptCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _attemptCount
+    }
+
+    func write(_ data: Data, to url: URL) throws {
+        lock.lock()
+        _attemptCount += 1
+        let failThisAttempt = shouldFail
+        shouldFail = false
+        lock.unlock()
+
+        if failThisAttempt {
+            throw NSError(
+                domain: NSCocoaErrorDomain,
+                code: NSFileWriteOutOfSpaceError,
+                userInfo: nil
+            )
+        }
+        try data.write(to: url, options: .atomic)
     }
 }

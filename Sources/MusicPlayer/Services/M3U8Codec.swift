@@ -3,6 +3,10 @@ import Foundation
 /// M3U8 playlist codec for import/export.
 /// Supports UTF-8 with BOM, CRLF/LF line endings, relative and absolute paths.
 enum M3U8Codec {
+    private static let maximumLineCount = 100_000
+    private static let maximumEntryCount = 50_000
+    private static let maximumIssueCount = 2_000
+    private static let maximumLineBytes = 16 * 1_024
 
     struct ParsedEntry {
         let path: String
@@ -19,6 +23,7 @@ enum M3U8Codec {
     struct ParseResult {
         let entries: [ParsedEntry]
         let issues: [ParseIssue]
+        let wasTruncated: Bool
     }
 
     // MARK: - Export
@@ -71,110 +76,135 @@ enum M3U8Codec {
     static func parse(_ content: String, baseURL: URL? = nil) -> ParseResult {
         var entries: [ParsedEntry] = []
         var issues: [ParseIssue] = []
-
-        // Strip UTF-8 BOM if present
         let strippedContent = content.hasPrefix("\u{FEFF}") ? String(content.dropFirst()) : content
+        var seenPaths: [String: Int] = [:]
+        var lineNumber = 0
+        var wasTruncated = false
+        strippedContent.enumerateLines { line, stop in
+            lineNumber += 1
+            guard lineNumber <= maximumLineCount else {
+                wasTruncated = true
+                stop = true
+                return
+            }
+            guard entries.count < maximumEntryCount else {
+                wasTruncated = true
+                stop = true
+                return
+            }
+            processImportLine(
+                line,
+                lineNumber: lineNumber,
+                baseURL: baseURL,
+                seenPaths: &seenPaths,
+                entries: &entries,
+                issues: &issues
+            )
+        }
 
-        // Normalize line endings: CRLF and CR -> LF
-        let normalized = strippedContent
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
+        return ParseResult(entries: entries, issues: issues, wasTruncated: wasTruncated)
+    }
 
-        // Split by LF
-        let lines = normalized.components(separatedBy: "\n")
+    private static func processImportLine(
+        _ line: String,
+        lineNumber: Int,
+        baseURL: URL?,
+        seenPaths: inout [String: Int],
+        entries: inout [ParsedEntry],
+        issues: inout [ParseIssue]
+    ) {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { return }
+        guard trimmed.utf8.count <= maximumLineBytes else {
+            appendIssue(
+                ParseIssue(
+                    lineNumber: lineNumber,
+                    content: String(trimmed.prefix(256)),
+                    reason: "条目过长 (entry too long)",
+                    firstOccurrenceLineNumber: nil
+                ),
+                to: &issues
+            )
+            return
+        }
 
-        // Track seen paths for duplicate detection
-        var seenPaths: [String: Int] = [:] // canonical path -> first line number
-
-        for (index, line) in lines.enumerated() {
-            let lineNumber = index + 1
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-
-            // Skip empty lines
-            guard !trimmed.isEmpty else { continue }
-
-            // Skip comments (#EXTM3U, #EXTINF, # comments, etc.)
-            guard !trimmed.hasPrefix("#") else { continue }
-
-            // Check for URI scheme (case-insensitive)
-            if let colonIndex = trimmed.firstIndex(of: ":"),
-               colonIndex != trimmed.startIndex {
-                let schemeCandidate = String(trimmed[..<colonIndex])
-
-                // RFC 3986: scheme must start with ASCII letter, followed by letter/digit/+/-/.
-                guard let firstChar = schemeCandidate.first,
-                      firstChar.isASCII && firstChar.isLetter else {
-                    // Not a valid scheme, treat as local path
-                    let absolutePath = resolveLocalPath(trimmed, baseURL: baseURL)
-                    processEntry(absolutePath, trimmed, lineNumber, &seenPaths, &entries, &issues)
-                    continue
-                }
-
-                // Check if remaining characters are valid for scheme
+        if let colonIndex = trimmed.firstIndex(of: ":"), colonIndex != trimmed.startIndex {
+            let schemeCandidate = String(trimmed[..<colonIndex])
+            if let first = schemeCandidate.first, first.isASCII, first.isLetter {
                 let isScheme = schemeCandidate.allSatisfy {
                     $0.isLetter || $0.isNumber || $0 == "+" || $0 == "-" || $0 == "."
                 }
-
                 if isScheme {
-                    let schemeLower = schemeCandidate.lowercased()
-
-                    if schemeLower == "file" {
-                        // file:// URL - validate it's local
-                        if let url = URL(string: trimmed), url.scheme?.lowercased() == "file" {
-                            // Reject file URLs with explicit non-local host
-                            if let host = url.host, !host.isEmpty {
-                                let hostLower = host.lowercased()
-                                if hostLower != "localhost" {
-                                    issues.append(ParseIssue(
-                                        lineNumber: lineNumber,
-                                        content: trimmed,
-                                        reason: "不支持非本地 file:// URL (non-local file:// URL not supported)",
-                                        firstOccurrenceLineNumber: nil
-                                    ))
-                                    continue
-                                }
-                            }
-
-                            // Local file URL is valid, extract path
-                            let absolutePath = url.path
-                            processEntry(absolutePath, trimmed, lineNumber, &seenPaths, &entries, &issues)
-                            continue
-                        } else {
-                            issues.append(ParseIssue(
-                                lineNumber: lineNumber,
-                                content: trimmed,
-                                reason: "无效的 file:// URL (invalid file:// URL)",
-                                firstOccurrenceLineNumber: nil
-                            ))
-                            continue
+                    let scheme = schemeCandidate.lowercased()
+                    if scheme == "file" {
+                        guard let url = URL(string: trimmed),
+                              url.scheme?.lowercased() == "file" else {
+                            appendIssue(
+                                ParseIssue(
+                                    lineNumber: lineNumber,
+                                    content: trimmed,
+                                    reason: "无效的 file:// URL (invalid file:// URL)",
+                                    firstOccurrenceLineNumber: nil
+                                ),
+                                to: &issues
+                            )
+                            return
                         }
-                    } else if schemeLower == "http" || schemeLower == "https" {
-                        issues.append(ParseIssue(
-                            lineNumber: lineNumber,
-                            content: trimmed,
-                            reason: "不支持远程 URL (remote URL not supported)",
-                            firstOccurrenceLineNumber: nil
-                        ))
-                        continue
-                    } else {
-                        // Any other scheme (ftp, smb, rtsp, etc.)
-                        issues.append(ParseIssue(
-                            lineNumber: lineNumber,
-                            content: trimmed,
-                            reason: "不支持的 URL scheme (unsupported URL scheme)",
-                            firstOccurrenceLineNumber: nil
-                        ))
-                        continue
+                        if let host = url.host,
+                           !host.isEmpty,
+                           host.lowercased() != "localhost" {
+                            appendIssue(
+                                ParseIssue(
+                                    lineNumber: lineNumber,
+                                    content: trimmed,
+                                    reason: "不支持非本地 file:// URL (non-local file:// URL not supported)",
+                                    firstOccurrenceLineNumber: nil
+                                ),
+                                to: &issues
+                            )
+                            return
+                        }
+                        processEntry(
+                            url.path,
+                            trimmed,
+                            lineNumber,
+                            &seenPaths,
+                            &entries,
+                            &issues
+                        )
+                        return
                     }
+                    let reason = (scheme == "http" || scheme == "https")
+                        ? "不支持远程 URL (remote URL not supported)"
+                        : "不支持的 URL scheme (unsupported URL scheme)"
+                    appendIssue(
+                        ParseIssue(
+                            lineNumber: lineNumber,
+                            content: trimmed,
+                            reason: reason,
+                            firstOccurrenceLineNumber: nil
+                        ),
+                        to: &issues
+                    )
+                    return
                 }
             }
-
-            // No scheme or Windows-style path (C:/) - treat as local path
-            let absolutePath = resolveLocalPath(trimmed, baseURL: baseURL)
-            processEntry(absolutePath, trimmed, lineNumber, &seenPaths, &entries, &issues)
         }
 
-        return ParseResult(entries: entries, issues: issues)
+        let absolutePath = resolveLocalPath(trimmed, baseURL: baseURL)
+        processEntry(
+            absolutePath,
+            trimmed,
+            lineNumber,
+            &seenPaths,
+            &entries,
+            &issues
+        )
+    }
+
+    private static func appendIssue(_ issue: ParseIssue, to issues: inout [ParseIssue]) {
+        guard issues.count < maximumIssueCount else { return }
+        issues.append(issue)
     }
 
     // MARK: - Helpers
@@ -208,12 +238,15 @@ enum M3U8Codec {
 
         // Check for duplicates
         if let firstLine = seenPaths[canonicalPath] {
-            issues.append(ParseIssue(
-                lineNumber: lineNumber,
-                content: originalContent,
-                reason: "重复条目 (duplicate entry)",
-                firstOccurrenceLineNumber: firstLine
-            ))
+            appendIssue(
+                ParseIssue(
+                    lineNumber: lineNumber,
+                    content: originalContent,
+                    reason: "重复条目 (duplicate entry)",
+                    firstOccurrenceLineNumber: firstLine
+                ),
+                to: &issues
+            )
         } else {
             seenPaths[canonicalPath] = lineNumber
         }

@@ -4,316 +4,346 @@ import XCTest
 
 @MainActor
 final class VolumeNormalizationCacheTests: XCTestCase {
-    func testReplacingFileAtSamePathInvalidatesCachedLoudness() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "musicplayer-volume-cache-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
+    private final class Clock: @unchecked Sendable {
+        var value: TimeInterval
 
-        let audioURL = directory.appendingPathComponent("fixture.wav")
-        try writeWAV(to: audioURL, amplitude: 0.08)
-
-        let player = AudioPlayer(
-            volumeCacheFileURLOverride: directory.appendingPathComponent("volume-cache.json")
-        )
-        let quietGain = player.calculateNormalizedVolume(for: audioURL, persist: false)
-        XCTAssertTrue(player.hasVolumeNormalizationCache(for: audioURL))
-
-        let originalAttributes = try FileManager.default.attributesOfItem(atPath: audioURL.path)
-        let originalDate = try XCTUnwrap(originalAttributes[.modificationDate] as? Date)
-        let originalSize = try XCTUnwrap(originalAttributes[.size] as? NSNumber)
-        let originalIdentifier = try XCTUnwrap(originalAttributes[.systemFileNumber] as? NSNumber)
-
-        let replacementURL = directory.appendingPathComponent("replacement.wav")
-        try writeWAV(to: replacementURL, amplitude: 0.50)
-        try FileManager.default.setAttributes(
-            [.modificationDate: originalDate],
-            ofItemAtPath: replacementURL.path
-        )
-        try FileManager.default.removeItem(at: audioURL)
-        try FileManager.default.moveItem(at: replacementURL, to: audioURL)
-
-        let replacementAttributes = try FileManager.default.attributesOfItem(atPath: audioURL.path)
-        XCTAssertEqual(replacementAttributes[.size] as? NSNumber, originalSize)
-        let replacementDate = try XCTUnwrap(replacementAttributes[.modificationDate] as? Date)
-        XCTAssertEqual(replacementDate.timeIntervalSince1970, originalDate.timeIntervalSince1970, accuracy: 0.001)
-        XCTAssertNotEqual(replacementAttributes[.systemFileNumber] as? NSNumber, originalIdentifier)
-
-        XCTAssertFalse(player.hasVolumeNormalizationCache(for: audioURL))
-        let loudGain = player.calculateNormalizedVolume(for: audioURL, persist: false)
-        XCTAssertLessThan(loudGain, quietGain)
-    }
-
-    func testV2MigrationPreservesNonnegativeLoudnessValues() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "musicplayer-volume-cache-migration-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-
-        let audioURL = directory.appendingPathComponent("zero-db.wav")
-        let cacheURL = directory.appendingPathComponent("volume-cache.json")
-        let legacyPayload: [String: Any] = [
-            "version": 2,
-            "loudnessDbByPath": [audioURL.path: 0.0]
-        ]
-        try JSONSerialization.data(withJSONObject: legacyPayload).write(to: cacheURL)
-
-        let player = AudioPlayer(volumeCacheFileURLOverride: cacheURL)
-        player.flushVolumeCachePersistence()
-
-        let payload = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as? [String: Any]
-        )
-        XCTAssertEqual(payload["version"] as? Int, 3)
-        let entries = try XCTUnwrap(payload["entriesByPath"] as? [String: Any])
-        let entry = try XCTUnwrap(entries[PathKey.canonical(for: audioURL)] as? [String: Any])
-        let loudnessDb = try XCTUnwrap(entry["loudnessDb"] as? Double)
-        XCTAssertEqual(loudnessDb, 0.0, accuracy: 0.000_1)
-    }
-
-    func testV3SignedCacheReloadsAcrossAudioPlayerInstances() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "musicplayer-volume-cache-cold-start-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-
-        let audioURL = directory.appendingPathComponent("fixture.wav")
-        let cacheURL = directory.appendingPathComponent("volume-cache.json")
-        try writeWAV(to: audioURL, amplitude: 0.12)
-
-        let analyzedGain: Float
-        do {
-            let analyzingPlayer = AudioPlayer(volumeCacheFileURLOverride: cacheURL)
-            analyzedGain = analyzingPlayer.calculateNormalizedVolume(for: audioURL, persist: true)
-            XCTAssertTrue(analyzingPlayer.hasVolumeNormalizationCache(for: audioURL))
-            analyzingPlayer.flushVolumeCachePersistence()
+        init(_ value: TimeInterval) {
+            self.value = value
         }
-
-        XCTAssertTrue(FileManager.default.fileExists(atPath: cacheURL.path))
-        let reloadedPlayer = AudioPlayer(volumeCacheFileURLOverride: cacheURL)
-        XCTAssertTrue(reloadedPlayer.hasVolumeNormalizationCache(for: audioURL))
-        let reloadedGain = reloadedPlayer.calculateNormalizedVolume(for: audioURL, persist: false)
-        XCTAssertEqual(reloadedGain, analyzedGain, accuracy: 0.000_1)
     }
 
-    func testAutoIdlePreanalysisProcessesAtMostTwoFiles() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "musicplayer-auto-idle-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
+    func testSQLiteStoreReloadsCurrentMeasurementAndRejectsReplacedFile() throws {
+        try withTemporaryDirectory { directory in
+            let databaseURL = directory.appendingPathComponent("volume.sqlite3")
+            let audioURL = directory.appendingPathComponent("fixture.bin")
+            try Data(repeating: 1, count: 32).write(to: audioURL)
+            let snapshot = FileValidationSnapshot.load(for: audioURL)
 
-        let urls = (0 ..< 3).map { directory.appendingPathComponent("\($0).wav") }
-        for (index, url) in urls.enumerated() {
-            try writeWAV(to: url, amplitude: 0.10 + Float(index) * 0.05)
+            do {
+                let store = try VolumeAnalysisStore(databaseURL: databaseURL)
+                XCTAssertSuccess(store.save(
+                    measurement: measurement(lufs: -20),
+                    for: audioURL,
+                    snapshot: snapshot
+                ))
+                XCTAssertEqual(store.measurement(for: audioURL)?.integratedLoudnessLUFS, -20)
+            }
+
+            let reloaded = try VolumeAnalysisStore(databaseURL: databaseURL)
+            XCTAssertEqual(reloaded.measurement(for: audioURL)?.integratedLoudnessLUFS, -20)
+
+            try Data(repeating: 2, count: 64).write(to: audioURL, options: .atomic)
+            XCTAssertNil(reloaded.measurement(for: audioURL))
+            XCTAssertEqual(reloaded.analysisCount, 0)
         }
-        let player = AudioPlayer(
-            volumeCacheFileURLOverride: directory.appendingPathComponent("volume-cache.json")
-        )
-        defer { player.cancelVolumeNormalizationPreanalysis() }
+    }
 
-        player.startVolumeNormalizationPreanalysis(urls: urls, reason: .autoIdle)
-        let publishedLimit = await waitUntil(timeout: 2) {
-            player.volumePreanalysisTotal == 2
+    func testSQLiteCapacityUsesPersistentLRUAndKeepsHotCacheBounded() throws {
+        try withTemporaryDirectory { directory in
+            let clock = Clock(1_000)
+            let store = try VolumeAnalysisStore(
+                databaseURL: directory.appendingPathComponent("volume.sqlite3"),
+                analysisCapacity: 2,
+                hotCacheCapacity: 1,
+                now: { clock.value }
+            )
+            let urls = try (0..<3).map { index -> URL in
+                let url = directory.appendingPathComponent("\(index).bin")
+                try Data(repeating: UInt8(index), count: index + 8).write(to: url)
+                return url
+            }
+
+            XCTAssertSuccess(store.save(
+                measurement: measurement(lufs: -21),
+                for: urls[0],
+                snapshot: FileValidationSnapshot.load(for: urls[0])
+            ))
+            clock.value += 1
+            XCTAssertSuccess(store.save(
+                measurement: measurement(lufs: -20),
+                for: urls[1],
+                snapshot: FileValidationSnapshot.load(for: urls[1])
+            ))
+
+            clock.value += 25 * 60 * 60
+            XCTAssertNotNil(store.measurement(for: urls[0]))
+            clock.value += 1
+            XCTAssertSuccess(store.save(
+                measurement: measurement(lufs: -19),
+                for: urls[2],
+                snapshot: FileValidationSnapshot.load(for: urls[2])
+            ))
+
+            XCTAssertNotNil(store.measurement(for: urls[0]))
+            XCTAssertNil(store.measurement(for: urls[1]))
+            XCTAssertNotNil(store.measurement(for: urls[2]))
+            XCTAssertEqual(store.analysisCount, 2)
         }
-        XCTAssertTrue(publishedLimit)
-        XCTAssertEqual(player.volumePreanalysisTotal, 2)
+    }
 
-        let completed = await waitUntil(timeout: 5) {
-            !player.isVolumePreanalysisRunning && player.volumePreanalysisCompleted == 2
+    func testFailureBackoffPersistsAndExpires() throws {
+        try withTemporaryDirectory { directory in
+            let clock = Clock(10_000)
+            let databaseURL = directory.appendingPathComponent("volume.sqlite3")
+            let url = directory.appendingPathComponent("bad.bin")
+            try Data("not audio".utf8).write(to: url)
+            let snapshot = FileValidationSnapshot.load(for: url)
+
+            do {
+                let store = try VolumeAnalysisStore(
+                    databaseURL: databaseURL,
+                    now: { clock.value }
+                )
+                store.recordFailure(.decodeFailed, for: url, snapshot: snapshot)
+                XCTAssertFalse(store.shouldRetryAnalysis(for: url))
+                XCTAssertEqual(store.nextRetryDate?.timeIntervalSince1970, 10_900)
+            }
+
+            let reloaded = try VolumeAnalysisStore(
+                databaseURL: databaseURL,
+                now: { clock.value }
+            )
+            XCTAssertFalse(reloaded.shouldRetryAnalysis(for: url))
+            clock.value = 10_901
+            XCTAssertTrue(reloaded.shouldRetryAnalysis(for: url))
         }
-        XCTAssertTrue(completed)
-        XCTAssertEqual(
-            urls.filter { player.hasVolumeNormalizationCache(for: $0) }.count,
-            2
-        )
     }
 
-    func testImmediateAutoIdleCancellationCannotStartStaleAnalysis() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "musicplayer-auto-idle-cancel-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
+    func testLegacyV3RMSCacheIsInvalidatedInsteadOfRelabeledAsLUFS() throws {
+        try withTemporaryDirectory { directory in
+            let legacyURL = directory.appendingPathComponent("volume-cache.json")
+            try Data(#"{"version":3,"entriesByPath":{}}"#.utf8).write(to: legacyURL)
 
-        let audioURL = directory.appendingPathComponent("fixture.wav")
-        try writeWAV(to: audioURL, amplitude: 0.2, duration: 30)
-        let player = AudioPlayer(
-            volumeCacheFileURLOverride: directory.appendingPathComponent("volume-cache.json")
-        )
+            let store = try VolumeAnalysisStore(
+                databaseURL: directory.appendingPathComponent("volume.sqlite3"),
+                legacyJSONURL: legacyURL
+            )
 
-        player.startVolumeNormalizationPreanalysis(urls: [audioURL], reason: .autoIdle)
-        player.cancelVolumeNormalizationPreanalysisIfAutoIdle()
-        try? await Task.sleep(nanoseconds: 250_000_000)
-
-        XCTAssertFalse(player.isVolumePreanalysisRunning)
-        XCTAssertFalse(player.hasVolumeNormalizationCache(for: audioURL))
-    }
-
-    func testFailedAutoIdleItemEntersCooldownInsteadOfPollingEveryMinute() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "musicplayer-auto-idle-retry-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-
-        let badURL = directory.appendingPathComponent("not-audio.mp3")
-        try Data("plain text".utf8).write(to: badURL)
-        let player = AudioPlayer(
-            volumeCacheFileURLOverride: directory.appendingPathComponent("volume-cache.json")
-        )
-
-        player.startVolumeNormalizationPreanalysis(urls: [badURL], reason: .autoIdle)
-        let completed = await waitUntil(timeout: 2) {
-            !player.isVolumePreanalysisRunning && player.volumePreanalysisCompleted == 1
+            XCTAssertEqual(store.analysisCount, 0)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path))
+            XCTAssertNil(store.protectedCacheReason)
         }
-
-        XCTAssertTrue(completed)
-        XCTAssertFalse(player.hasMissingVolumeNormalizationCache(in: [badURL]))
-        XCTAssertGreaterThan(
-            try XCTUnwrap(player.nextVolumeNormalizationRetryDate),
-            Date()
-        )
     }
 
-    func testClearCannotBeOverwrittenByOlderDebouncedSave() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "musicplayer-volume-cache-clear-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
+    func testCompatibleV4EntryImportsOnceIntoSQLite() throws {
+        try withTemporaryDirectory { directory in
+            let audioURL = directory.appendingPathComponent("fixture.bin")
+            try Data(repeating: 4, count: 48).write(to: audioURL)
+            let snapshot = FileValidationSnapshot.load(for: audioURL)
+            let legacyURL = directory.appendingPathComponent("volume-cache.json")
+            let payload: [String: Any] = [
+                "version": 4,
+                "entriesByPath": [
+                    audioURL.path: [
+                        "integratedLoudnessLUFS": -18.5,
+                        "estimatedTruePeakDbTP": -2.0,
+                        "samplePeakDbFS": -2.5,
+                        "estimatedTruePeakSource": 1,
+                        "analyzedFrameCount": 48_000,
+                        "sampleRate": 48_000,
+                        "algorithmIdentifier": LoudnessAlgorithm.identifier,
+                        "algorithmVersion": LoudnessAlgorithm.version,
+                        "fileSize": snapshot.fileSize,
+                        "modificationTimeNanoseconds": snapshot.mtimeNs,
+                        "fileIdentifier": snapshot.inode.map { $0 as Any } ?? NSNull(),
+                        "updatedAt": 100,
+                        "lastUsedAt": 101
+                    ]
+                ]
+            ]
+            try JSONSerialization.data(withJSONObject: payload).write(to: legacyURL)
 
-        let audioURL = directory.appendingPathComponent("fixture.wav")
-        let cacheURL = directory.appendingPathComponent("volume-cache.json")
-        try writeWAV(to: audioURL, amplitude: 0.2)
-        let player = AudioPlayer(volumeCacheFileURLOverride: cacheURL)
-        _ = player.calculateNormalizedVolume(for: audioURL, persist: true)
-        XCTAssertTrue(player.hasVolumeNormalizationCache(for: audioURL))
+            let store = try VolumeAnalysisStore(
+                databaseURL: directory.appendingPathComponent("volume.sqlite3"),
+                legacyJSONURL: legacyURL
+            )
 
-        player.clearVolumeCache()
-        try? await Task.sleep(nanoseconds: 1_200_000_000)
-
-        let reloaded = AudioPlayer(volumeCacheFileURLOverride: cacheURL)
-        XCTAssertFalse(reloaded.hasVolumeNormalizationCache(for: audioURL))
-        XCTAssertEqual(reloaded.volumeNormalizationCacheCount, 0)
-    }
-
-    private func waitUntil(
-        timeout: TimeInterval,
-        condition: @escaping @MainActor () -> Bool
-    ) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return true }
-            try? await Task.sleep(nanoseconds: 20_000_000)
+            XCTAssertEqual(store.measurement(for: audioURL)?.integratedLoudnessLUFS, -18.5)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path))
+            XCTAssertEqual(store.analysisCount, 1)
         }
-        return condition()
     }
 
-    func testFutureVersionPreservesOriginalBytes() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "musicplayer-volume-cache-future-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
+    func testEmptyV4CacheIsCompatibleAndDoesNotCreateReadOnlyTrap() throws {
+        try withTemporaryDirectory { directory in
+            let legacyURL = directory.appendingPathComponent("volume-cache.json")
+            try Data(#"{"version":4,"entriesByPath":{}}"#.utf8).write(to: legacyURL)
+            let store = try VolumeAnalysisStore(
+                databaseURL: directory.appendingPathComponent("volume.sqlite3"),
+                legacyJSONURL: legacyURL
+            )
 
-        let cacheURL = directory.appendingPathComponent("volume-cache.json")
-        let audioURL = directory.appendingPathComponent("fixture.wav")
-        try writeWAV(to: audioURL, amplitude: 0.5)
-
-        // Create future version cache file missing current required fields
-        let futureCache = """
-        {
-            "version": 999,
-            "futureField": "must-preserve"
+            XCTAssertNil(store.protectedCacheReason)
+            XCTAssertEqual(
+                store.clear(),
+                .cleared(analysisCount: 0, failureCount: 0, removedProtectedLegacy: false)
+            )
         }
-        """
-        let originalBytes = Data(futureCache.utf8)
-        try originalBytes.write(to: cacheURL, options: .atomic)
-
-        let player = AudioPlayer(volumeCacheFileURLOverride: cacheURL)
-
-        // Attempt write operation
-        _ = player.calculateNormalizedVolume(for: audioURL, persist: true)
-        player.flushVolumeCachePersistence()
-
-        let afterWriteBytes = try Data(contentsOf: cacheURL)
-        XCTAssertEqual(afterWriteBytes, originalBytes, "Future version file must survive write")
-
-        // Attempt clear operation
-        player.clearVolumeCache()
-
-        let afterClearBytes = try Data(contentsOf: cacheURL)
-        XCTAssertEqual(afterClearBytes, originalBytes, "Future version file must survive clear")
     }
 
-    func testUnknownFormatPreservesOriginalBytes() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "musicplayer-volume-cache-unknown-\(UUID().uuidString)",
-            isDirectory: true
+    func testFutureLegacyCacheIsPreservedUntilExplicitForcedClear() throws {
+        try withTemporaryDirectory { directory in
+            let legacyURL = directory.appendingPathComponent("volume-cache.json")
+            let original = Data(#"{"version":999,"future":"preserve"}"#.utf8)
+            try original.write(to: legacyURL)
+            let store = try VolumeAnalysisStore(
+                databaseURL: directory.appendingPathComponent("volume.sqlite3"),
+                legacyJSONURL: legacyURL
+            )
+
+            XCTAssertEqual(store.protectedCacheReason, .futureLegacyJSON(version: 999))
+            XCTAssertEqual(store.clear(), .requiresConfirmation(.futureLegacyJSON(version: 999)))
+            XCTAssertEqual(try Data(contentsOf: legacyURL), original)
+
+            XCTAssertEqual(
+                store.clear(forceProtectedData: true),
+                .cleared(analysisCount: 0, failureCount: 0, removedProtectedLegacy: true)
+            )
+            XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path))
+        }
+    }
+
+    func testAudioPlayerUsesSQLiteCacheWithoutPlayingAudio() throws {
+        try withTemporaryDirectory { directory in
+            let audioURL = directory.appendingPathComponent("fixture.wav")
+            let legacyURL = directory.appendingPathComponent("volume-cache.json")
+            try writeWAV(to: audioURL, amplitude: 0.12)
+
+            let analyzed: Float
+            do {
+                let player = AudioPlayer(volumeCacheFileURLOverride: legacyURL)
+                analyzed = player.calculateNormalizedVolume(for: audioURL)
+                XCTAssertTrue(player.hasVolumeNormalizationCache(for: audioURL))
+                XCTAssertEqual(player.flushVolumeCachePersistence(), .flushed)
+            }
+
+            let reloaded = AudioPlayer(volumeCacheFileURLOverride: legacyURL)
+            XCTAssertTrue(reloaded.hasVolumeNormalizationCache(for: audioURL))
+            XCTAssertEqual(reloaded.calculateNormalizedVolume(for: audioURL), analyzed, accuracy: 0.000_1)
+        }
+    }
+
+    func testSessionMeasurementRemainsUsableWhenSQLiteCannotInitialize() throws {
+        try withTemporaryDirectory { directory in
+            let audioURL = directory.appendingPathComponent("session-only.wav")
+            try writeWAV(to: audioURL, amplitude: 0.12)
+            let blockedParent = directory.appendingPathComponent("not-a-directory")
+            try Data("blocker".utf8).write(to: blockedParent)
+            let player = AudioPlayer(
+                volumeCacheFileURLOverride: blockedParent.appendingPathComponent("volume-cache.json")
+            )
+
+            let first = player.calculateNormalizedVolume(for: audioURL)
+            let second = player.calculateNormalizedVolume(for: audioURL)
+
+            XCTAssertTrue(player.hasVolumeNormalizationCache(for: audioURL))
+            XCTAssertEqual(second, first, accuracy: 0.000_1)
+            guard case .failed = player.flushVolumeCachePersistence() else {
+                return XCTFail("Unavailable SQLite persistence must be reported explicitly")
+            }
+            guard case .failed = player.clearVolumeCache() else {
+                return XCTFail("Unavailable SQLite clear must be reported explicitly")
+            }
+            XCTAssertTrue(
+                player.hasVolumeNormalizationCache(for: audioURL),
+                "A failed disk clear must preserve the valid session measurement"
+            )
+            XCTAssertEqual(
+                player.calculateNormalizedVolume(for: audioURL),
+                first,
+                accuracy: 0.000_1
+            )
+        }
+    }
+
+    func testFutureDatabasePreservesSessionMeasurementAndReportsFlushFailure() throws {
+        try withTemporaryDirectory { directory in
+            let databaseURL = directory.appendingPathComponent("future.sqlite3")
+            let seed = try SQLiteDatabase(fileURL: databaseURL)
+            try seed.execute("PRAGMA application_id = 1297110604")
+            try seed.execute("PRAGMA user_version = 99")
+            try seed.checkpoint()
+            seed.close()
+            let original = try Data(contentsOf: databaseURL)
+
+            let audioURL = directory.appendingPathComponent("future-session.wav")
+            try writeWAV(to: audioURL, amplitude: 0.12)
+            let player = AudioPlayer(volumeCacheFileURLOverride: databaseURL)
+            let normalized = player.calculateNormalizedVolume(for: audioURL)
+
+            XCTAssertTrue(normalized.isFinite)
+            XCTAssertTrue(player.hasVolumeNormalizationCache(for: audioURL))
+            XCTAssertEqual(
+                player.clearVolumeCache(),
+                .requiresConfirmation(.futureDatabase(version: 99))
+            )
+            XCTAssertTrue(player.hasVolumeNormalizationCache(for: audioURL))
+            guard case .failed = player.flushVolumeCachePersistence() else {
+                return XCTFail("A protected future database must not report a durable flush")
+            }
+            XCTAssertEqual(try Data(contentsOf: databaseURL), original)
+        }
+    }
+
+    private func measurement(lufs: Float) -> LoudnessMeasurement {
+        LoudnessMeasurement(
+            integratedLoudnessLUFS: lufs,
+            estimatedTruePeakDbTP: -2,
+            samplePeakDbFS: -3,
+            analyzedFrameCount: 48_000,
+            sampleRate: 48_000
         )
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-
-        let cacheURL = directory.appendingPathComponent("volume-cache.json")
-        let audioURL = directory.appendingPathComponent("fixture.wav")
-        try writeWAV(to: audioURL, amplitude: 0.5)
-
-        // Create corrupted/unknown format
-        let corruptedCache = Data("not valid json".utf8)
-        try corruptedCache.write(to: cacheURL, options: .atomic)
-
-        let player = AudioPlayer(volumeCacheFileURLOverride: cacheURL)
-
-        _ = player.calculateNormalizedVolume(for: audioURL, persist: true)
-        player.flushVolumeCachePersistence()
-
-        let afterWriteBytes = try Data(contentsOf: cacheURL)
-        XCTAssertEqual(afterWriteBytes, corruptedCache, "Unknown format file must survive write")
-
-        player.clearVolumeCache()
-
-        let afterClearBytes = try Data(contentsOf: cacheURL)
-        XCTAssertEqual(afterClearBytes, corruptedCache, "Unknown format file must survive clear")
     }
 
-    private func writeWAV(
-        to url: URL,
-        amplitude: Float,
-        duration: TimeInterval = 0.5
+    private func XCTAssertSuccess(
+        _ result: Result<Int, VolumeAnalysisStoreError>,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case .success = result else {
+            XCTFail("Expected successful cache write", file: file, line: line)
+            return
+        }
+    }
+
+    private func withTemporaryDirectory(
+        _ body: (URL) throws -> Void
     ) throws {
-        if FileManager.default.fileExists(atPath: url.path) {
-            try FileManager.default.removeItem(at: url)
-        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-volume-store-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try body(directory)
+    }
 
-        let sampleRate = 8_000.0
+    private func writeWAV(to url: URL, amplitude: Float) throws {
+        let sampleRate = 48_000.0
         let format = try XCTUnwrap(
-            AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)
+            AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)
         )
         var settings = format.settings
         settings.removeValue(forKey: AVLinearPCMIsNonInterleaved)
         let file = try AVAudioFile(forWriting: url, settings: settings)
-        let frameCount = AVAudioFrameCount((duration * sampleRate).rounded())
-        let buffer = try XCTUnwrap(
-            AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)
-        )
-        buffer.frameLength = frameCount
-        let samples = try XCTUnwrap(buffer.floatChannelData?[0])
-        for index in 0 ..< Int(frameCount) {
-            let time = Double(index) / sampleRate
-            samples[index] = Float(sin(2 * Double.pi * 440 * time)) * amplitude
+        let frameCount: AVAudioFrameCount = 24_000
+        let chunkFrames: AVAudioFrameCount = 4_096
+        var written: AVAudioFrameCount = 0
+        while written < frameCount {
+            let count = min(chunkFrames, frameCount - written)
+            let buffer = try XCTUnwrap(
+                AVAudioPCMBuffer(pcmFormat: format, frameCapacity: count)
+            )
+            buffer.frameLength = count
+            for channel in 0..<2 {
+                let samples = try XCTUnwrap(buffer.floatChannelData?[channel])
+                for index in 0..<Int(count) {
+                    let frame = Double(written) + Double(index)
+                    samples[index] = amplitude * Float(sin(2 * .pi * 997 * frame / sampleRate))
+                }
+            }
+            try file.write(from: buffer)
+            written += count
         }
-        try file.write(from: buffer)
     }
 }
