@@ -53,11 +53,17 @@ Common commands:
 
 - Current Bundle ID: `io.github.lueluelue2006.macosmusicplayer`
 
-## Caches / data locations
+## Persistence / data locations
 
 - AppSupport: `~/Library/Application Support/MusicPlayer`
-  - `metadata-cache.json`: disk cache for title/artist/album (invalidates by mtime+size)
-  - volume normalization cache files (per track; see code)
+  - `Library.sqlite`: sole authority for queue, playlists, sparse playback weights, removable-media locations/bookmarks, cleanup intents, and playback session.
+  - User-authored artwork and other non-rebuildable resources remain in AppSupport.
+- Caches: `~/Library/Caches/MusicPlayer`
+  - `derived-cache.sqlite3`: bounded metadata, duration, and immersive-boundary cache.
+  - `volume-analysis.sqlite3`: bounded loudness-analysis cache.
+- Preferences: the app's UserDefaults domain contains one versioned preferences envelope; playback scope/session does not live there.
+
+Legacy JSON/defaults are migration sources only. `LibraryBootstrap` imports them into a verified temporary database and atomically installs `Library.sqlite`; future or corrupt authorities must stay protected rather than falling back to legacy writes.
 
 ## “Where is what” (code map)
 
@@ -76,3 +82,5 @@ Common commands:
 - Do not retain full-resolution artwork `Data` across the playlist; only keep a small thumbnail for the currently playing track.
 - Avoid unbounded caches (lyrics/artwork/analysis results) in memory.
 - Avoid copying large Sets/Arrays on every render; prefer incremental checks.
+- Keep all Library.sqlite domain commits revision-monotonic and use the strict expected-revision APIs; compatibility wrappers are not for production writers.
+- Keep rebuildable analysis under Caches and user-authored/ordering state under AppSupport.

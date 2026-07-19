@@ -55,6 +55,15 @@ final class PlaybackStateStore {
     private var cachedState: State?
     private var storedPersistenceState: PersistenceState = .writable
     private var storedLastFlushSucceeded: Bool?
+    /// A successful `UserDefaults.set` only updates the process-local domain.
+    /// Generations let lifecycle flushes distinguish that accepted mutation from
+    /// one that has crossed an explicit synchronization boundary.
+    private var mutationGeneration: UInt64 = 0
+    private var durableGeneration: UInt64 = 0
+    /// Legacy keys may only be removed after the replacement envelope is known
+    /// durable. If that first synchronization fails, a later `flush()` resumes
+    /// the migration instead of abandoning the cleanup forever.
+    private var needsLegacyCleanupAfterEnvelopeSync = false
 
     init(
         userDefaults: UserDefaults = .standard,
@@ -75,6 +84,15 @@ final class PlaybackStateStore {
         lock.lock()
         defer { lock.unlock() }
         return storedLastFlushSucceeded
+    }
+
+    var hasUnpersistedChanges: Bool {
+        guard !disablesPersistence else { return false }
+        ensureLoaded()
+        lock.lock()
+        defer { lock.unlock() }
+        return mutationGeneration > durableGeneration
+            || needsLegacyCleanupAfterEnvelopeSync
     }
 
     // MARK: - Read
@@ -153,7 +171,7 @@ final class PlaybackStateStore {
         let newKey = PathKey.canonical(for: newURL)
         if currentKey == newKey {
             lock.unlock()
-            return userDefaults.synchronize() ? .durable : .failed
+            return flush() ? .durable : .failed
         }
         guard currentKey == oldKey else {
             lock.unlock()
@@ -167,7 +185,7 @@ final class PlaybackStateStore {
         )
         lock.unlock()
         guard didPersist else { return .failed }
-        return userDefaults.synchronize() ? .durable : .failed
+        return flush() ? .durable : .failed
     }
 
     // MARK: - Clear
@@ -202,11 +220,52 @@ final class PlaybackStateStore {
     func flush() -> Bool {
         guard !disablesPersistence else { return true }
         ensureLoaded()
-        let succeeded = userDefaults.synchronize()
+
         lock.lock()
-        storedLastFlushSucceeded = succeeded
+        let firstTarget = mutationGeneration
         lock.unlock()
-        return succeeded
+
+        let firstSynchronizationSucceeded = userDefaults.synchronize()
+
+        lock.lock()
+        if firstSynchronizationSucceeded {
+            durableGeneration = max(durableGeneration, firstTarget)
+        }
+
+        // A legacy migration deliberately retains the source keys until the
+        // replacement envelope has crossed a durability boundary. Removing the
+        // keys is itself a new mutation and therefore needs a second receipt.
+        var secondTarget: UInt64?
+        if firstSynchronizationSucceeded,
+           needsLegacyCleanupAfterEnvelopeSync,
+           durableGeneration >= firstTarget,
+           removeLegacyKeysLocked() {
+            if mutationGeneration > durableGeneration {
+                secondTarget = mutationGeneration
+            }
+        }
+
+        if secondTarget == nil {
+            let isLatestDurable = firstSynchronizationSucceeded
+                && durableGeneration >= mutationGeneration
+                && !needsLegacyCleanupAfterEnvelopeSync
+            storedLastFlushSucceeded = isLatestDurable
+            lock.unlock()
+            return isLatestDurable
+        }
+        lock.unlock()
+
+        let secondSynchronizationSucceeded = userDefaults.synchronize()
+        lock.lock()
+        if secondSynchronizationSucceeded, let secondTarget {
+            durableGeneration = max(durableGeneration, secondTarget)
+        }
+        let isLatestDurable = secondSynchronizationSucceeded
+            && durableGeneration >= mutationGeneration
+            && !needsLegacyCleanupAfterEnvelopeSync
+        storedLastFlushSucceeded = isLatestDurable
+        lock.unlock()
+        return isLatestDurable
     }
 
     // MARK: - Load and migration
@@ -258,9 +317,8 @@ final class PlaybackStateStore {
             }
             if userDefaults.object(forKey: Self.legacyFilePathKey) != nil
                 || userDefaults.object(forKey: Self.legacyFileTimeKey) != nil {
-                userDefaults.removeObject(forKey: Self.legacyFilePathKey)
-                userDefaults.removeObject(forKey: Self.legacyFileTimeKey)
-                _ = userDefaults.synchronize()
+                needsLegacyCleanupAfterEnvelopeSync = true
+                completeLegacyMigrationWhileLocked()
             }
             return
         }
@@ -272,9 +330,8 @@ final class PlaybackStateStore {
         guard let rawPath = userDefaults.string(forKey: Self.legacyFilePathKey),
               !rawPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             // A time without a path cannot identify a playback state.
-            userDefaults.removeObject(forKey: Self.legacyFilePathKey)
-            userDefaults.removeObject(forKey: Self.legacyFileTimeKey)
             cachedState = nil
+            _ = removeLegacyKeysLocked()
             return
         }
         guard rawPath.utf8.count <= Self.maximumPathBytes else {
@@ -290,14 +347,21 @@ final class PlaybackStateStore {
             lastPlayedTime: Self.sanitizedTime(rawTime)
         )
         guard persistLocked(migrated) else { return }
-        guard userDefaults.synchronize() else { return }
-        userDefaults.removeObject(forKey: Self.legacyFilePathKey)
-        userDefaults.removeObject(forKey: Self.legacyFileTimeKey)
-        _ = userDefaults.synchronize()
+        needsLegacyCleanupAfterEnvelopeSync = true
+        completeLegacyMigrationWhileLocked()
     }
 
     private func recoverCorruptEnvelopeLocked(data: Data, reason: String) {
         PersistenceLogger.log("播放状态 envelope 损坏（\(reason)），尝试迁移旧状态")
+        guard mutationGeneration < UInt64.max else {
+            storedPersistenceState = .protectedCorrupt
+            cachedState = nil
+            PersistenceLogger.log("播放状态修订号已达上限，保留损坏数据")
+            return
+        }
+        let previousEnvelope = userDefaults.data(forKey: Self.envelopeKey)
+        let previousNewestQuarantine = userDefaults.data(forKey: Self.corruptQuarantineKeys[0])
+        let previousOlderQuarantine = userDefaults.data(forKey: Self.corruptQuarantineKeys[1])
         if data.count <= Self.maximumEnvelopeBytes {
             if let previous = userDefaults.data(forKey: Self.corruptQuarantineKeys[0]) {
                 userDefaults.set(previous, forKey: Self.corruptQuarantineKeys[1])
@@ -307,6 +371,11 @@ final class PlaybackStateStore {
         userDefaults.removeObject(forKey: Self.envelopeKey)
         storedPersistenceState = .writable
         cachedState = nil
+        if previousEnvelope != userDefaults.data(forKey: Self.envelopeKey)
+            || previousNewestQuarantine != userDefaults.data(forKey: Self.corruptQuarantineKeys[0])
+            || previousOlderQuarantine != userDefaults.data(forKey: Self.corruptQuarantineKeys[1]) {
+            mutationGeneration += 1
+        }
         migrateLegacyStateLocked()
     }
 
@@ -321,20 +390,99 @@ final class PlaybackStateStore {
             PersistenceLogger.log("播放状态 envelope 超过安全上限")
             return false
         }
+        if userDefaults.data(forKey: Self.envelopeKey) == data {
+            cachedState = state
+            return true
+        }
+        guard mutationGeneration < UInt64.max else {
+            PersistenceLogger.log("播放状态修订号已达上限")
+            return false
+        }
         userDefaults.set(data, forKey: Self.envelopeKey)
         guard userDefaults.data(forKey: Self.envelopeKey) == data else {
             PersistenceLogger.log("播放状态 envelope 写入校验失败")
             return false
         }
         cachedState = state
+        mutationGeneration += 1
         return true
     }
 
     private func clearLocked() {
+        let hadPersistedValues = userDefaults.object(forKey: Self.envelopeKey) != nil
+            || userDefaults.object(forKey: Self.legacyFilePathKey) != nil
+            || userDefaults.object(forKey: Self.legacyFileTimeKey) != nil
+        guard cachedState != nil || hadPersistedValues else { return }
+        guard mutationGeneration < UInt64.max else {
+            PersistenceLogger.log("播放状态修订号已达上限，未清除状态")
+            return
+        }
         userDefaults.removeObject(forKey: Self.envelopeKey)
         userDefaults.removeObject(forKey: Self.legacyFilePathKey)
         userDefaults.removeObject(forKey: Self.legacyFileTimeKey)
+        guard userDefaults.object(forKey: Self.envelopeKey) == nil,
+              userDefaults.object(forKey: Self.legacyFilePathKey) == nil,
+              userDefaults.object(forKey: Self.legacyFileTimeKey) == nil else {
+            PersistenceLogger.log("播放状态清除校验失败")
+            return
+        }
         cachedState = nil
+        needsLegacyCleanupAfterEnvelopeSync = false
+        mutationGeneration += 1
+    }
+
+    /// Removes migration source keys as one tracked mutation. Returning `true`
+    /// means either no cleanup remained or the removal was accepted by the
+    /// process-local defaults domain; durability is established separately.
+    @discardableResult
+    private func removeLegacyKeysLocked() -> Bool {
+        let hasLegacyKeys = userDefaults.object(forKey: Self.legacyFilePathKey) != nil
+            || userDefaults.object(forKey: Self.legacyFileTimeKey) != nil
+        guard hasLegacyKeys else {
+            needsLegacyCleanupAfterEnvelopeSync = false
+            return true
+        }
+        guard mutationGeneration < UInt64.max else {
+            PersistenceLogger.log("播放状态修订号已达上限，未清理旧键")
+            return false
+        }
+        userDefaults.removeObject(forKey: Self.legacyFilePathKey)
+        userDefaults.removeObject(forKey: Self.legacyFileTimeKey)
+        guard userDefaults.object(forKey: Self.legacyFilePathKey) == nil,
+              userDefaults.object(forKey: Self.legacyFileTimeKey) == nil else {
+            PersistenceLogger.log("播放状态旧键清理校验失败")
+            return false
+        }
+        mutationGeneration += 1
+        needsLegacyCleanupAfterEnvelopeSync = false
+        return true
+    }
+
+    /// Initialization already owns `lock`, so migration can establish both
+    /// durability boundaries synchronously without exposing a half-migrated
+    /// state to another caller.
+    private func completeLegacyMigrationWhileLocked() {
+        let envelopeTarget = mutationGeneration
+        guard userDefaults.synchronize() else {
+            storedLastFlushSucceeded = false
+            return
+        }
+        durableGeneration = max(durableGeneration, envelopeTarget)
+        guard removeLegacyKeysLocked() else {
+            storedLastFlushSucceeded = false
+            return
+        }
+        guard mutationGeneration > durableGeneration else {
+            storedLastFlushSucceeded = true
+            return
+        }
+        let cleanupTarget = mutationGeneration
+        let cleanupSucceeded = userDefaults.synchronize()
+        if cleanupSucceeded {
+            durableGeneration = max(durableGeneration, cleanupTarget)
+        }
+        storedLastFlushSucceeded = cleanupSucceeded
+            && durableGeneration >= mutationGeneration
     }
 
     private static func sanitizedTime(_ time: TimeInterval) -> TimeInterval {

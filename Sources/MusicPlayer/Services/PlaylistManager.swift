@@ -8,7 +8,40 @@ struct QueueRemovalContext {
     let playlistPosition: Int?
 }
 
-final class PlaylistManager: ObservableObject {
+final class PlaylistManager: ObservableObject, AudioPlaybackAccessLeaseProviding {
+    struct ResolvedPlaylistTrack: Sendable {
+        let url: URL
+        let offlineReason: String?
+    }
+
+    private struct PendingLibraryLocationRefresh: Sendable {
+        let baseLocation: LibraryLocation
+        let refresh: LibraryBookmarkRefresh
+    }
+    enum QueuePersistenceProtection: Equatable {
+        case future(version: Int)
+        case foreignDatabase
+        case corrupt(diagnosticURL: URL?)
+        case unreadable(message: String)
+
+        var diagnosticMessage: String {
+            switch self {
+            case .future(let version):
+                return "音乐库版本 \(version) 高于当前应用，已保持只读。"
+            case .foreignDatabase:
+                return "音乐库标识不匹配，已保持只读。"
+            case .corrupt:
+                return "队列数据已损坏，原始内容已保留为诊断副本。"
+            case .unreadable(let message):
+                return message
+            }
+        }
+
+        var canResetQueue: Bool {
+            if case .corrupt(let diagnosticURL) = self { return diagnosticURL != nil }
+            return false
+        }
+    }
     struct QueuePersistenceFlushResult: Equatable, Sendable {
         enum Outcome: Equatable, Sendable {
             case durable
@@ -23,6 +56,34 @@ final class PlaylistManager: ObservableObject {
         let durableRevision: UInt64
 
         var isDurable: Bool { outcome == .durable }
+    }
+
+    struct QueueTerminationSnapshotPreparation: Equatable, Sendable {
+        enum Outcome: Equatable, Sendable {
+            /// The current immutable queue snapshot was already available.
+            case reusedLatest
+            /// A current immutable queue snapshot was captured within the budget.
+            case prepared
+            /// The SQLite queue has no structural debt; only its cursor needs flushing.
+            case cursorOnly
+            case skippedBeforeRestore
+            case protectedReadOnly
+            /// Capturing a new snapshot could not safely fit in the remaining budget.
+            case timedOut
+        }
+
+        let outcome: Outcome
+        let generation: UInt64
+        let entryCount: Int
+
+        var canAttemptFlush: Bool {
+            switch outcome {
+            case .reusedLatest, .prepared, .cursorOnly:
+                return true
+            case .skippedBeforeRestore, .protectedReadOnly, .timedOut:
+                return false
+            }
+        }
     }
 
     enum QueueClearResult: Equatable, Sendable {
@@ -47,9 +108,12 @@ final class PlaylistManager: ObservableObject {
         case terminating(wasReady: Bool)
     }
 
-    @Published var audioFiles: [AudioFile] = []
+    @Published var audioFiles: [AudioFile] = [] {
+        didSet { playlistSnapshotStateGeneration &+= 1 }
+    }
     @Published var currentIndex: Int = 0 {
         didSet {
+            playlistSnapshotStateGeneration &+= 1
             if !isApplyingPersistedCurrentIndex {
                 retainedSavedCurrentFullOrderIndex = nil
             }
@@ -63,9 +127,12 @@ final class PlaylistManager: ObservableObject {
     /// necessarily changing the scope value itself.
     @Published private(set) var playbackScopeRevision: UInt64 = 0
     @Published var scanSubfolders: Bool = true { // 默认开启子文件夹扫描
-        didSet { saveScanSubfoldersPreference() }
+        didSet {
+            guard !isRestoringScanSubfoldersPreference else { return }
+            saveScanSubfoldersPreference()
+        }
     }
-    private let userScanSubfoldersKey = "userScanSubfoldersEnabled"
+    private var isRestoringScanSubfoldersPreference = false
     
     private var shuffleQueue: [Int] = []
     private var shuffleIndex = 0
@@ -85,11 +152,16 @@ final class PlaylistManager: ObservableObject {
     @Published var isRestoringPlaylist = false  // 标记是否正在恢复播放列表
     @Published private(set) var isInitialRestorePending = false
     @Published private(set) var queueLoadState: QueueLoadState
+    @Published private(set) var queuePersistenceProtection: QueuePersistenceProtection?
     private var didPerformInitialRestore: Bool = false
     private var queueLoadGeneration: UInt64 = 0
     private var initialRestoreTask: Task<Void, Never>?
     private var restoredMetadataHydrationTask: Task<Void, Never>?
     private var restoredMetadataHydrationGeneration: UInt64 = 0
+    /// Non-nil from the instant the startup session snapshot is captured until
+    /// the normalized restore result is merged back. Scope setters must remain
+    /// side-effect-free with respect to PlaybackSessionStore in this interval.
+    private var playbackSessionRestoreGeneration: UInt64?
     
     // MARK: - 添加/扫描进度（可取消）
     @Published private(set) var isAddingFiles: Bool = false
@@ -108,16 +180,61 @@ final class PlaylistManager: ObservableObject {
 
     private struct SavedPlaylist: Codable {
         struct TrackRecord: Codable {
+            let id: UUID?
             let path: String
             let signature: FileSignature?
+            let locationID: UUID?
+            let relativePath: String?
+
+            init(
+                id: UUID? = nil,
+                path: String,
+                signature: FileSignature?,
+                locationID: UUID? = nil,
+                relativePath: String? = nil
+            ) {
+                self.id = id
+                self.path = path
+                self.signature = signature
+                self.locationID = locationID
+                self.relativePath = relativePath
+            }
         }
 
         struct WeightRekeyRecord: Codable, Equatable {
+            let id: UUID
             let oldPath: String
             let newPath: String
+            let createdAt: Date
+
+            init(
+                id: UUID = UUID(),
+                oldPath: String,
+                newPath: String,
+                createdAt: Date = Date()
+            ) {
+                self.id = id
+                self.oldPath = oldPath
+                self.newPath = newPath
+                self.createdAt = createdAt
+            }
+
+            private enum CodingKeys: String, CodingKey {
+                case id, oldPath, newPath, createdAt
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                oldPath = try container.decode(String.self, forKey: .oldPath)
+                newPath = try container.decode(String.self, forKey: .newPath)
+                id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+                createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt)
+                    ?? Date(timeIntervalSinceReferenceDate: 0)
+            }
         }
 
         let version: Int?
+        let storeRevision: UInt64?
         let tracks: [TrackRecord]?
         let paths: [String]
         let currentIndex: Int
@@ -125,12 +242,14 @@ final class PlaylistManager: ObservableObject {
 
         init(
             version: Int?,
+            storeRevision: UInt64? = nil,
             tracks: [TrackRecord]?,
             paths: [String],
             currentIndex: Int,
             pendingWeightRekeys: [WeightRekeyRecord]? = nil
         ) {
             self.version = version
+            self.storeRevision = storeRevision
             self.tracks = tracks
             self.paths = paths
             self.currentIndex = currentIndex
@@ -143,6 +262,8 @@ final class PlaylistManager: ObservableObject {
     }
     private let playlistFileName = "playlist.json"
     private let playlistFileURLOverride: URL?
+    private let libraryDatabase: LibraryDatabase?
+    private let libraryLocationResolver: LibraryLocationResolver
     private let playlistFileWriter: (Data, URL) throws -> Void
     private let isRunningRegressionTests: Bool
     private let playlistIOQueue = DispatchQueue(label: "playlist.persistence", qos: .utility)
@@ -151,6 +272,16 @@ final class PlaylistManager: ObservableObject {
     private var playlistSaveRevision: UInt64 = 0
     private var playlistSaveWorkItem: DispatchWorkItem?
     private var pendingPlaylistWrite: (revision: UInt64, snapshot: SavedPlaylist)?
+    private var playlistSnapshotStateGeneration: UInt64 = 0
+    private var latestCapturedPlaylistSnapshot: (
+        stateGeneration: UInt64,
+        revision: UInt64,
+        snapshot: SavedPlaylist
+    )?
+    private var terminationSnapshotPreparation: (
+        generation: UInt64,
+        result: QueueTerminationSnapshotPreparation
+    )?
     private var isPlaylistWriteDrainScheduled = false
     private var playlistDurableRevision: UInt64 = 0
     private var playlistLastFailedRevision: UInt64?
@@ -177,17 +308,37 @@ final class PlaylistManager: ObservableObject {
     private var isApplyingPersistedCurrentIndex = false
     private var pendingQueueWeightRekeys: [SavedPlaylist.WeightRekeyRecord] = []
     private var loadedSignatureByPath: [String: FileSignature] = [:]
+    /// Stable occurrence identity aligned one-to-one with `audioFiles`.
+    private var queueEntryIDs: [UUID] = []
+    private struct QueueLocationReference: Equatable {
+        let locationID: UUID
+        let relativePath: String?
+    }
+    /// External-root references aligned one-to-one with `audioFiles`.
+    private var queueLocationReferences: [QueueLocationReference?] = []
+    private var latestExternalTopologyGeneration: UInt64 = 0
+    /// Last structural revision committed to Library.sqlite. Access is protected
+    /// by `playlistSaveStateLock` when used off the main thread.
+    private var libraryQueueRevision: UInt64 = 0
+    private var cursorSaveWorkItem: DispatchWorkItem?
+    private var cursorSaveGeneration: UInt64 = 0
+    private var cursorDurableGeneration: UInt64 = 0
     private var didNotifyProtectedQueueMutation = false
+    private var protectedQueueSourceURL: URL?
     private let metadataGate = ConcurrencyGate(maxConcurrent: 4) // 限制元数据加载并发
     private let durationGate = ConcurrencyGate(maxConcurrent: 2) // 限制时长计算并发（更轻量但也需要控速）
     private let signatureCaptureService: SignatureCaptureService
     private let freshMetadataLoaderOverride: ((URL) async -> AudioMetadata)?
 
     // MARK: - Playback scope persistence
-    private let appPreferencesStore: AppPreferencesStore
-    private let playbackWeights: PlaybackWeights
+    let appPreferencesStore: AppPreferencesStore
+    let playbackSessionStore: PlaybackSessionStore?
+    private let legacyUserDefaults: UserDefaults
+    /// The process-wide weight store injected by the composition root.
+    /// Views, commands and IPC must use this exact instance so production
+    /// never splits state between Library.sqlite and the legacy singleton.
+    let playbackWeights: PlaybackWeights
     private let playbackStateRekeyHandler: ((URL, URL) -> PlaybackStateStore.RekeyResult)?
-    private var didNotifyProtectedScopePreference = false
 
     @MainActor private var durationPrefetchTask: Task<Void, Never>?
     @MainActor private var pendingDurationURLs: [URL] = []
@@ -196,17 +347,23 @@ final class PlaylistManager: ObservableObject {
 
     init(
         playlistFileURLOverride: URL? = nil,
+        libraryDatabase: LibraryDatabase? = nil,
+        libraryLocationResolver: LibraryLocationResolver = LibraryLocationResolver(),
         disablePersistence: Bool = false,
         persistenceDebounceInterval: TimeInterval = 0.4,
         signatureCaptureService: SignatureCaptureService? = nil,
         initialQueueLoadState: QueueLoadState? = nil,
         appPreferencesStore: AppPreferencesStore = .shared,
+        legacyUserDefaults: UserDefaults? = nil,
+        playbackSessionStore: PlaybackSessionStore? = nil,
         playbackWeights: PlaybackWeights = .shared,
         playbackStateRekeyHandler: ((URL, URL) -> PlaybackStateStore.RekeyResult)? = nil,
         freshMetadataLoaderOverride: ((URL) async -> AudioMetadata)? = nil,
         playlistFileWriter: ((Data, URL) throws -> Void)? = nil
     ) {
         self.playlistFileURLOverride = playlistFileURLOverride
+        self.libraryDatabase = libraryDatabase
+        self.libraryLocationResolver = libraryLocationResolver
         self.playlistFileWriter = playlistFileWriter ?? { data, url in
             try DerivedCacheFileIO.atomicWrite(data, to: url)
         }
@@ -228,6 +385,8 @@ final class PlaylistManager: ObservableObject {
         self.signatureCaptureService = signatureCaptureService ?? SignatureCaptureService()
         self.freshMetadataLoaderOverride = freshMetadataLoaderOverride
         self.appPreferencesStore = appPreferencesStore
+        self.legacyUserDefaults = legacyUserDefaults ?? .standard
+        self.playbackSessionStore = playbackSessionStore
         self.playbackWeights = playbackWeights
         self.playbackStateRekeyHandler = playbackStateRekeyHandler
         playlistIOQueue.setSpecific(key: playlistIOQueueKey, value: ())
@@ -246,6 +405,14 @@ final class PlaylistManager: ObservableObject {
     }
 
     // MARK: - Playback scope
+
+    var currentPlaybackPlaylistTrackID: String? {
+        guard case .playlist = playbackScope,
+              let key = currentPlaybackPlaylistOccurrenceKey,
+              key.hasPrefix("id:") else { return nil }
+        let raw = String(key.dropFirst(3))
+        return raw.split(separator: "#", maxSplits: 1).first.map(String.init)
+    }
 
     /// Switch playback controls to operate on the main queue.
     func setPlaybackScopeQueue() {
@@ -303,7 +470,11 @@ final class PlaylistManager: ObservableObject {
     ) {
         guard playbackScope == .playlist(playlistID) else { return }
         guard !trackURLsInOrder.isEmpty else {
-            setPlaybackScopeQueue()
+            setPlaybackScopePlaylist(
+                playlistID,
+                trackURLsInOrder: [],
+                trackIDsInOrder: []
+            )
             return
         }
 
@@ -364,26 +535,22 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func persistPlaybackScope(_ scope: PlaybackScope) {
-        guard !isRunningRegressionTests else { return }
-        guard appPreferencesStore.persistenceState == .writable else {
-            if !didNotifyProtectedScopePreference {
-                didNotifyProtectedScopePreference = true
-                PersistenceLogger.notifyUser(
-                    title: "播放范围偏好处于只读保护模式",
-                    subtitle: "当前会话可用，重启后保留原设置"
-                )
-            }
-            return
-        }
-        let preferenceScope: AppPreferencesStore.PlaybackScope
+        guard playbackSessionRestoreGeneration == nil,
+              !isRunningRegressionTests,
+              let playbackSessionStore else { return }
+        let storedScope: PlaybackSessionStore.Scope
         switch scope {
         case .queue:
-            preferenceScope = .queue
+            storedScope = .queue
         case .playlist(let id):
-            preferenceScope = .playlist(id)
+            storedScope = .playlist(id)
         }
-        _ = appPreferencesStore.update { $0.playbackScope = preferenceScope }
-        _ = appPreferencesStore.persist()
+        _ = playbackSessionStore.mergeScope(storedScope)
+        if audioFiles.indices.contains(currentIndex) {
+            _ = playbackSessionStore.mergeInstalledTrack(
+                playbackSessionTrackIdentity(for: audioFiles[currentIndex].url)
+            )
+        }
     }
 
     /// Restore last used playback scope (queue vs a specific user playlist).
@@ -391,7 +558,24 @@ final class PlaylistManager: ObservableObject {
     /// - Important: Call this after the queue (`audioFiles`) has been restored, otherwise playlist-scope
     ///   playback won't be able to map tracks to queue indices.
     func restorePlaybackScopeIfNeeded(playlistsStore: PlaylistsStore) async {
-        switch appPreferencesStore.load().playbackScope {
+        await restorePlaybackScopeIfNeeded(
+            playlistsStore: playlistsStore,
+            sessionSnapshot: playbackSessionStore?.snapshot
+        )
+    }
+
+    private func restorePlaybackScopeIfNeeded(
+        playlistsStore: PlaylistsStore,
+        sessionSnapshot: PlaybackSessionStore.Snapshot?
+    ) async {
+        let persistedScope: PlaybackScope
+        switch sessionSnapshot?.scope ?? .queue {
+        case .queue:
+            persistedScope = .queue
+        case .playlist(let id):
+            persistedScope = .playlist(id)
+        }
+        switch persistedScope {
         case .queue:
             await MainActor.run { [weak self] in
                 self?.setPlaybackScopeQueue()
@@ -409,10 +593,14 @@ final class PlaylistManager: ObservableObject {
             }
 
             let fm = FileManager.default
-            let playableTracks = playlist.tracks.filter {
-                fm.fileExists(atPath: $0.path)
+            let resolvedTracks = await resolvePlaylistTrackLocations(playlist.tracks)
+            let playableIndices = playlist.tracks.indices.filter { index in
+                resolvedTracks.indices.contains(index)
+                    && resolvedTracks[index].offlineReason == nil
+                    && fm.fileExists(atPath: resolvedTracks[index].url.path)
             }
-            let urlsInOrder = playableTracks.map { URL(fileURLWithPath: $0.path) }
+            let playableTracks = playableIndices.map { playlist.tracks[$0] }
+            let urlsInOrder = playableIndices.map { resolvedTracks[$0].url }
 
             if urlsInOrder.isEmpty {
                 await MainActor.run { [weak self] in
@@ -423,9 +611,12 @@ final class PlaylistManager: ObservableObject {
 
             // Extract signatures from playlist tracks
             var signatures: [String: FileSignature] = [:]
-            for track in playlist.tracks {
+            for (index, track) in playlist.tracks.enumerated() {
                 if let sig = track.signature {
-                    signatures[track.path] = sig
+                    let path = resolvedTracks.indices.contains(index)
+                        ? resolvedTracks[index].url.path
+                        : track.path
+                    signatures[path] = sig
                 }
             }
 
@@ -466,9 +657,20 @@ final class PlaylistManager: ObservableObject {
 
             let filesToAppend = toAppend
             let signaturesSnapshot = signatures
+            let storedTracksByResolvedPath = Dictionary(
+                playableIndices.map { index in
+                    (resolvedTracks[index].url.path, playlist.tracks[index])
+                },
+                uniquingKeysWith: { first, _ in first }
+            )
             if !filesToAppend.isEmpty {
                 await MainActor.run { [weak self] in
-                    _ = self?.ensureInQueue(filesToAppend, focusURL: nil, signatures: signaturesSnapshot)
+                    _ = self?.ensureInQueue(
+                        filesToAppend,
+                        focusURL: nil,
+                        signatures: signaturesSnapshot,
+                        storedTracksByResolvedPath: storedTracksByResolvedPath
+                    )
                 }
             }
 
@@ -476,7 +678,8 @@ final class PlaylistManager: ObservableObject {
                 self?.setPlaybackScopePlaylist(
                     playlistID,
                     trackURLsInOrder: urlsInOrder,
-                    trackIDsInOrder: playableTracks.map { $0.id.uuidString }
+                    trackIDsInOrder: playableTracks.map { $0.id.uuidString },
+                    selectedTrackID: sessionSnapshot?.installedTrack.scopeTrackID?.uuidString
                 )
             }
 
@@ -599,6 +802,12 @@ final class PlaylistManager: ObservableObject {
 
         queueLoadGeneration &+= 1
         let generation = queueLoadGeneration
+        // Capture exactly once before detached restore work starts. Every scope,
+        // identity and position decision below is derived from this value.
+        let frozenSessionSnapshot = playbackSessionStore?.snapshot
+        if frozenSessionSnapshot != nil {
+            playbackSessionRestoreGeneration = generation
+        }
         transitionQueueLoadState(.loading(generation: generation))
         isInitialRestorePending = true
 
@@ -628,8 +837,14 @@ final class PlaylistManager: ObservableObject {
             }
             guard accepted else { return }
 
-            await self.restorePlaybackScopeIfNeeded(playlistsStore: playlistsStore)
-            guard !Task.isCancelled else { return }
+            await self.restorePlaybackScopeIfNeeded(
+                playlistsStore: playlistsStore,
+                sessionSnapshot: frozenSessionSnapshot
+            )
+            guard !Task.isCancelled else {
+                await self.finishCancelledInitialRestore(generation: generation)
+                return
+            }
 
             await MainActor.run {
                 guard !self.isTerminating, self.queueLoadGeneration == generation else { return }
@@ -637,8 +852,30 @@ final class PlaylistManager: ObservableObject {
                 // The persisted queue must still load so a temporary session can
                 // never replace it with an empty in-memory placeholder.
                 let skipPlaybackRestore = audioPlayer.consumeSkipRestoreThisLaunch()
+                var restoredURL: URL?
                 if !skipPlaybackRestore, audioPlayer.currentFile == nil {
-                    audioPlayer.loadLastPlayedFile()
+                    if let session = frozenSessionSnapshot {
+                        self.ensureQueueEntryIDAlignment()
+                        restoredURL = self.restoredPlaybackURL(from: session)
+                        if let restoredURL {
+                            audioPlayer.loadPlaybackSession(
+                                fileURL: restoredURL,
+                                time: Double(session.positionMilliseconds) / 1_000
+                            )
+                        }
+                    } else {
+                        audioPlayer.loadLastPlayedFile()
+                    }
+                }
+                if let session = frozenSessionSnapshot {
+                    // Resolve even when a Finder/Dock launch suppresses playback;
+                    // normalization must still use the same frozen identity.
+                    restoredURL = restoredURL ?? self.restoredPlaybackURL(from: session)
+                    self.finishPlaybackSessionRestore(
+                        generation: generation,
+                        frozenSnapshot: session,
+                        restoredURL: restoredURL
+                    )
                 }
                 self.isInitialRestorePending = false
                 self.initialRestoreTask = nil
@@ -667,12 +904,68 @@ final class PlaylistManager: ObservableObject {
 
     private func finishCancelledInitialRestore(generation: UInt64) async {
         await MainActor.run { [weak self] in
-            guard let self,
-                  self.queueLoadState == .loading(generation: generation) else { return }
+            guard let self else { return }
+            if self.playbackSessionRestoreGeneration == generation {
+                self.playbackSessionRestoreGeneration = nil
+            }
+            guard self.queueLoadState == .loading(generation: generation) else { return }
             self.isInitialRestorePending = false
             self.initialRestoreTask = nil
             self.transitionQueueLoadState(.notStarted)
         }
+    }
+
+    @MainActor
+    private func restoredPlaybackURL(
+        from snapshot: PlaybackSessionStore.Snapshot
+    ) -> URL? {
+        if case .playlist = playbackScope,
+           let scopeTrackID = snapshot.installedTrack.scopeTrackID {
+            let occurrencePrefix = "id:\(scopeTrackID.uuidString)"
+            if let occurrence = playbackPlaylistTrackKeys.first(where: {
+                $0 == occurrencePrefix || $0.hasPrefix("\(occurrencePrefix)#")
+            }),
+               let key = pathKeyForPlaylistOccurrence(occurrence),
+               let index = indexInQueue(forPathKey: key),
+               audioFiles.indices.contains(index) {
+                return audioFiles[index].url
+            }
+        }
+        return snapshot.installedTrack.queueEntryID
+            .flatMap { queueEntryIDs.firstIndex(of: $0) }
+            .flatMap { audioFiles.indices.contains($0) ? audioFiles[$0].url : nil }
+            ?? snapshot.installedTrack.fallbackPath.flatMap { fallback in
+                let key = PathKey.canonical(path: fallback)
+                return audioFiles.first { pathKey($0.url) == key }?.url
+            }
+    }
+
+    /// Final restore publication is deliberately concentrated in one MainActor
+    /// turn. PlaybackSessionStore cancels/debounces each intermediate revision,
+    /// so these three merges converge on one final persisted snapshot; this is
+    /// the current atomicity boundary until the store exposes a whole-session merge.
+    @MainActor
+    private func finishPlaybackSessionRestore(
+        generation: UInt64,
+        frozenSnapshot: PlaybackSessionStore.Snapshot,
+        restoredURL: URL?
+    ) {
+        guard playbackSessionRestoreGeneration == generation,
+              let playbackSessionStore else { return }
+        playbackSessionRestoreGeneration = nil
+
+        let normalizedScope: PlaybackSessionStore.Scope
+        switch playbackScope {
+        case .queue: normalizedScope = .queue
+        case .playlist(let id): normalizedScope = .playlist(id)
+        }
+        let normalizedURL = restoredURL
+            ?? (audioFiles.indices.contains(currentIndex) ? audioFiles[currentIndex].url : nil)
+        let normalizedTrack = normalizedURL.map(playbackSessionTrackIdentity(for:)) ?? .empty
+        let normalizedPosition = restoredURL == nil ? 0 : frozenSnapshot.positionMilliseconds
+        _ = playbackSessionStore.mergeScope(normalizedScope)
+        _ = playbackSessionStore.mergeInstalledTrack(normalizedTrack)
+        _ = playbackSessionStore.mergePosition(milliseconds: normalizedPosition)
     }
 
     @MainActor
@@ -721,7 +1014,10 @@ final class PlaylistManager: ObservableObject {
     /// AppKit termination must stay synchronous: waiting from
     /// `applicationShouldTerminate` can deadlock its nested run loop.
     @MainActor
-    func prepareForImmediateTermination() {
+    func prepareForImmediateTermination(generation: UInt64? = nil) {
+        // Termination is one-way. Repeated callbacks for the same AppKit quit
+        // request must not advance queue generations or restart cancellation.
+        guard !isTerminating else { return }
         let wasReady: Bool
         switch queueLoadState {
         case .ready, .terminating(wasReady: true):
@@ -730,6 +1026,7 @@ final class PlaylistManager: ObservableObject {
             wasReady = false
         }
         isTerminating = true
+        playbackSessionRestoreGeneration = nil
         transitionQueueLoadState(.terminating(wasReady: wasReady))
         queueLoadGeneration &+= 1
         initialRestoreTask?.cancel()
@@ -747,6 +1044,96 @@ final class PlaylistManager: ObservableObject {
         for waiter in startWaiters {
             waiter.resume()
         }
+    }
+
+    /// Captures (or reuses) the immutable structural queue snapshot consumed by
+    /// the termination flush. The estimate is intentionally conservative: for a
+    /// large queue with too little budget, returning `.timedOut` is preferable to
+    /// beginning an unbounded O(n log n) build on AppKit's synchronous quit path.
+    @MainActor
+    func prepareTerminationQueueSnapshot(
+        remaining: TimeInterval,
+        generation: UInt64
+    ) -> QueueTerminationSnapshotPreparation {
+        playlistSaveStateLock.lock()
+        if let cached = terminationSnapshotPreparation,
+           cached.generation == generation {
+            playlistSaveStateLock.unlock()
+            return cached.result
+        }
+        let entryCount = audioFiles.count + retainedMissingWithOriginalIndex.count
+        let readOnly = isPlaylistPersistenceReadOnly
+        let canBuild = canBuildPlaylistPersistenceSnapshot
+        let hasStructuralDebt = playlistSaveRevision > playlistDurableRevision
+            || playlistSaveWorkItem != nil
+            || pendingPlaylistWrite != nil
+            || isPlaylistWriteDrainScheduled
+        let currentStateGeneration = playlistSnapshotStateGeneration
+        let reusable = latestCapturedPlaylistSnapshot.flatMap {
+            $0.stateGeneration == currentStateGeneration ? $0 : nil
+        }
+        playlistSaveStateLock.unlock()
+
+        let outcome: QueueTerminationSnapshotPreparation.Outcome
+        if readOnly {
+            outcome = .protectedReadOnly
+        } else if !canBuild {
+            outcome = .skippedBeforeRestore
+        } else if libraryDatabase != nil, !hasStructuralDebt {
+            outcome = .cursorOnly
+        } else if reusable != nil {
+            outcome = .reusedLatest
+        } else {
+            let budget = remaining.isFinite ? max(0, remaining) : 0
+            // Includes alignment, record allocation and final sorting. At the
+            // hard 100k cap this reserves roughly half a second for capture.
+            let estimatedCaptureSeconds = 0.004 + (Double(entryCount) * 0.000_005)
+            guard budget >= estimatedCaptureSeconds else {
+                let result = QueueTerminationSnapshotPreparation(
+                    outcome: .timedOut,
+                    generation: generation,
+                    entryCount: entryCount
+                )
+                playlistSaveStateLock.lock()
+                terminationSnapshotPreparation = (generation, result)
+                playlistSaveStateLock.unlock()
+                return result
+            }
+
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            let snapshot = buildPlaylistSnapshot()
+            let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
+            guard elapsed <= budget else {
+                outcome = .timedOut
+                let result = QueueTerminationSnapshotPreparation(
+                    outcome: outcome,
+                    generation: generation,
+                    entryCount: entryCount
+                )
+                playlistSaveStateLock.lock()
+                terminationSnapshotPreparation = (generation, result)
+                playlistSaveStateLock.unlock()
+                return result
+            }
+            playlistSaveStateLock.lock()
+            latestCapturedPlaylistSnapshot = (
+                currentStateGeneration,
+                playlistSaveRevision,
+                snapshot
+            )
+            playlistSaveStateLock.unlock()
+            outcome = .prepared
+        }
+
+        let result = QueueTerminationSnapshotPreparation(
+            outcome: outcome,
+            generation: generation,
+            entryCount: entryCount
+        )
+        playlistSaveStateLock.lock()
+        terminationSnapshotPreparation = (generation, result)
+        playlistSaveStateLock.unlock()
+        return result
     }
 
     @MainActor
@@ -850,7 +1237,10 @@ final class PlaylistManager: ObservableObject {
     private func queueStateFitsPersistenceBounds(
         addingFiles: [(file: AudioFile, signature: FileSignature?)] = [],
         removingMissingIndices: Set<Int> = [],
-        addingRekeys: [SavedPlaylist.WeightRekeyRecord] = []
+        addingRekeys: [SavedPlaylist.WeightRekeyRecord] = [],
+        signatureOverrides: [String: FileSignature] = [:],
+        locationOverrides: [Int: QueueLocationReference] = [:],
+        addingLocationReferences: [QueueLocationReference?] = []
     ) -> Bool {
         let retainedMissingCount = retainedMissingWithOriginalIndex.indices.reduce(into: 0) {
             if !removingMissingIndices.contains($1) { $0 += 1 }
@@ -884,18 +1274,39 @@ final class PlaylistManager: ObservableObject {
             return true
         }
 
-        for file in audioFiles {
+        for (index, file) in audioFiles.enumerated() {
             guard consumeString(file.url.path, requiresAbsolutePath: true),
-                  consumeSignature(loadedSignatureByPath[file.url.path]) else { return false }
+                  consumeSignature(
+                    signatureOverrides[file.url.path] ?? loadedSignatureByPath[file.url.path]
+                  ) else { return false }
+            let location = locationOverrides[index]
+                ?? (queueLocationReferences.indices.contains(index)
+                    ? queueLocationReferences[index]
+                    : nil)
+            if let relativePath = location?.relativePath {
+                guard (try? LibraryRelativePath.validate(
+                    relativePath,
+                    allowEmpty: false
+                )) != nil,
+                consumeString(relativePath, requiresAbsolutePath: false) else { return false }
+            }
         }
         for (index, missing) in retainedMissingWithOriginalIndex.enumerated()
         where !removingMissingIndices.contains(index) {
             guard consumeString(missing.record.path, requiresAbsolutePath: true),
                   consumeSignature(missing.record.signature) else { return false }
         }
-        for addition in addingFiles {
+        for (index, addition) in addingFiles.enumerated() {
             guard consumeString(addition.file.url.path, requiresAbsolutePath: true),
                   consumeSignature(addition.signature) else { return false }
+            if addingLocationReferences.indices.contains(index),
+               let relativePath = addingLocationReferences[index]?.relativePath {
+                guard (try? LibraryRelativePath.validate(
+                    relativePath,
+                    allowEmpty: false
+                )) != nil,
+                consumeString(relativePath, requiresAbsolutePath: false) else { return false }
+            }
         }
 
         let mergedRekeys = mergedPendingQueueWeightRekeys(addingRekeys)
@@ -1065,6 +1476,32 @@ final class PlaylistManager: ObservableObject {
 
         await updateUI(phase: "扫描完成", detail: scanSummary, current: fileURLs.count, total: fileURLs.count, force: true)
 
+        // Persist one bookmark per user-selected root (or explicit single
+        // file), then attach only compact relative references to queue rows.
+        // A mounted-volume rename can therefore be repaired without scanning.
+        let importLocations = await registerImportLocations(for: urls)
+        var importedReferenceByPath: [String: QueueLocationReference] = [:]
+        if !importLocations.isEmpty {
+            let orderedLocations = importLocations.sorted {
+                $0.fallbackPath.count > $1.fallbackPath.count
+            }
+            for fileURL in fileURLs {
+                for location in orderedLocations {
+                    if let reference = try? await libraryLocationResolver.makeReference(
+                        for: fileURL,
+                        in: location
+                    ) {
+                        importedReferenceByPath[fileURL.path] = QueueLocationReference(
+                            locationID: reference.locationID ?? location.id,
+                            relativePath: reference.relativePath
+                        )
+                        break
+                    }
+                }
+            }
+        }
+        let importReferencesSnapshot = importedReferenceByPath
+
         await updateUI(phase: "读取元数据…", detail: "", current: 0, total: fileURLs.count, force: true)
 
         // Deduplicate input URLs by canonical and legacy path before worker pool
@@ -1125,6 +1562,7 @@ final class PlaylistManager: ObservableObject {
                   self.queueLoadState == .ready,
                   self.isQueueContentMutationAllowed() else { return }
 
+            self.ensureQueueEntryIDAlignment()
             let wasEmpty = self.audioFiles.isEmpty
             let oldCount = self.audioFiles.count
             let selectedFileID = self.audioFiles.indices.contains(self.currentIndex)
@@ -1167,6 +1605,7 @@ final class PlaylistManager: ObservableObject {
             var relocatedAdditions: [(
                 file: AudioFile,
                 signature: FileSignature,
+                entryID: UUID,
                 originalIndex: Int,
                 oldPath: String
             )] = []
@@ -1184,6 +1623,7 @@ final class PlaylistManager: ObservableObject {
                 relocatedAdditions.append((
                     file: candidate.file,
                     signature: candidate.signature,
+                    entryID: missing.record.id ?? UUID(),
                     originalIndex: missing.originalIndex,
                     oldPath: missing.record.path
                 ))
@@ -1237,6 +1677,8 @@ final class PlaylistManager: ObservableObject {
             if !relocatedAdditions.isEmpty {
                 struct OrderedRuntimeEntry {
                     let file: AudioFile
+                    let entryID: UUID
+                    let locationReference: QueueLocationReference?
                     let originalIndex: Int?
                     let ordinal: Int
                 }
@@ -1246,6 +1688,10 @@ final class PlaylistManager: ObservableObject {
                 var ordered = self.audioFiles.enumerated().map { runtimeIndex, file in
                     OrderedRuntimeEntry(
                         file: file,
+                        entryID: self.queueEntryIDs[runtimeIndex],
+                        locationReference: self.queueLocationReferences.indices.contains(runtimeIndex)
+                            ? self.queueLocationReferences[runtimeIndex]
+                            : nil,
                         originalIndex: self.fullOrderIndexForAudioFile[runtimeIndex],
                         ordinal: runtimeIndex
                     )
@@ -1253,6 +1699,8 @@ final class PlaylistManager: ObservableObject {
                 ordered.append(contentsOf: relocatedAdditions.enumerated().map { offset, item in
                     OrderedRuntimeEntry(
                         file: item.file,
+                        entryID: item.entryID,
+                        locationReference: nil,
                         originalIndex: item.originalIndex,
                         ordinal: oldCount + offset
                     )
@@ -1270,6 +1718,8 @@ final class PlaylistManager: ObservableObject {
                     }
                 }
                 self.audioFiles = ordered.map(\.file)
+                self.queueEntryIDs = ordered.map(\.entryID)
+                self.queueLocationReferences = ordered.map(\.locationReference)
                 self.fullOrderIndexForAudioFile = ordered.map(\.originalIndex)
 
                 if let savedCurrent = self.retainedSavedCurrentFullOrderIndex,
@@ -1298,6 +1748,10 @@ final class PlaylistManager: ObservableObject {
                 }
             }
             self.audioFiles.append(contentsOf: toAppend.map(\.file))
+            self.queueEntryIDs.append(contentsOf: toAppend.map { _ in UUID() })
+            self.queueLocationReferences.append(contentsOf: toAppend.map {
+                importReferencesSnapshot[$0.file.url.path]
+            })
             if !self.fullOrderIndexForAudioFile.isEmpty {
                 self.fullOrderIndexForAudioFile.append(contentsOf: repeatElement(
                     nil,
@@ -1326,6 +1780,534 @@ final class PlaylistManager: ObservableObject {
             if wasEmpty && !self.audioFiles.isEmpty && !self.isRestoringPlaylist {
                 NotificationCenter.default.post(name: .playlistDidAddFirstFiles, object: nil)
             }
+        }
+    }
+
+    private func registerImportLocations(for selectedURLs: [URL]) async -> [LibraryLocation] {
+        guard let libraryDatabase, libraryDatabase.accessMode == .writable else { return [] }
+
+        var existingByIdentity: [String: LibraryLocation] = [:]
+        do {
+            _ = try libraryDatabase.forEachLibraryLocation { record in
+                let key = "\(record.location.kind.rawValue)\u{0}\(record.location.fallbackPath)"
+                existingByIdentity[key] = record.location
+                return true
+            }
+        } catch {
+            PersistenceLogger.log("读取已授权音乐位置失败：\(error.localizedDescription)")
+            return []
+        }
+
+        var locations: [LibraryLocation] = []
+        var seen = Set<String>()
+        for suppliedURL in selectedURLs {
+            guard !Task.isCancelled else { return locations }
+            let url = suppliedURL.standardizedFileURL
+            let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
+            let kind: LibraryLocationKind
+            if values?.isDirectory == true {
+                kind = .directory
+            } else if values?.isRegularFile == true {
+                kind = .singleFile
+            } else {
+                continue
+            }
+            let identity = "\(kind.rawValue)\u{0}\(url.path)"
+            guard seen.insert(identity).inserted else { continue }
+
+            let location: LibraryLocation
+            do {
+                location = try await libraryLocationResolver.makeLocation(
+                    for: url,
+                    kind: kind,
+                    id: existingByIdentity[identity]?.id ?? UUID()
+                )
+            } catch {
+                PersistenceLogger.log("无法保存音乐位置 \(url.lastPathComponent)：\(error.localizedDescription)")
+                continue
+            }
+
+            var stored = false
+            for _ in 0..<3 {
+                do {
+                    let revision = try libraryDatabase.libraryLocationsRevision()
+                    stored = try libraryDatabase.upsertLibraryLocation(
+                        LibraryLocationRecord(location: location, updatedAt: Date()),
+                        expectedRevision: revision,
+                        nextRevision: revision &+ 1
+                    )
+                    if stored { break }
+                } catch {
+                    PersistenceLogger.log("保存音乐位置失败：\(error.localizedDescription)")
+                    break
+                }
+            }
+            if stored {
+                locations.append(location)
+                existingByIdentity[identity] = location
+            }
+        }
+        return locations
+    }
+
+    /// Re-resolves only tracks backed by a persisted location. Offline rows
+    /// stay in the queue with their stable occurrence IDs, and reconnecting a
+    /// volume updates paths in place rather than scanning the disk.
+    func refreshExternalMediaAvailability(
+        playlistsStore: PlaylistsStore? = nil,
+        topologyGeneration: UInt64? = nil
+    ) async {
+        guard libraryDatabase != nil else { return }
+        let acceptedGeneration = await MainActor.run { () -> UInt64? in
+            let generation = topologyGeneration
+                ?? (self.latestExternalTopologyGeneration &+ 1)
+            guard generation > self.latestExternalTopologyGeneration else { return nil }
+            self.latestExternalTopologyGeneration = generation
+            return generation
+        }
+        guard let acceptedGeneration else { return }
+        let locations = await loadLibraryLocationsOffMain()
+
+        struct Candidate: @unchecked Sendable {
+            let index: Int
+            let entryID: UUID
+            let file: AudioFile
+            let reference: LibraryTrackReference
+        }
+        let candidates: [Candidate] = await MainActor.run {
+            self.ensureQueueEntryIDAlignment()
+            return self.audioFiles.indices.compactMap { index in
+                guard let stored = self.queueLocationReferences[index],
+                      let reference = try? LibraryTrackReference(
+                          id: self.queueEntryIDs[index],
+                          locationID: stored.locationID,
+                          relativePath: stored.relativePath,
+                          legacyAbsolutePath: self.audioFiles[index].url.path,
+                          signature: self.loadedSignatureByPath[self.audioFiles[index].url.path]
+                      ) else { return nil }
+                return Candidate(
+                    index: index,
+                    entryID: self.queueEntryIDs[index],
+                    file: self.audioFiles[index],
+                    reference: reference
+                )
+            }
+        }
+        struct ResolutionUpdate: @unchecked Sendable {
+            let candidate: Candidate
+            let availability: LibraryLocationAvailability
+        }
+        var updates: [ResolutionUpdate] = []
+        updates.reserveCapacity(candidates.count)
+        var refreshedLocations: [UUID: PendingLibraryLocationRefresh] = [:]
+        for start in stride(from: 0, to: candidates.count, by: 256) {
+            guard !Task.isCancelled else { return }
+            for candidate in candidates[start..<min(start + 256, candidates.count)] {
+                guard let location = locations[candidate.reference.locationID ?? UUID()] else {
+                    updates.append(ResolutionUpdate(
+                        candidate: candidate,
+                        availability: .invalidReference("保存的音乐位置不存在")
+                    ))
+                    continue
+                }
+                let resolution = await libraryLocationResolver.resolve(
+                    candidate.reference,
+                    in: location
+                )
+                updates.append(ResolutionUpdate(
+                    candidate: candidate,
+                    availability: resolution.availability
+                ))
+                if let refresh = resolution.bookmarkRefresh {
+                    refreshedLocations[location.id] = PendingLibraryLocationRefresh(
+                        baseLocation: location,
+                        refresh: refresh
+                    )
+                }
+            }
+            await Task.yield()
+        }
+
+        for pendingRefresh in refreshedLocations.values {
+            _ = await persistLibraryLocationRefresh(pendingRefresh)
+        }
+
+        let updatesSnapshot = updates
+        let applyResult = await MainActor.run { () -> (didChange: Bool, hydratedURLs: [URL]) in
+            var changed = false
+            var hydratedURLs: [URL] = []
+            guard self.latestExternalTopologyGeneration == acceptedGeneration else {
+                return (false, [])
+            }
+            for update in updatesSnapshot {
+                guard let index = self.queueEntryIDs.firstIndex(
+                    of: update.candidate.entryID
+                ), self.audioFiles.indices.contains(index),
+                self.pathKey(self.audioFiles[index].url)
+                    == self.pathKey(update.candidate.file.url) else { continue }
+                let oldFile = self.audioFiles[index]
+                switch update.availability {
+                case .available(let resolvedURL):
+                    let oldKey = self.pathKey(oldFile.url)
+                    let newKey = self.pathKey(resolvedURL)
+                    if oldKey != newKey {
+                        self.audioFiles[index] = AudioFile(
+                            id: oldFile.id,
+                            url: resolvedURL,
+                            metadata: oldFile.metadata,
+                            lyricsTimeline: oldFile.lyricsTimeline,
+                            duration: oldFile.duration
+                        )
+                        if let signature = self.loadedSignatureByPath.removeValue(
+                            forKey: oldFile.url.path
+                        ) {
+                            self.loadedSignatureByPath[resolvedURL.path] = signature
+                        }
+                        changed = true
+                    }
+                    if self.unplayableReasons.removeValue(forKey: oldKey) != nil {
+                        changed = true
+                        hydratedURLs.append(resolvedURL)
+                    }
+                    self.unplayableReasons.removeValue(forKey: newKey)
+                default:
+                    let reason = Self.externalAvailabilityMessage(update.availability)
+                    let key = self.pathKey(oldFile.url)
+                    if self.unplayableReasons[key] != reason {
+                        self.unplayableReasons[key] = reason
+                        changed = true
+                    }
+                }
+            }
+            if changed {
+                self.invalidateQueueIndexCache()
+                self.updateFilteredFiles()
+                self.resetShuffleQueue()
+                self.savePlaylist()
+            }
+            return (changed, hydratedURLs)
+        }
+        if applyResult.didChange, !applyResult.hydratedURLs.isEmpty {
+            await hydrateRestoredMetadata(
+                urls: applyResult.hydratedURLs,
+                audioPlayer: nil
+            )
+        }
+        if let playlistsStore {
+            await refreshActivePlaylistScopeAfterTopologyChange(
+                playlistsStore: playlistsStore,
+                topologyGeneration: acceptedGeneration
+            )
+        }
+        await MainActor.run {
+            guard self.latestExternalTopologyGeneration == acceptedGeneration else { return }
+            NotificationCenter.default.post(
+                name: .externalMediaTopologyDidChange,
+                object: self,
+                userInfo: ["generation": acceptedGeneration]
+            )
+        }
+    }
+
+    private func refreshActivePlaylistScopeAfterTopologyChange(
+        playlistsStore: PlaylistsStore,
+        topologyGeneration: UInt64
+    ) async {
+        let playlist: UserPlaylist? = await MainActor.run {
+            guard self.latestExternalTopologyGeneration == topologyGeneration,
+                  case .playlist(let playlistID) = self.playbackScope else { return nil }
+            return playlistsStore.playlist(for: playlistID)
+        }
+        guard let playlist else { return }
+        let resolved = await resolvePlaylistTrackLocations(playlist.tracks)
+        guard resolved.count == playlist.tracks.count else { return }
+
+        await MainActor.run {
+            guard self.latestExternalTopologyGeneration == topologyGeneration,
+                  case .playlist(let activeID) = self.playbackScope,
+                  activeID == playlist.id else { return }
+            let playableIndices = playlist.tracks.indices.filter {
+                resolved[$0].offlineReason == nil
+                    && FileManager.default.fileExists(atPath: resolved[$0].url.path)
+            }
+            let urls = playableIndices.map { resolved[$0].url }
+            let files = playableIndices.map { index -> AudioFile in
+                let url = resolved[index].url
+                if let existing = self.audioFiles.first(where: {
+                    self.pathKey($0.url) == self.pathKey(url)
+                }) {
+                    return existing
+                }
+                return AudioFile(
+                    id: playlist.tracks[index].id.uuidString,
+                    url: url,
+                    metadata: AudioMetadata(
+                        title: url.deletingPathExtension().lastPathComponent,
+                        artist: "未知艺术家",
+                        album: "未知专辑",
+                        year: nil,
+                        genre: nil,
+                        artwork: nil
+                    )
+                )
+            }
+            let storedByPath = Dictionary(
+                playableIndices.map {
+                    (resolved[$0].url.path, playlist.tracks[$0])
+                },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let signatures = Dictionary(
+                playableIndices.compactMap { index in
+                    playlist.tracks[index].signature.map {
+                        (resolved[index].url.path, $0)
+                    }
+                },
+                uniquingKeysWith: { first, _ in first }
+            )
+            if !files.isEmpty {
+                _ = self.ensureInQueue(
+                    files,
+                    signatures: signatures,
+                    storedTracksByResolvedPath: storedByPath
+                )
+            }
+            self.setPlaybackScopePlaylist(
+                playlist.id,
+                trackURLsInOrder: urls,
+                trackIDsInOrder: playableIndices.map {
+                    playlist.tracks[$0].id.uuidString
+                }
+            )
+        }
+    }
+
+    func resolvePlaylistTrackLocations(
+        _ tracks: [UserPlaylist.Track]
+    ) async -> [ResolvedPlaylistTrack] {
+        let locations = await loadLibraryLocationsOffMain()
+        var output: [ResolvedPlaylistTrack] = []
+        output.reserveCapacity(tracks.count)
+        var refreshedLocations: [UUID: PendingLibraryLocationRefresh] = [:]
+        for start in stride(from: 0, to: tracks.count, by: 256) {
+            guard !Task.isCancelled else { return output }
+            for track in tracks[start..<min(start + 256, tracks.count)] {
+                let fallback = URL(fileURLWithPath: track.path)
+                guard let locationID = track.locationID else {
+                    output.append(ResolvedPlaylistTrack(url: fallback, offlineReason: nil))
+                    continue
+                }
+                guard let location = locations[locationID],
+                      let reference = try? LibraryTrackReference(
+                          id: track.id,
+                          locationID: locationID,
+                          relativePath: track.relativePath,
+                          legacyAbsolutePath: track.path,
+                          signature: track.signature
+                      ) else {
+                    output.append(ResolvedPlaylistTrack(
+                        url: fallback,
+                        offlineReason: "保存的音乐位置引用无效"
+                    ))
+                    continue
+                }
+                let resolution = await libraryLocationResolver.resolve(reference, in: location)
+                switch resolution.availability {
+                case .available(let url):
+                    output.append(ResolvedPlaylistTrack(url: url, offlineReason: nil))
+                default:
+                    output.append(ResolvedPlaylistTrack(
+                        url: fallback,
+                        offlineReason: Self.externalAvailabilityMessage(
+                            resolution.availability
+                        )
+                    ))
+                }
+                if let refresh = resolution.bookmarkRefresh {
+                    refreshedLocations[location.id] = PendingLibraryLocationRefresh(
+                        baseLocation: location,
+                        refresh: refresh
+                    )
+                }
+            }
+            await Task.yield()
+        }
+        for pendingRefresh in refreshedLocations.values {
+            _ = await persistLibraryLocationRefresh(pendingRefresh)
+        }
+        return output
+    }
+
+    /// Invalidates resolver leases before an external volume disappears and
+    /// marks matching rows offline immediately. Returns whether the installed
+    /// queue selection belongs to that volume so the caller can pause audio.
+    func handleExternalVolumeWillUnmount(_ volume: MountedLibraryVolume?) async -> Bool {
+        guard let volume else { return false }
+        let locations = await loadLibraryLocationsOffMain()
+        let affectedLocationIDs = Set(locations.values.compactMap { location -> UUID? in
+            if let expected = location.volumeIdentifier,
+               let actual = volume.identifier {
+                return expected == actual ? location.id : nil
+            }
+            let root = location.fallbackURL.standardizedFileURL.path
+            let mounted = volume.url.standardizedFileURL.path
+            return root == mounted || root.hasPrefix(mounted + "/") ? location.id : nil
+        })
+        guard !affectedLocationIDs.isEmpty else { return false }
+        for id in affectedLocationIDs {
+            await libraryLocationResolver.invalidateActiveResolution(for: id)
+        }
+        return await MainActor.run {
+            self.ensureQueueEntryIDAlignment()
+            var currentIsAffected = false
+            for index in self.audioFiles.indices {
+                guard let reference = self.queueLocationReferences[index],
+                      affectedLocationIDs.contains(reference.locationID) else { continue }
+                self.unplayableReasons[self.pathKey(self.audioFiles[index].url)] =
+                    "所在磁盘正在断开"
+                if index == self.currentIndex { currentIsAffected = true }
+            }
+            if !affectedLocationIDs.isEmpty {
+                self.resetShuffleQueue()
+            }
+            return currentIsAffected
+        }
+    }
+
+    private func loadLibraryLocationsOffMain() async -> [UUID: LibraryLocation] {
+        guard let libraryDatabase else { return [:] }
+        return await Task.detached(priority: .utility) {
+            var result: [UUID: LibraryLocation] = [:]
+            do {
+                _ = try libraryDatabase.forEachLibraryLocation { record in
+                    result[record.location.id] = record.location
+                    return true
+                }
+            } catch {
+                PersistenceLogger.log("读取音乐位置失败：\(error.localizedDescription)")
+            }
+            return result
+        }.value
+    }
+
+    func playbackAccessRequest(for file: AudioFile) -> AudioPlaybackAccessRequest? {
+        let lookup = { () -> AudioPlaybackAccessRequest? in
+            self.ensureQueueEntryIDAlignment()
+            let key = self.pathKey(file.url)
+            let index: Int?
+            if self.audioFiles.indices.contains(self.currentIndex),
+               self.pathKey(self.audioFiles[self.currentIndex].url) == key {
+                index = self.currentIndex
+            } else {
+                index = self.indexInQueue(forPathKey: key)
+            }
+            guard let index,
+                  self.queueEntryIDs.indices.contains(index),
+                  self.queueLocationReferences.indices.contains(index),
+                  let stored = self.queueLocationReferences[index] else { return nil }
+            return AudioPlaybackAccessRequest(
+                referenceID: self.queueEntryIDs[index],
+                locationID: stored.locationID,
+                relativePath: stored.relativePath,
+                legacyAbsolutePath: file.url.path
+            )
+        }
+        if Thread.isMainThread { return lookup() }
+        return DispatchQueue.main.sync(execute: lookup)
+    }
+
+    func acquirePlaybackAccessLease(
+        for request: AudioPlaybackAccessRequest
+    ) async throws -> any AudioPlaybackAccessLease {
+        guard let libraryDatabase else {
+            throw LibraryLocationResolverError.unavailable(
+                .invalidReference("音乐库位置存储不可用")
+            )
+        }
+        let record = try await Task.detached(priority: .userInitiated) {
+            try libraryDatabase.loadLibraryLocation(id: request.locationID)
+        }.value
+        guard let location = record?.location else {
+            throw LibraryLocationResolverError.unavailable(
+                .invalidReference("保存的音乐位置不存在")
+            )
+        }
+        let reference = try LibraryTrackReference(
+            id: request.referenceID,
+            locationID: request.locationID,
+            relativePath: request.relativePath,
+            legacyAbsolutePath: request.legacyAbsolutePath,
+            signature: nil
+        )
+        let lease = try await libraryLocationResolver.acquireAccess(
+            to: reference,
+            in: location
+        )
+        if let refresh = lease.bookmarkRefresh {
+            _ = await persistLibraryLocationRefresh(
+                PendingLibraryLocationRefresh(
+                    baseLocation: location,
+                    refresh: refresh
+                )
+            )
+        }
+        return lease
+    }
+
+    @discardableResult
+    private func persistLibraryLocationRefresh(
+        _ pending: PendingLibraryLocationRefresh
+    ) async -> Bool {
+        guard let libraryDatabase, libraryDatabase.accessMode == .writable else { return false }
+        return await Task.detached(priority: .utility) {
+            let desired: LibraryLocation
+            do {
+                desired = try pending.baseLocation.applying(pending.refresh)
+            } catch {
+                return false
+            }
+
+            for _ in 0..<3 {
+                do {
+                    let revision = try libraryDatabase.libraryLocationsRevision()
+                    guard let current = try libraryDatabase.loadLibraryLocation(
+                        id: pending.baseLocation.id
+                    ) else { return false }
+                    if current.location == desired { return true }
+                    guard current.location == pending.baseLocation else { return false }
+                    let refreshed = try current.location.applying(pending.refresh)
+                    if try libraryDatabase.upsertLibraryLocation(
+                        LibraryLocationRecord(location: refreshed, updatedAt: Date()),
+                        expectedRevision: revision,
+                        nextRevision: revision &+ 1
+                    ) {
+                        return true
+                    }
+                } catch {
+                    PersistenceLogger.log("刷新音乐位置书签失败：\(error.localizedDescription)")
+                    return false
+                }
+            }
+            return false
+        }.value
+    }
+
+    private static func externalAvailabilityMessage(
+        _ availability: LibraryLocationAvailability
+    ) -> String {
+        switch availability {
+        case .available:
+            return ""
+        case .volumeUnavailable:
+            return "所在磁盘当前未连接"
+        case .authorizationRequired:
+            return "需要重新授权此音乐位置"
+        case .rootMissing:
+            return "保存的音乐根目录已移动"
+        case .fileMissing:
+            return "歌曲在音乐位置中不存在"
+        case .invalidReference(let detail), .indeterminate(let detail):
+            return detail
         }
     }
 
@@ -1384,42 +2366,67 @@ final class PlaylistManager: ObservableObject {
         // 刷新应当反映外部更改（尤其是 .lrc），不再盲目保留旧歌词
         // let currentLyrics = audioPlayer?.lyricsTimeline
 
-        let sourceFiles = audioFiles
-        // Indexes keep the scheduling input compact even for a 100k-track queue;
-        // copying every AudioFile into an enumerated tuple array would retain a
-        // second large collection of metadata and lyric references.
-        let sourceIndexes = Array(sourceFiles.indices)
+        struct RefreshIdentity: Hashable, Sendable {
+            let queueEntryID: UUID
+            let pathKey: String
+        }
+        struct RefreshCandidate: @unchecked Sendable {
+            let identity: RefreshIdentity
+            let file: AudioFile
+        }
+        let candidates: [RefreshCandidate] = await MainActor.run {
+            self.ensureQueueEntryIDAlignment()
+            return self.audioFiles.indices.map { index in
+                RefreshCandidate(
+                    identity: RefreshIdentity(
+                        queueEntryID: self.queueEntryIDs[index],
+                        pathKey: self.pathKey(self.audioFiles[index].url)
+                    ),
+                    file: self.audioFiles[index]
+                )
+            }
+        }
         let completedRefreshes = await BoundedWorkerPool.map(
-            items: sourceIndexes,
+            items: candidates,
             maxConcurrent: Self.maximumConcurrentMetadataRefreshTasks
-        ) { [weak self] index -> (Int, AudioFile)? in
+        ) { [weak self] candidate -> (RefreshIdentity, AudioMetadata)? in
             guard let self, !Task.isCancelled else { return nil }
-            let file = sourceFiles[index]
+            let file = candidate.file
             let newMetadata = await self.loadFreshMetadata(from: file.url)
             guard !Task.isCancelled else { return nil }
             await MetadataCache.shared.storeBasicMetadata(newMetadata, for: file.url)
-            // 不保留歌词时间轴，强制后续重新解析（避免外部 .lrc 或嵌入歌词更新后不生效）
-            let newFile = AudioFile(
-                url: file.url,
-                metadata: newMetadata,
-                lyricsTimeline: nil,
-                duration: file.duration
-            )
-            return (index, newFile)
+            return (candidate.identity, newMetadata)
         }
-        var refreshedFiles = sourceFiles
-        for case let (index, refreshedFile)? in completedRefreshes {
-            refreshedFiles[index] = refreshedFile
+        var metadataByIdentity: [RefreshIdentity: AudioMetadata] = [:]
+        metadataByIdentity.reserveCapacity(completedRefreshes.count)
+        for case let (identity, metadata)? in completedRefreshes {
+            metadataByIdentity[identity] = metadata
         }
-        let completedFiles = refreshedFiles
+        let metadataSnapshot = metadataByIdentity
 
         await MainActor.run {
-            audioFiles = completedFiles
-            updateFilteredFiles()
+            self.ensureQueueEntryIDAlignment()
+            for index in self.audioFiles.indices {
+                let identity = RefreshIdentity(
+                    queueEntryID: self.queueEntryIDs[index],
+                    pathKey: self.pathKey(self.audioFiles[index].url)
+                )
+                guard let metadata = metadataSnapshot[identity] else { continue }
+                let current = self.audioFiles[index]
+                self.audioFiles[index] = AudioFile(
+                    id: current.id,
+                    url: current.url,
+                    metadata: metadata,
+                    lyricsTimeline: nil,
+                    duration: current.duration
+                )
+            }
+            self.updateFilteredFiles()
 
             // 如果有正在播放的文件，更新AudioPlayer中的引用
             if let currentURL = currentFileURL,
                 let audioPlayer = audioPlayer,
+               audioPlayer.currentFile?.url == currentURL,
                let newCurrentFile = audioFiles.first(where: { $0.url == currentURL }) {
                 // 暂时保留播放器当前显示的歌词，待下面主动重载后替换
                 let mergedCurrent = AudioFile(url: newCurrentFile.url, metadata: newCurrentFile.metadata, lyricsTimeline: audioPlayer.lyricsTimeline, duration: newCurrentFile.duration)
@@ -1435,9 +2442,12 @@ final class PlaylistManager: ObservableObject {
         }
         // 保留音量均衡缓存：避免“完全刷新”导致所有歌曲都需要重新分析。
         // 若用户确实需要重算（例如音频内容被替换），可在菜单或“音量均衡分析”页手动清空缓存。
-        if let currentURL = currentFileURL, let audioPlayer = audioPlayer {
+        if let currentURL = currentFileURL,
+           let audioPlayer = audioPlayer,
+           await MainActor.run(body: { audioPlayer.currentFile?.url == currentURL }) {
             let result = await LyricsService.shared.loadLyrics(for: currentURL)
             await MainActor.run {
+                guard audioPlayer.currentFile?.url == currentURL else { return }
                 switch result {
                 case .success(let timeline):
                     audioPlayer.lyricsTimeline = timeline
@@ -1530,7 +2540,10 @@ final class PlaylistManager: ObservableObject {
             playbackScope: scopeBeforeRemoval,
             playlistPosition: playlistPositionBeforeRemoval
         )
+        ensureQueueEntryIDAlignment()
         audioFiles.remove(at: index)
+        queueEntryIDs.remove(at: index)
+        queueLocationReferences.remove(at: index)
 
         // Remove corresponding full-order index slot
         if index < fullOrderIndexForAudioFile.count {
@@ -1576,7 +2589,7 @@ final class PlaylistManager: ObservableObject {
                 let index = (start + offset) % audioFiles.count
                 guard !isUnplayableIndex(index) else { continue }
                 currentIndex = index
-                savePlaylist()
+                saveQueueCursor()
                 return audioFiles[index]
             }
             return nil
@@ -1593,7 +2606,7 @@ final class PlaylistManager: ObservableObject {
                       !isUnplayableIndex(index) else { continue }
                 currentIndex = index
                 currentPlaybackPlaylistOccurrenceKey = occurrenceKey
-                savePlaylist()
+                saveQueueCursor()
                 return audioFiles[index]
             }
             return nil
@@ -1607,6 +2620,8 @@ final class PlaylistManager: ObservableObject {
         guard isQueueContentMutationAllowed() else { return .rejected }
         cancelDurationPrefetch()
         audioFiles.removeAll()
+        queueEntryIDs.removeAll()
+        queueLocationReferences.removeAll()
         invalidateQueueIndexCache()
         filteredFiles.removeAll()
         currentIndex = 0
@@ -1620,6 +2635,67 @@ final class PlaylistManager: ObservableObject {
         pendingQueueWeightRekeys.removeAll()
         savePlaylist() // 清空后保存
         return .applied(flushPlaylistPersistence())
+    }
+
+    /// Explicit recovery for a protected legacy queue. The corrupt bytes must
+    /// already have a verified diagnostic copy; recovery never applies to a
+    /// future/foreign database and never silently falls back to stale state.
+    @MainActor
+    @discardableResult
+    func recoverCorruptQueueStartingEmpty() -> Bool {
+        guard libraryDatabase == nil,
+              case .corrupt(let diagnosticURL) = queuePersistenceProtection,
+              let diagnosticURL else { return false }
+        playlistSaveStateLock.lock()
+        let sourceURL = protectedQueueSourceURL
+        playlistSaveStateLock.unlock()
+        guard let sourceURL,
+              let original = try? DerivedCacheFileIO.readBoundedRegularFile(
+                  at: sourceURL,
+                  maximumBytes: maximumPlaylistStoreBytes
+              ),
+              let diagnostic = try? DerivedCacheFileIO.readBoundedRegularFile(
+                  at: diagnosticURL,
+                  maximumBytes: maximumPlaylistStoreBytes
+              ),
+              original == diagnostic else { return false }
+
+        let empty = SavedPlaylist(
+            version: playlistFormatVersion,
+            tracks: [],
+            paths: [],
+            currentIndex: 0
+        )
+        do {
+            try writePlaylistSnapshot(empty, to: sourceURL)
+        } catch {
+            PersistenceLogger.log("重建空队列失败：\(error.localizedDescription)")
+            return false
+        }
+
+        cancelDurationPrefetch()
+        audioFiles.removeAll(keepingCapacity: false)
+        queueEntryIDs.removeAll(keepingCapacity: false)
+        queueLocationReferences.removeAll(keepingCapacity: false)
+        filteredFiles.removeAll(keepingCapacity: false)
+        retainedMissingWithOriginalIndex.removeAll(keepingCapacity: false)
+        fullOrderIndexForAudioFile.removeAll(keepingCapacity: false)
+        loadedSignatureByPath.removeAll(keepingCapacity: false)
+        pendingQueueWeightRekeys.removeAll(keepingCapacity: false)
+        unplayableReasons.removeAll(keepingCapacity: false)
+        currentIndex = 0
+        searchText = ""
+        invalidateQueueIndexCache()
+        resetShuffleQueue()
+        setPlaylistPersistenceReadOnly(nil)
+        playlistSaveStateLock.lock()
+        playlistDurableRevision = playlistSaveRevision
+        playlistSaveStateLock.unlock()
+        PersistenceLogger.notifyUser(
+            title: "队列已重建",
+            subtitle: "损坏数据仍保留在诊断副本中"
+        )
+        return true
     }
     
     func searchFiles(_ query: String) {
@@ -1646,7 +2722,12 @@ final class PlaylistManager: ObservableObject {
     /// - Note: Dedup is by normalized path key.
     /// - Returns: The index of `focusURL` in the queue after ensuring, if provided.
     @MainActor
-    func ensureInQueue(_ files: [AudioFile], focusURL: URL? = nil, signatures: [String: FileSignature] = [:]) -> Int? {
+    func ensureInQueue(
+        _ files: [AudioFile],
+        focusURL: URL? = nil,
+        signatures: [String: FileSignature] = [:],
+        storedTracksByResolvedPath: [String: UserPlaylist.Track] = [:]
+    ) -> Int? {
         guard !files.isEmpty else { return nil }
         guard queueLoadState == .ready else { return nil }
         guard isQueueContentMutationAllowed() else { return nil }
@@ -1661,13 +2742,60 @@ final class PlaylistManager: ObservableObject {
         let existingFocusIndex: Int? = focusKey.flatMap { indexByKey[$0] }
         var focusIndex = existingFocusIndex
 
+        var storedTrackByKey: [String: UserPlaylist.Track] = [:]
+        var conflictingStoredTrackKeys = Set<String>()
+        for (path, track) in storedTracksByResolvedPath {
+            let key = pathKey(URL(fileURLWithPath: path))
+            if let existing = storedTrackByKey[key],
+               existing.locationID != track.locationID
+                || existing.relativePath != track.relativePath {
+                conflictingStoredTrackKeys.insert(key)
+                storedTrackByKey.removeValue(forKey: key)
+            } else if !conflictingStoredTrackKeys.contains(key) {
+                storedTrackByKey[key] = track
+            }
+        }
+        var signatureByKey: [String: FileSignature] = [:]
+        var conflictingSignatureKeys = Set<String>()
+        for (path, signature) in signatures {
+            let key = pathKey(URL(fileURLWithPath: path))
+            if let existing = signatureByKey[key], existing != signature {
+                conflictingSignatureKeys.insert(key)
+                signatureByKey.removeValue(forKey: key)
+            } else if !conflictingSignatureKeys.contains(key) {
+                signatureByKey[key] = signature
+            }
+        }
+
         var toAppend: [AudioFile] = []
         toAppend.reserveCapacity(files.count)
+        var signatureUpdates: [String: FileSignature] = [:]
+        var locationUpdates: [Int: QueueLocationReference] = [:]
 
         for f in files {
             let key = pathKey(f.url)
             if let existing = indexByKey[key] {
                 if focusIndex == nil, let focusKey, focusKey == key { focusIndex = existing }
+                if loadedSignatureByPath[audioFiles[existing].url.path] == nil,
+                   let signature = signatureByKey[key] {
+                    signatureUpdates[audioFiles[existing].url.path] = signature
+                }
+                if let storedTrack = storedTrackByKey[key],
+                   let locationID = storedTrack.locationID {
+                    let proposed = QueueLocationReference(
+                        locationID: locationID,
+                        relativePath: storedTrack.relativePath
+                    )
+                    let existingReference = queueLocationReferences.indices.contains(existing)
+                        ? queueLocationReferences[existing]
+                        : nil
+                    if existingReference == nil
+                        || (existingReference?.locationID == locationID
+                            && existingReference?.relativePath == nil
+                            && proposed.relativePath != nil) {
+                        locationUpdates[existing] = proposed
+                    }
+                }
                 continue
             }
 
@@ -1677,31 +2805,108 @@ final class PlaylistManager: ObservableObject {
             toAppend.append(f)
         }
 
-        guard !toAppend.isEmpty else { return focusIndex }
         let additions = toAppend.map { file in
-            (file: file, signature: signatures[file.url.path])
+            (file: file, signature: signatureByKey[pathKey(file.url)])
         }
-        guard queueStateFitsPersistenceBounds(addingFiles: additions) else {
+        let additionLocations: [QueueLocationReference?] = toAppend.map { file in
+            guard let track = storedTrackByKey[pathKey(file.url)],
+                  let locationID = track.locationID else { return nil }
+            return QueueLocationReference(
+                locationID: locationID,
+                relativePath: track.relativePath
+            )
+        }
+        guard !toAppend.isEmpty || !signatureUpdates.isEmpty || !locationUpdates.isEmpty else {
+            return focusIndex
+        }
+        guard queueStateFitsPersistenceBounds(
+            addingFiles: additions,
+            signatureOverrides: signatureUpdates,
+            locationOverrides: locationUpdates,
+            addingLocationReferences: additionLocations
+        ) else {
             notifyQueueCapacityRejected()
             return existingFocusIndex
         }
 
-        // Store signatures only for files that are actually appended
+        ensureQueueEntryIDAlignment()
+        for (path, signature) in signatureUpdates {
+            loadedSignatureByPath[path] = signature
+        }
+        for (index, reference) in locationUpdates where queueLocationReferences.indices.contains(index) {
+            queueLocationReferences[index] = reference
+        }
         for f in toAppend {
-            if let sig = signatures[f.url.path] {
+            if let sig = signatureByKey[pathKey(f.url)] {
                 loadedSignatureByPath[f.url.path] = sig
             }
         }
 
         let oldCount = audioFiles.count
         audioFiles.append(contentsOf: toAppend)
+        queueEntryIDs.append(contentsOf: toAppend.map { _ in UUID() })
+        queueLocationReferences.append(contentsOf: additionLocations)
         invalidateQueueIndexCache()
         updateFilteredFiles()
-        enqueueDurationPrefetch(for: toAppend.map(\.url))
-        integrateNewQueueIndicesIntoShuffleQueue(oldCount: oldCount)
+        if !toAppend.isEmpty {
+            enqueueDurationPrefetch(for: toAppend.map(\.url))
+            integrateNewQueueIndicesIntoShuffleQueue(oldCount: oldCount)
+        }
         savePlaylist()
 
         return focusIndex
+    }
+
+    @MainActor
+    func makePlaylistTracks(from files: [AudioFile]) -> [UserPlaylist.Track] {
+        ensureQueueEntryIDAlignment()
+        return files.map { file in
+            let index = audioFiles.firstIndex {
+                pathKey($0.url) == pathKey(file.url)
+            }
+            let location = index.flatMap { queueLocationReferences[$0] }
+            return UserPlaylist.Track(
+                path: file.url.path,
+                signature: loadedSignatureByPath[file.url.path],
+                locationID: location?.locationID,
+                relativePath: location?.relativePath
+            )
+        }
+    }
+
+    func playbackSessionTrackIdentity(
+        for url: URL
+    ) -> PlaybackSessionStore.InstalledTrack {
+        ensureQueueEntryIDAlignment()
+        let key = pathKey(url)
+        let queueIndex = audioFiles.firstIndex { pathKey($0.url) == key }
+        let queueEntryID = queueIndex.flatMap {
+            queueEntryIDs.indices.contains($0) ? queueEntryIDs[$0] : nil
+        }
+        let scopeTrackID: UUID?
+        switch playbackScope {
+        case .queue:
+            scopeTrackID = nil
+        case .playlist:
+            let occurrence = currentPlaybackPlaylistOccurrenceKey
+                ?? playbackPlaylistTrackKeys.first {
+                    pathKeyForPlaylistOccurrence($0) == key
+                }
+            if let occurrence,
+               occurrence.hasPrefix("id:"),
+               let component = occurrence.dropFirst(3)
+                   .split(separator: "#", maxSplits: 1).first {
+                let raw = String(component)
+                scopeTrackID = UUID(uuidString: raw)
+            } else {
+                scopeTrackID = nil
+            }
+        }
+        return PlaybackSessionStore.InstalledTrack(
+            queueEntryID: queueEntryID,
+            scopeTrackID: scopeTrackID,
+            fallbackPath: url.path
+        )
     }
     
     func nextFile(isShuffling: Bool) -> AudioFile? {
@@ -1740,9 +2945,9 @@ final class PlaylistManager: ObservableObject {
     }
     
     func selectFile(at index: Int) -> AudioFile? {
-        guard audioFiles.indices.contains(index) else { return nil }
+        guard audioFiles.indices.contains(index), !isUnplayableIndex(index) else { return nil }
         currentIndex = index
-        savePlaylist() // 保存当前索引
+        saveQueueCursor()
         return audioFiles[index]
     }
     
@@ -1780,7 +2985,7 @@ final class PlaylistManager: ObservableObject {
             currentIndex = (currentIndex + 1) % total
             attempts += 1
             if !isUnplayableIndex(currentIndex) {
-                savePlaylist()
+                saveQueueCursor()
                 return audioFiles[currentIndex]
             }
         }
@@ -1798,7 +3003,7 @@ final class PlaylistManager: ObservableObject {
             currentIndex = currentIndex > 0 ? currentIndex - 1 : total - 1
             attempts += 1
             if !isUnplayableIndex(currentIndex) {
-                savePlaylist()
+                saveQueueCursor()
                 return audioFiles[currentIndex]
             }
         }
@@ -1840,7 +3045,7 @@ final class PlaylistManager: ObservableObject {
         if !shuffleQueue.isEmpty {
             currentIndex = shuffleQueue[0]
             shuffleIndex = 1
-            savePlaylist()
+            saveQueueCursor()
             return audioFiles[currentIndex]
         }
         return nil
@@ -1853,7 +3058,7 @@ final class PlaylistManager: ObservableObject {
         guard let idx = weightedRandomIndex(indices: candidates, scope: .queue) else { return nil }
 
         currentIndex = idx
-        savePlaylist() // 保存新的索引
+        saveQueueCursor()
         return audioFiles[idx]
     }
 
@@ -1877,7 +3082,7 @@ final class PlaylistManager: ObservableObject {
             if isUnplayableIndex(idx) { continue }
             currentIndex = idx
             currentPlaybackPlaylistOccurrenceKey = occurrenceKey
-            savePlaylist()
+            saveQueueCursor()
             return audioFiles[idx]
         }
         return nil
@@ -1901,7 +3106,7 @@ final class PlaylistManager: ObservableObject {
             if isUnplayableIndex(idx) { continue }
             currentIndex = idx
             currentPlaybackPlaylistOccurrenceKey = occurrenceKey
-            savePlaylist()
+            saveQueueCursor()
             return audioFiles[idx]
         }
         return nil
@@ -1951,7 +3156,7 @@ final class PlaylistManager: ObservableObject {
               !isUnplayableIndex(idx) else { return nil }
         currentIndex = idx
         currentPlaybackPlaylistOccurrenceKey = firstKey
-        savePlaylist()
+        saveQueueCursor()
         return audioFiles[idx]
     }
 
@@ -1977,7 +3182,7 @@ final class PlaylistManager: ObservableObject {
 
         currentIndex = idx
         currentPlaybackPlaylistOccurrenceKey = chosenKey
-        savePlaylist()
+        saveQueueCursor()
         return audioFiles[idx]
     }
 
@@ -2010,6 +3215,35 @@ final class PlaylistManager: ObservableObject {
 
     private func invalidateQueueIndexCache() {
         isQueueIndexCacheDirty = true
+    }
+
+    private func ensureQueueEntryIDAlignment() {
+        if queueEntryIDs.count > audioFiles.count {
+            queueEntryIDs.removeLast(queueEntryIDs.count - audioFiles.count)
+        } else if queueEntryIDs.count < audioFiles.count {
+            queueEntryIDs.append(
+                contentsOf: (queueEntryIDs.count..<audioFiles.count).map { _ in UUID() }
+            )
+        }
+        if queueLocationReferences.count > audioFiles.count {
+            queueLocationReferences.removeLast(queueLocationReferences.count - audioFiles.count)
+        } else if queueLocationReferences.count < audioFiles.count {
+            queueLocationReferences.append(
+                contentsOf: repeatElement(
+                    Optional<QueueLocationReference>.none,
+                    count: audioFiles.count - queueLocationReferences.count
+                )
+            )
+        }
+    }
+
+    private func seedLibraryQueueRevision(_ revision: UInt64) {
+        guard libraryDatabase != nil else { return }
+        playlistSaveStateLock.lock()
+        libraryQueueRevision = revision
+        playlistSaveRevision = max(playlistSaveRevision, revision)
+        playlistDurableRevision = max(playlistDurableRevision, revision)
+        playlistSaveStateLock.unlock()
     }
 
     private func rebuildQueueIndexCacheIfNeeded() {
@@ -2198,7 +3432,7 @@ final class PlaylistManager: ObservableObject {
             if isUnplayableIndex(idx) { continue }
             currentIndex = idx
             currentPlaybackPlaylistOccurrenceKey = key
-            savePlaylist()
+            saveQueueCursor()
             return audioFiles[idx]
         }
         return nil
@@ -2221,7 +3455,7 @@ final class PlaylistManager: ObservableObject {
                 currentIndex = idx
                 currentPlaybackPlaylistOccurrenceKey = key
                 playlistShuffleIndex = searchIndex + 1  // Set cursor so next() returns the following item
-                savePlaylist()
+                saveQueueCursor()
                 return audioFiles[idx]
             }
             searchIndex -= 1
@@ -2239,7 +3473,7 @@ final class PlaylistManager: ObservableObject {
             shuffleIndex += 1
             if !isUnplayableIndex(idx) {
                 currentIndex = idx
-                savePlaylist()
+                saveQueueCursor()
                 return audioFiles[idx]
             }
         }
@@ -2257,7 +3491,7 @@ final class PlaylistManager: ObservableObject {
             if !isUnplayableIndex(idx) {
                 currentIndex = idx
                 shuffleIndex = searchIndex + 1  // Set cursor so next() returns the following item
-                savePlaylist()
+                saveQueueCursor()
                 return audioFiles[idx]
             }
             searchIndex -= 1
@@ -2273,16 +3507,30 @@ final class PlaylistManager: ObservableObject {
 
     // MARK: - 子文件夹扫描偏好持久化
     private func loadScanSubfoldersPreference() {
-        let d = UserDefaults.standard
-        if d.object(forKey: userScanSubfoldersKey) != nil {
-            self.scanSubfolders = d.bool(forKey: userScanSubfoldersKey)
-        }
+        isRestoringScanSubfoldersPreference = true
+        scanSubfolders = appPreferencesStore.load().scanSubfolders
+        isRestoringScanSubfoldersPreference = false
     }
 
     private func saveScanSubfoldersPreference() {
         guard !isRunningRegressionTests else { return }
-        let d = UserDefaults.standard
-        d.set(scanSubfolders, forKey: userScanSubfoldersKey)
+        let authoritativeValue = appPreferencesStore.load().scanSubfolders
+        guard appPreferencesStore.persistenceState == .writable else {
+            restoreScanSubfoldersPreference(authoritativeValue)
+            return
+        }
+        _ = appPreferencesStore.update { $0.scanSubfolders = scanSubfolders }
+        if case .failure = appPreferencesStore.persist() {
+            _ = appPreferencesStore.update { $0.scanSubfolders = authoritativeValue }
+            restoreScanSubfoldersPreference(authoritativeValue)
+        }
+    }
+
+    private func restoreScanSubfoldersPreference(_ value: Bool) {
+        guard scanSubfolders != value else { return }
+        isRestoringScanSubfoldersPreference = true
+        scanSubfolders = value
+        isRestoringScanSubfoldersPreference = false
     }
 
     // 统一的路径键（Unicode 规范化 + 标准路径，不再强制 lowercased）
@@ -2446,12 +3694,150 @@ final class PlaylistManager: ObservableObject {
     }
     
     // MARK: - 保存和加载播放列表
+    /// Persists navigation without rebuilding the queue. Legacy JSON backends
+    /// retain their historical snapshot behavior until migration succeeds.
+    private func saveQueueCursor() {
+        guard let libraryDatabase else {
+            savePlaylist()
+            return
+        }
+        ensureQueueEntryIDAlignment()
+        guard audioFiles.indices.contains(currentIndex),
+              queueEntryIDs.indices.contains(currentIndex) else { return }
+        let selectedID = queueEntryIDs[currentIndex]
+
+        playlistSaveStateLock.lock()
+        let hasStructuralDebt = playlistSaveRevision > playlistDurableRevision
+            || playlistSaveWorkItem != nil
+            || pendingPlaylistWrite != nil
+            || isPlaylistWriteDrainScheduled
+        if hasStructuralDebt {
+            playlistSaveStateLock.unlock()
+            // The selected occurrence may not exist in SQLite yet. Coalesce the
+            // cursor into the pending structural snapshot instead.
+            savePlaylist()
+            return
+        }
+        cursorSaveGeneration &+= 1
+        let generation = cursorSaveGeneration
+        let expectedRevision = libraryQueueRevision
+        let previous = cursorSaveWorkItem
+        let work = DispatchWorkItem { [weak self, weak libraryDatabase] in
+            guard let self, let libraryDatabase else { return }
+            self.playlistSaveStateLock.lock()
+            let isCurrent = generation == self.cursorSaveGeneration
+            if isCurrent { self.cursorSaveWorkItem = nil }
+            self.playlistSaveStateLock.unlock()
+            guard isCurrent else { return }
+            do {
+                let updated = try libraryDatabase.updateQueueCursor(
+                    currentEntryID: selectedID,
+                    expectedQueueRevision: expectedRevision
+                )
+                self.playlistSaveStateLock.lock()
+                if updated {
+                    self.cursorDurableGeneration = max(
+                        self.cursorDurableGeneration,
+                        generation
+                    )
+                }
+                self.playlistSaveStateLock.unlock()
+                if !updated {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.savePlaylist()
+                    }
+                }
+            } catch {
+                PersistenceLogger.log("保存队列游标失败：\(error.localizedDescription)")
+            }
+        }
+        cursorSaveWorkItem = work
+        playlistSaveStateLock.unlock()
+        previous?.cancel()
+        playlistIOQueue.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
+    private func flushLibraryCursorIfStructureIsCurrent(
+        timeout: TimeInterval
+    ) -> QueuePersistenceFlushResult? {
+        guard let libraryDatabase else { return nil }
+        ensureQueueEntryIDAlignment()
+
+        playlistSaveStateLock.lock()
+        let hasStructuralDebt = playlistSaveRevision > playlistDurableRevision
+            || playlistSaveWorkItem != nil
+            || pendingPlaylistWrite != nil
+            || isPlaylistWriteDrainScheduled
+        guard !hasStructuralDebt else {
+            playlistSaveStateLock.unlock()
+            return nil
+        }
+        let readOnly = isPlaylistPersistenceReadOnly
+        let canPersist = canBuildPlaylistPersistenceSnapshot
+        let revision = playlistSaveRevision
+        let expectedQueueRevision = libraryQueueRevision
+        cursorSaveGeneration &+= 1
+        let cursorGeneration = cursorSaveGeneration
+        let pendingCursor = cursorSaveWorkItem
+        cursorSaveWorkItem = nil
+        let selectedID = audioFiles.indices.contains(currentIndex)
+            && queueEntryIDs.indices.contains(currentIndex)
+            ? queueEntryIDs[currentIndex]
+            : nil
+        playlistSaveStateLock.unlock()
+        pendingCursor?.cancel()
+
+        guard !readOnly, canPersist else {
+            return QueuePersistenceFlushResult(
+                outcome: readOnly ? .protectedReadOnly : .skippedBeforeRestore,
+                attemptedRevision: revision,
+                durableRevision: playlistDurableRevision
+            )
+        }
+
+        var didPersist = false
+        let operation = {
+            do {
+                didPersist = try libraryDatabase.updateQueueCursor(
+                    currentEntryID: selectedID,
+                    expectedQueueRevision: expectedQueueRevision
+                )
+            } catch {
+                PersistenceLogger.log("同步保存队列游标失败：\(error.localizedDescription)")
+            }
+        }
+        let drained: Bool
+        if DispatchQueue.getSpecific(key: playlistIOQueueKey) != nil {
+            operation()
+            drained = true
+        } else {
+            let completion = DispatchSemaphore(value: 0)
+            playlistIOQueue.async {
+                operation()
+                completion.signal()
+            }
+            drained = completion.wait(timeout: .now() + max(0, timeout)) == .success
+        }
+        if didPersist {
+            playlistSaveStateLock.lock()
+            cursorDurableGeneration = max(cursorDurableGeneration, cursorGeneration)
+            playlistSaveStateLock.unlock()
+        }
+        return QueuePersistenceFlushResult(
+            outcome: didPersist ? .durable : (drained ? .failed : .timedOut),
+            attemptedRevision: revision,
+            durableRevision: playlistDurableRevision
+        )
+    }
+
     func savePlaylist() {
         if isRunningRegressionTests {
             debugLog("回归测试模式：跳过播放列表持久化写盘")
             return
         }
+        playlistSnapshotStateGeneration &+= 1
         let previousWorkItem: DispatchWorkItem?
+        let previousCursorWorkItem: DispatchWorkItem?
         playlistSaveStateLock.lock()
         guard !isPlaylistPersistenceReadOnly else {
             playlistSaveStateLock.unlock()
@@ -2466,6 +3852,9 @@ final class PlaylistManager: ObservableObject {
         playlistSaveRevision &+= 1
         let revision = playlistSaveRevision
         previousWorkItem = playlistSaveWorkItem
+        cursorSaveGeneration &+= 1
+        previousCursorWorkItem = cursorSaveWorkItem
+        cursorSaveWorkItem = nil
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.playlistSaveStateLock.lock()
@@ -2479,14 +3868,20 @@ final class PlaylistManager: ObservableObject {
             // Capture the latest queue only when the debounce drains, so rapid
             // navigation does not repeatedly allocate O(queue-size) path arrays.
             let snapshot = self.buildPlaylistSnapshot()
+            let stateGeneration = self.playlistSnapshotStateGeneration
             self.debugLog(
                 "保存播放列表: \(snapshot.paths.count) 个文件, 当前索引: \(snapshot.currentIndex)"
             )
-            self.enqueuePlaylistWrite(snapshot, revision: revision)
+            self.enqueuePlaylistWrite(
+                snapshot,
+                revision: revision,
+                stateGeneration: stateGeneration
+            )
         }
         playlistSaveWorkItem = workItem
         playlistSaveStateLock.unlock()
         previousWorkItem?.cancel()
+        previousCursorWorkItem?.cancel()
         DispatchQueue.main.asyncAfter(
             deadline: .now() + playlistSaveDebounceInterval,
             execute: workItem
@@ -2501,6 +3896,10 @@ final class PlaylistManager: ObservableObject {
                 attemptedRevision: playlistSaveRevision,
                 durableRevision: playlistSaveRevision
             )
+        }
+
+        if let cursorResult = flushLibraryCursorIfStructureIsCurrent(timeout: timeout) {
+            return cursorResult
         }
 
         playlistSaveStateLock.lock()
@@ -2540,19 +3939,42 @@ final class PlaylistManager: ObservableObject {
         // Publish the flush snapshot through the same bounded, serial drain as
         // debounced saves. A flush can therefore never overtake an older write
         // or overwrite a newer snapshot that the active drain already picked up.
-        let snapshot = buildPlaylistSnapshot()
+        playlistSaveStateLock.lock()
+        let stateGeneration = playlistSnapshotStateGeneration
+        let reusableSnapshot = latestCapturedPlaylistSnapshot.flatMap {
+            $0.stateGeneration == stateGeneration ? $0.snapshot : nil
+        }
+        let preparationTimedOut = isTerminating
+            && terminationSnapshotPreparation?.result.outcome == .timedOut
+        if preparationTimedOut {
+            let attemptedRevision = playlistSaveRevision
+            let durableRevision = playlistDurableRevision
+            playlistSaveStateLock.unlock()
+            return QueuePersistenceFlushResult(
+                outcome: .timedOut,
+                attemptedRevision: attemptedRevision,
+                durableRevision: durableRevision
+            )
+        }
+        playlistSaveStateLock.unlock()
+        let snapshot = reusableSnapshot ?? buildPlaylistSnapshot()
         playlistSaveStateLock.lock()
         playlistSaveRevision &+= 1
         let revision = playlistSaveRevision
         let pending = playlistSaveWorkItem
         playlistSaveWorkItem = nil
+        cursorSaveGeneration &+= 1
+        let pendingCursor = cursorSaveWorkItem
+        cursorSaveWorkItem = nil
         playlistRetryWorkItem?.cancel()
         playlistRetryWorkItem = nil
         playlistRetryAttempt = 0
         pendingPlaylistWrite = (revision, snapshot)
+        latestCapturedPlaylistSnapshot = (stateGeneration, revision, snapshot)
         isPlaylistWriteDrainScheduled = true
         playlistSaveStateLock.unlock()
         pending?.cancel()
+        pendingCursor?.cancel()
 
         let drained = drainPlaylistWrites(timeout: timeout, performDrain: true)
 
@@ -2583,7 +4005,11 @@ final class PlaylistManager: ObservableObject {
         return completion.wait(timeout: .now() + max(0, timeout)) == .success
     }
 
-    private func enqueuePlaylistWrite(_ snapshot: SavedPlaylist, revision: UInt64) {
+    private func enqueuePlaylistWrite(
+        _ snapshot: SavedPlaylist,
+        revision: UInt64,
+        stateGeneration: UInt64
+    ) {
         playlistSaveStateLock.lock()
         guard revision == playlistSaveRevision else {
             playlistSaveStateLock.unlock()
@@ -2593,6 +4019,7 @@ final class PlaylistManager: ObservableObject {
         playlistRetryWorkItem = nil
         playlistRetryAttempt = 0
         pendingPlaylistWrite = (revision, snapshot)
+        latestCapturedPlaylistSnapshot = (stateGeneration, revision, snapshot)
         guard !isPlaylistWriteDrainScheduled else {
             playlistSaveStateLock.unlock()
             return
@@ -2620,7 +4047,10 @@ final class PlaylistManager: ObservableObject {
             // snapshot. The captured snapshot is still safe to write: enqueues
             // are monotonic, and a newer captured snapshot replaces the single
             // pending slot or is written on the next loop iteration.
-            let didPersist = savePlaylistToDisk(pending.snapshot)
+            let didPersist = savePlaylistToDisk(
+                pending.snapshot,
+                revision: pending.revision
+            )
             var shouldReturnForRetry = false
             playlistSaveStateLock.lock()
             if didPersist {
@@ -2681,6 +4111,7 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func buildPlaylistSnapshot() -> SavedPlaylist {
+        ensureQueueEntryIDAlignment()
         // Build entries with stable sorting keys
         struct Entry {
             let sortKey: Int
@@ -2703,7 +4134,16 @@ final class PlaylistManager: ObservableObject {
         for (runtimeIndex, file) in audioFiles.enumerated() {
             let path = file.url.path
             let sig = loadedSignatureByPath[path]
-            let record = SavedPlaylist.TrackRecord(path: path, signature: sig)
+            let locationReference = queueLocationReferences.indices.contains(runtimeIndex)
+                ? queueLocationReferences[runtimeIndex]
+                : nil
+            let record = SavedPlaylist.TrackRecord(
+                id: queueEntryIDs[runtimeIndex],
+                path: path,
+                signature: sig,
+                locationID: locationReference?.locationID,
+                relativePath: locationReference?.relativePath
+            )
 
             let sortKey: Int
             if runtimeIndex < fullOrderIndexForAudioFile.count, let originalIndex = fullOrderIndexForAudioFile[runtimeIndex] {
@@ -2744,6 +4184,7 @@ final class PlaylistManager: ObservableObject {
 
         return SavedPlaylist(
             version: playlistFormatVersion,
+            storeRevision: libraryQueueRevision,
             tracks: finalRecords,
             paths: [],
             currentIndex: fullOrderCurrentIndex,
@@ -2761,23 +4202,100 @@ final class PlaylistManager: ObservableObject {
         // Parse TrackRecords from v1 schema or fall back to legacy paths.
         // A v1 payload with an empty tracks array and populated paths came from
         // an intermediate build and must not silently erase the queue.
-        let records: [SavedPlaylist.TrackRecord]
+        let decodedRecords: [SavedPlaylist.TrackRecord]
         if let tracks = saved.tracks, !tracks.isEmpty || saved.paths.isEmpty {
-            records = tracks
+            decodedRecords = tracks
         } else {
-            records = saved.paths.map { SavedPlaylist.TrackRecord(path: $0, signature: nil) }
+            decodedRecords = saved.paths.map {
+                SavedPlaylist.TrackRecord(path: $0, signature: nil)
+            }
+        }
+        let records = decodedRecords.map { record in
+            record.id == nil
+                ? SavedPlaylist.TrackRecord(
+                    id: UUID(),
+                    path: record.path,
+                    signature: record.signature,
+                    locationID: record.locationID,
+                    relativePath: record.relativePath
+                )
+                : record
         }
 
         let fileManager = FileManager.default
-        var validEntries: [(url: URL, snapshot: FileValidationSnapshot, signature: FileSignature?, originalIndex: Int)] = []
+        var validEntries: [(
+            url: URL,
+            snapshot: FileValidationSnapshot,
+            signature: FileSignature?,
+            entryID: UUID,
+            originalIndex: Int,
+            locationReference: QueueLocationReference?,
+            offlineReason: String?
+        )] = []
         var missingWithIndex: [(originalIndex: Int, record: SavedPlaylist.TrackRecord)] = []
+
+        var locationsByID: [UUID: LibraryLocation] = [:]
+        if let libraryDatabase {
+            do {
+                _ = try libraryDatabase.forEachLibraryLocation { record in
+                    locationsByID[record.location.id] = record.location
+                    return true
+                }
+            } catch {
+                PersistenceLogger.log("读取媒体位置失败：\(error.localizedDescription)")
+            }
+        }
 
         for (originalIndex, record) in records.enumerated() {
             if Task.isCancelled { return }
-            let url = URL(fileURLWithPath: record.path)
+            var url = URL(fileURLWithPath: record.path)
+            var offlineReason: String?
+            let locationReference = record.locationID.map {
+                QueueLocationReference(locationID: $0, relativePath: record.relativePath)
+            }
+
+            if let locationID = record.locationID {
+                if let location = locationsByID[locationID],
+                   let reference = try? LibraryTrackReference(
+                       id: record.id ?? UUID(),
+                       locationID: locationID,
+                       relativePath: record.relativePath,
+                       legacyAbsolutePath: record.path,
+                       signature: record.signature
+                   ) {
+                    let resolution = await libraryLocationResolver.resolve(
+                        reference,
+                        in: location
+                    )
+                    switch resolution.availability {
+                    case .available(let resolvedURL):
+                        url = resolvedURL
+                    case .volumeUnavailable:
+                        offlineReason = "所在磁盘当前未连接"
+                    case .authorizationRequired:
+                        offlineReason = "需要重新授权此音乐位置"
+                    case .rootMissing:
+                        offlineReason = "保存的音乐根目录已移动"
+                    case .fileMissing:
+                        offlineReason = "歌曲在音乐位置中不存在"
+                    case .invalidReference(let detail), .indeterminate(let detail):
+                        offlineReason = detail
+                    }
+                } else {
+                    offlineReason = "保存的音乐位置引用无效"
+                }
+            }
             let snapshot = FileValidationSnapshot.load(for: url, fileManager: fileManager)
-            if snapshot.exists {
-                validEntries.append((url, snapshot, record.signature, originalIndex))
+            if snapshot.exists || offlineReason != nil {
+                validEntries.append((
+                    url,
+                    snapshot,
+                    record.signature,
+                    record.id ?? UUID(),
+                    originalIndex,
+                    locationReference,
+                    offlineReason
+                ))
             } else {
                 missingWithIndex.append((originalIndex, record))
             }
@@ -2807,7 +4325,9 @@ final class PlaylistManager: ObservableObject {
                 guard !Task.isCancelled, !self.isTerminating else { return false }
                 self.retainedMissingWithOriginalIndex = missingSnapshot
                 self.fullOrderIndexForAudioFile = []
+                self.queueEntryIDs = []
                 self.loadedSignatureByPath = sigMapSnapshot
+                self.seedLibraryQueueRevision(saved.storeRevision ?? 0)
                 self.retainedSavedCurrentFullOrderIndex = records.indices.contains(saved.currentIndex)
                     ? saved.currentIndex
                     : nil
@@ -2848,6 +4368,22 @@ final class PlaylistManager: ObservableObject {
             if Task.isCancelled { return }
             let url = entry.url
             let snapshot = entry.snapshot
+            if entry.offlineReason != nil {
+                let title = url.deletingPathExtension().lastPathComponent
+                restoredFiles.append(AudioFile(
+                    url: url,
+                    metadata: AudioMetadata(
+                        title: title.isEmpty ? "未知标题" : title,
+                        artist: "离线媒体",
+                        album: "等待磁盘重新连接",
+                        year: nil,
+                        genre: nil,
+                        artwork: nil
+                    ),
+                    duration: nil
+                ))
+                continue
+            }
             let duration = await DurationCache.shared.cachedDurationIfValid(for: url, snapshot: snapshot)
             if duration == nil {
                 missingDurationURLs.append(url)
@@ -2902,13 +4438,24 @@ final class PlaylistManager: ObservableObject {
         let sigMapSnapshot = combinedSignatureMap
         let missingSnapshot = missingWithIndex
         let fullOrderSnapshot = fullOrderIndices
+        let queueEntryIDSnapshot = validEntries.map(\.entryID)
+        let queueLocationReferenceSnapshot = validEntries.map(\.locationReference)
+        let offlineReasonsSnapshot = validEntries.reduce(into: [String: String]()) {
+            if let reason = $1.offlineReason {
+                $0[self.pathKey($1.url)] = reason
+            }
+        }
         guard !Task.isCancelled else { return }
         let installed = await MainActor.run { () -> Bool in
             guard !Task.isCancelled, !self.isTerminating else { return false }
             self.retainedMissingWithOriginalIndex = missingSnapshot
             self.fullOrderIndexForAudioFile = fullOrderSnapshot
+            self.queueEntryIDs = queueEntryIDSnapshot
+            self.queueLocationReferences = queueLocationReferenceSnapshot
             self.loadedSignatureByPath = sigMapSnapshot
+            self.seedLibraryQueueRevision(saved.storeRevision ?? 0)
             self.audioFiles = restoredFilesSnapshot
+            self.unplayableReasons.merge(offlineReasonsSnapshot) { _, new in new }
             self.invalidateQueueIndexCache()
             self.isApplyingPersistedCurrentIndex = true
             self.currentIndex = min(max(runtimeCurrentIndex, 0), restoredFilesSnapshot.count - 1)
@@ -3027,7 +4574,7 @@ final class PlaylistManager: ObservableObject {
         }
 
         // 兼容旧版 UserDefaults：读取后迁移到磁盘
-        let d = UserDefaults.standard
+        let d = legacyUserDefaults
         if let filePaths = d.stringArray(forKey: "savedPlaylistPaths"), !filePaths.isEmpty {
             let savedIndex = d.integer(forKey: "savedPlaylistIndex")
             let snapshot = SavedPlaylist(version: nil, tracks: nil, paths: filePaths, currentIndex: savedIndex)
@@ -3049,6 +4596,65 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func loadSavedPlaylistFromDisk() -> PlaylistLoadOutcome {
+        if let libraryDatabase {
+            do {
+                let queue = try libraryDatabase.loadQueue()
+                let records = queue.entries.map {
+                    SavedPlaylist.TrackRecord(
+                        id: $0.id,
+                        path: $0.path,
+                        signature: $0.signature,
+                        locationID: $0.locationID,
+                        relativePath: $0.relativePath
+                    )
+                }
+                let currentIndex = queue.currentEntryID.flatMap { selectedID in
+                    queue.entries.firstIndex(where: { $0.id == selectedID })
+                } ?? 0
+                let rekeys = queue.pendingRekeys.map {
+                    SavedPlaylist.WeightRekeyRecord(
+                        id: $0.id,
+                        oldPath: $0.oldPath,
+                        newPath: $0.newPath,
+                        createdAt: $0.createdAt
+                    )
+                }
+                switch libraryDatabase.accessMode {
+                case .writable:
+                    break
+                case .readOnlyFuture(let version):
+                    setPlaylistPersistenceReadOnly(.future(version: version))
+                    PersistenceLogger.log(
+                        "Library.sqlite 版本 \(version) 过新，队列进入只读保护"
+                    )
+                case .readOnlyForeign:
+                    setPlaylistPersistenceReadOnly(.foreignDatabase)
+                    PersistenceLogger.log("Library.sqlite 标识不匹配，队列进入只读保护")
+                }
+                return .loaded(
+                    SavedPlaylist(
+                        version: playlistFormatVersion,
+                        storeRevision: queue.revision,
+                        tracks: records,
+                        paths: [],
+                        currentIndex: records.isEmpty ? 0 : min(currentIndex, records.count - 1),
+                        pendingWeightRekeys: rekeys.isEmpty ? nil : rekeys
+                    )
+                )
+            } catch {
+                setPlaylistPersistenceReadOnly(
+                    .unreadable(message: "音乐库队列无法读取：\(error.localizedDescription)")
+                )
+                PersistenceLogger.log("读取 Library.sqlite 队列失败：\(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    PersistenceLogger.notifyUser(
+                        title: "音乐库无法读取",
+                        subtitle: "队列已进入只读保护模式"
+                    )
+                }
+                return .protectedUnreadable
+            }
+        }
         guard let url = playlistFileURL() else { return .missing }
         guard FileManager.default.fileExists(atPath: url.path) else { return .missing }
 
@@ -3060,7 +4666,9 @@ final class PlaylistManager: ObservableObject {
             )
         } catch {
             debugLog("无法读取队列文件: \(error)")
-            setPlaylistPersistenceReadOnly(true)
+            setPlaylistPersistenceReadOnly(
+                .unreadable(message: "队列文件无法读取：\(error.localizedDescription)")
+            )
             PersistenceLogger.log("队列文件无法读取: \(url.path), 错误: \(error)")
             DispatchQueue.main.async {
                 PersistenceLogger.notifyUser(title: "队列文件无法读取", subtitle: "已进入保护模式")
@@ -3079,7 +4687,7 @@ final class PlaylistManager: ObservableObject {
 
         if let v = probeVersion, v != 1, v != playlistFormatVersion {
             debugLog("队列文件版本 \(v) 不受当前版本支持，进入只读模式")
-            setPlaylistPersistenceReadOnly(true)
+            setPlaylistPersistenceReadOnly(.future(version: v))
             PersistenceLogger.log("检测到不受支持的队列版本 \(v)，进入只读模式保护数据")
             DispatchQueue.main.async {
                 PersistenceLogger.notifyUser(
@@ -3094,15 +4702,27 @@ final class PlaylistManager: ObservableObject {
             let snapshot = try JSONDecoder().decode(SavedPlaylist.self, from: data)
             guard isStructurallyValidPlaylistSnapshot(snapshot) else {
                 debugLog("队列文件结构或边界校验失败，保留原文件")
-                setPlaylistPersistenceReadOnly(true)
-                preserveCorruptedPlaylistDiagnostic(at: url, originalData: data)
+                let diagnosticURL = preserveCorruptedPlaylistDiagnostic(
+                    at: url,
+                    originalData: data
+                )
+                setPlaylistPersistenceReadOnly(
+                    .corrupt(diagnosticURL: diagnosticURL),
+                    sourceURL: url
+                )
                 return .protectedCorrupt
             }
             return .loaded(snapshot)
         } catch {
             debugLog("队列文件损坏: \(error)，保留原文件并写入有界诊断副本")
-            setPlaylistPersistenceReadOnly(true)
-            preserveCorruptedPlaylistDiagnostic(at: url, originalData: data)
+            let diagnosticURL = preserveCorruptedPlaylistDiagnostic(
+                at: url,
+                originalData: data
+            )
+            setPlaylistPersistenceReadOnly(
+                .corrupt(diagnosticURL: diagnosticURL),
+                sourceURL: url
+            )
             return .protectedCorrupt
         }
     }
@@ -3171,9 +4791,14 @@ final class PlaylistManager: ObservableObject {
         return true
     }
 
-    private func setPlaylistPersistenceReadOnly(_ value: Bool) {
+    private func setPlaylistPersistenceReadOnly(
+        _ protection: QueuePersistenceProtection?,
+        sourceURL: URL? = nil
+    ) {
+        let value = protection != nil
         playlistSaveStateLock.lock()
         isPlaylistPersistenceReadOnly = value
+        protectedQueueSourceURL = sourceURL
         if value {
             // Cancel pending debounced saves and clear pending write
             playlistSaveWorkItem?.cancel()
@@ -3186,6 +4811,9 @@ final class PlaylistManager: ObservableObject {
             didNotifyProtectedQueueMutation = false
         }
         playlistSaveStateLock.unlock()
+        DispatchQueue.main.async { [weak self] in
+            self?.queuePersistenceProtection = protection
+        }
         if value {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -3224,7 +4852,11 @@ final class PlaylistManager: ObservableObject {
         return !isPlaylistPersistenceReadOnly
     }
 
-    private func preserveCorruptedPlaylistDiagnostic(at url: URL, originalData: Data) {
+    @discardableResult
+    private func preserveCorruptedPlaylistDiagnostic(
+        at url: URL,
+        originalData: Data
+    ) -> URL? {
         let parent = url.deletingLastPathComponent()
         let baseName = url.deletingPathExtension().lastPathComponent
         let digest = Self.stableDigest(originalData)
@@ -3244,7 +4876,7 @@ final class PlaylistManager: ObservableObject {
                     preserving: quarantineURL
                 )
                 notifyCorruptedPlaylistPreserved(diagnosticURL: quarantineURL)
-                return
+                return quarantineURL
             }
             quarantineURL = parent.appendingPathComponent(
                 "\(baseName).corrupted.\(digest).\(UUID().uuidString).json",
@@ -3260,9 +4892,11 @@ final class PlaylistManager: ObservableObject {
                 preserving: quarantineURL
             )
             notifyCorruptedPlaylistPreserved(diagnosticURL: quarantineURL)
+            return quarantineURL
         } catch {
             debugLog("写入队列诊断副本失败: \(error)，原文件仍保持只读")
             PersistenceLogger.log("写入队列诊断副本失败: \(error)，原文件: \(url.path)")
+            return nil
         }
     }
 
@@ -3315,14 +4949,99 @@ final class PlaylistManager: ObservableObject {
         }
     }
 
-    private func savePlaylistToDisk(_ snapshot: SavedPlaylist) -> Bool {
+    private func savePlaylistToDisk(
+        _ snapshot: SavedPlaylist,
+        revision: UInt64? = nil
+    ) -> Bool {
         if isRunningRegressionTests {
             return true
         }
-        guard let url = playlistFileURL() else { return false }
 
         // Check write protection before entering IO queue
         guard isPlaylistPersistenceWritable() else { return false }
+
+        if let libraryDatabase {
+            let records: [SavedPlaylist.TrackRecord]
+            if let tracks = snapshot.tracks, !tracks.isEmpty || snapshot.paths.isEmpty {
+                records = tracks
+            } else {
+                records = snapshot.paths.map {
+                    SavedPlaylist.TrackRecord(path: $0, signature: nil)
+                }
+            }
+            let entries = records.enumerated().map { index, record in
+                LibraryQueueEntry(
+                    id: record.id ?? UUID(),
+                    sortKey: Int64(index) * 1_024,
+                    path: record.path,
+                    signature: record.signature,
+                    locationID: record.locationID,
+                    relativePath: record.relativePath
+                )
+            }
+            let currentEntryID = entries.indices.contains(snapshot.currentIndex)
+                ? entries[snapshot.currentIndex].id
+                : nil
+            let rekeys = (snapshot.pendingWeightRekeys ?? []).map {
+                LibraryQueueRekeyIntent(
+                    id: $0.id,
+                    oldPath: $0.oldPath,
+                    newPath: $0.newPath,
+                    createdAt: $0.createdAt
+                )
+            }
+            playlistSaveStateLock.lock()
+            let expectedRevision = libraryQueueRevision
+            playlistSaveStateLock.unlock()
+            let targetRevision = max(
+                max(revision ?? 0, snapshot.storeRevision ?? 0),
+                expectedRevision &+ 1
+            )
+            do {
+                let result = try libraryDatabase.replaceQueue(
+                    LibraryQueueSnapshot(
+                        revision: targetRevision,
+                        entries: entries,
+                        currentEntryID: currentEntryID,
+                        pendingRekeys: rekeys
+                    ),
+                    expectedRevision: expectedRevision
+                )
+                switch result {
+                case .committed(let durableRevision), .alreadyCurrent(let durableRevision):
+                    playlistSaveStateLock.lock()
+                    libraryQueueRevision = durableRevision
+                    playlistSaveStateLock.unlock()
+                    return true
+                case .stale(let storedRevision):
+                    setPlaylistPersistenceReadOnly(
+                        .unreadable(
+                            message: "队列已被另一写入更新（磁盘版本 \(storedRevision)），已停止自动覆盖"
+                        )
+                    )
+                    return false
+                case .conflict(let conflictingRevision):
+                    setPlaylistPersistenceReadOnly(
+                        .unreadable(
+                            message: "队列版本 \(conflictingRevision) 存在内容冲突，已停止自动覆盖"
+                        )
+                    )
+                    return false
+                }
+            } catch {
+                debugLog("保存 Library.sqlite 队列失败: \(error)")
+                PersistenceLogger.log("保存 Library.sqlite 队列失败: \(error)")
+                DispatchQueue.main.async {
+                    PersistenceLogger.notifyUser(
+                        title: "队列保存失败",
+                        subtitle: "请检查磁盘权限或空间"
+                    )
+                }
+                return false
+            }
+        }
+
+        guard let url = playlistFileURL() else { return false }
 
         let isOnIOQueue = DispatchQueue.getSpecific(key: playlistIOQueueKey) != nil
         let write = {
@@ -3388,6 +5107,9 @@ final class PlaylistManager: ObservableObject {
 
 extension Notification.Name {
     static let playlistDidAddFirstFiles = Notification.Name("playlistDidAddFirstFiles")
+    static let externalMediaTopologyDidChange = Notification.Name(
+        "externalMediaTopologyDidChange"
+    )
 }
 
 import AVFoundation

@@ -2,6 +2,27 @@ import XCTest
 @testable import MusicPlayer
 
 final class DurationCacheTests: XCTestCase {
+    private final class Clock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storedValue: TimeInterval
+
+        init(_ value: TimeInterval) {
+            storedValue = value
+        }
+
+        var value: TimeInterval {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedValue
+        }
+
+        func set(_ value: TimeInterval) {
+            lock.lock()
+            storedValue = value
+            lock.unlock()
+        }
+    }
+
     func testCacheMissReturnsNil() async throws {
         try await withTemporaryCache { cacheURL, directory in
             let cache = DurationCache(cacheFileURLOverride: cacheURL)
@@ -314,6 +335,272 @@ final class DurationCacheTests: XCTestCase {
         }
     }
 
+    func testDerivedStoreUsesPerKeyIncrementalRowsAndReadsThroughAcrossInstances() async throws {
+        try await withTemporaryCache { legacyURL, directory in
+            let store = try DerivedCacheStore(
+                databaseURL: directory.appendingPathComponent("derived.sqlite3"),
+                limits: .init(writeDelay: 60)
+            )
+            let url = directory.appendingPathComponent("derived-track.mp3")
+            let snapshot = FileValidationSnapshot(
+                exists: true,
+                fileSize: 101,
+                mtimeNs: 202,
+                inode: 303
+            )
+            let writer = DurationCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+
+            await writer.storeDuration(321.5, for: url, snapshot: snapshot)
+            let immediate = await writer.cachedDurationIfValid(for: url, snapshot: snapshot)
+            XCTAssertEqual(immediate, 321.5)
+            let flush = try await writer.flushPersistence().get()
+            XCTAssertTrue(flush.wroteFile)
+            XCTAssertEqual(flush.entryCount, 1)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path))
+
+            let reader = DurationCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+            let reloaded = await reader.cachedDurationIfValid(for: url, snapshot: snapshot)
+            XCTAssertEqual(reloaded, 321.5)
+        }
+    }
+
+    func testDerivedStoreIdentityMismatchInvalidatesOnlyRequestedRow() async throws {
+        try await withTemporaryCache { legacyURL, directory in
+            let store = try DerivedCacheStore(
+                databaseURL: directory.appendingPathComponent("derived.sqlite3"),
+                limits: .init(writeDelay: 60)
+            )
+            let cache = DurationCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+            let firstURL = directory.appendingPathComponent("first.mp3")
+            let secondURL = directory.appendingPathComponent("second.mp3")
+            let firstIdentity = FileValidationSnapshot(
+                exists: true,
+                fileSize: 10,
+                mtimeNs: 20,
+                inode: 30
+            )
+            let secondIdentity = FileValidationSnapshot(
+                exists: true,
+                fileSize: 11,
+                mtimeNs: 21,
+                inode: 31
+            )
+            await cache.storeDuration(100, for: firstURL, snapshot: firstIdentity)
+            await cache.storeDuration(200, for: secondURL, snapshot: secondIdentity)
+            _ = await cache.flushPersistence()
+
+            let replacement = FileValidationSnapshot(
+                exists: true,
+                fileSize: firstIdentity.fileSize + 1,
+                mtimeNs: firstIdentity.mtimeNs,
+                inode: firstIdentity.inode
+            )
+            let invalidated = await cache.cachedDurationIfValid(
+                for: firstURL,
+                snapshot: replacement
+            )
+            let retained = await cache.cachedDurationIfValid(
+                for: secondURL,
+                snapshot: secondIdentity
+            )
+            XCTAssertNil(invalidated)
+            XCTAssertEqual(retained, 200)
+            _ = await cache.flushPersistence()
+            XCTAssertEqual(store.persistedEntryCount(for: .duration), 1)
+        }
+    }
+
+    func testDerivedStoreReadTouchIsThrottled() async throws {
+        try await withTemporaryCache { legacyURL, directory in
+            let clock = Clock(1_000)
+            let store = try DerivedCacheStore(
+                databaseURL: directory.appendingPathComponent("derived.sqlite3"),
+                limits: .init(
+                    writeDelay: 60,
+                    accessRefreshInterval: 100
+                ),
+                now: { clock.value }
+            )
+            let cache = DurationCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL,
+                now: { Date(timeIntervalSince1970: clock.value) }
+            )
+            let url = directory.appendingPathComponent("touch.mp3")
+            let snapshot = FileValidationSnapshot(
+                exists: true,
+                fileSize: 1,
+                mtimeNs: 2,
+                inode: 3
+            )
+            await cache.storeDuration(90, for: url, snapshot: snapshot)
+            _ = await cache.flushPersistence()
+
+            clock.set(1_050)
+            let earlyRead = await cache.cachedDurationIfValid(for: url, snapshot: snapshot)
+            let earlyFlush = try await cache.flushPersistence().get()
+            XCTAssertEqual(earlyRead, 90)
+            XCTAssertFalse(earlyFlush.wroteFile)
+
+            clock.set(1_150)
+            let lateRead = await cache.cachedDurationIfValid(for: url, snapshot: snapshot)
+            let lateFlush = try await cache.flushPersistence().get()
+            XCTAssertEqual(lateRead, 90)
+            XCTAssertTrue(lateFlush.wroteFile)
+            XCTAssertEqual(
+                store.record(
+                    kind: .duration,
+                    key: DurationCache.key(for: url),
+                    variant: DurationCache.derivedVariant,
+                    touch: false
+                )?.lastAccessedAt,
+                1_150
+            )
+        }
+    }
+
+    func testDerivedStoreClearGenerationRejectsLateWriteThenAllowsFreshWrite() async throws {
+        try await withTemporaryCache { legacyURL, directory in
+            let store = try DerivedCacheStore(
+                databaseURL: directory.appendingPathComponent("derived.sqlite3"),
+                limits: .init(writeDelay: 60)
+            )
+            let staleCache = DurationCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+            let clearingCache = DurationCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+            let url = directory.appendingPathComponent("late.mp3")
+            let snapshot = FileValidationSnapshot(
+                exists: true,
+                fileSize: 4,
+                mtimeNs: 5,
+                inode: 6
+            )
+
+            _ = await staleCache.cachedDurationIfValid(for: url, snapshot: snapshot)
+            _ = try await clearingCache.clearPersistence().get()
+
+            await staleCache.storeDuration(44, for: url, snapshot: snapshot)
+            _ = await staleCache.flushPersistence()
+            XCTAssertEqual(store.persistedEntryCount(for: .duration), 0)
+
+            await staleCache.storeDuration(45, for: url, snapshot: snapshot)
+            _ = try await staleCache.flushPersistence().get()
+            XCTAssertEqual(store.persistedEntryCount(for: .duration), 1)
+            let fresh = await staleCache.cachedDurationIfValid(for: url, snapshot: snapshot)
+            XCTAssertEqual(fresh, 45)
+        }
+    }
+
+    func testDerivedStoreMigratesLegacyJSONOnceAndClearDoesNotResurrectIt() async throws {
+        try await withTemporaryCache { legacyURL, directory in
+            let url = directory.appendingPathComponent("legacy.mp3")
+            let snapshot = FileValidationSnapshot(
+                exists: true,
+                fileSize: 7,
+                mtimeNs: 8,
+                inode: 9
+            )
+            try writeLegacyV3DurationCache(
+                to: legacyURL,
+                path: url.path,
+                duration: 222,
+                snapshot: snapshot,
+                lastAccessedAt: 1_000
+            )
+            let store = try DerivedCacheStore(
+                databaseURL: directory.appendingPathComponent("derived.sqlite3"),
+                limits: .init(maximumPendingOperations: 2, writeDelay: 60)
+            )
+            let first = DurationCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+
+            let migrated = await first.cachedDurationIfValid(for: url, snapshot: snapshot)
+            XCTAssertEqual(migrated, 222)
+            XCTAssertNotNil(
+                store.migrationMarker(for: DurationCache.derivedMigrationMarkerKey)
+            )
+            XCTAssertEqual(store.persistedEntryCount(for: .duration), 1)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path))
+
+            try writeLegacyV3DurationCache(
+                to: legacyURL,
+                path: url.path,
+                duration: 999,
+                snapshot: snapshot,
+                lastAccessedAt: 2_000
+            )
+            let second = DurationCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+            let retained = await second.cachedDurationIfValid(for: url, snapshot: snapshot)
+            XCTAssertEqual(
+                retained,
+                222,
+                "A durable migration marker must prevent a second import"
+            )
+
+            let clear = try await second.clearPersistence().get()
+            XCTAssertEqual(clear.removedEntryCount, 1)
+            let third = DurationCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+            let afterClear = await third.cachedDurationIfValid(for: url, snapshot: snapshot)
+            XCTAssertNil(
+                afterClear,
+                "Clearing derived rows must not re-import the retained legacy file"
+            )
+        }
+    }
+
+    func testDerivedStoreMarksOversizedLegacyJSONWithoutImportingRows() async throws {
+        try await withTemporaryCache { legacyURL, directory in
+            try Data(repeating: 0x44, count: 2_048).write(to: legacyURL)
+            let limits = DerivedCacheLimits(
+                maximumEntries: 3,
+                lowWatermark: 2,
+                maximumFileBytes: 1_024
+            )
+            let store = try DerivedCacheStore(
+                databaseURL: directory.appendingPathComponent("derived.sqlite3"),
+                limits: .init(writeDelay: 60)
+            )
+            let cache = DurationCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL,
+                limits: limits
+            )
+
+            let missing = await cache.cachedDurationIfValid(
+                for: directory.appendingPathComponent("missing.mp3"),
+                snapshot: .missing
+            )
+            XCTAssertNil(missing)
+            XCTAssertEqual(store.persistedEntryCount(for: .duration), 0)
+            XCTAssertNotNil(
+                store.migrationMarker(for: DurationCache.derivedMigrationMarkerKey)
+            )
+            XCTAssertEqual(try Data(contentsOf: legacyURL).count, 2_048)
+        }
+    }
+
     private func withTemporaryCache(
         _ body: (URL, URL) async throws -> Void
     ) async throws {
@@ -338,5 +625,27 @@ final class DurationCacheTests: XCTestCase {
             at: directory,
             includingPropertiesForKeys: nil
         ).sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private func writeLegacyV3DurationCache(
+        to cacheURL: URL,
+        path: String,
+        duration: TimeInterval,
+        snapshot: FileValidationSnapshot,
+        lastAccessedAt: Int64
+    ) throws {
+        let payload: [String: Any] = [
+            "version": 3,
+            "entries": [
+                path: [
+                    "durationSeconds": duration,
+                    "fileSize": snapshot.fileSize,
+                    "mtimeNs": snapshot.mtimeNs,
+                    "inode": snapshot.inode.map { $0 as Any } ?? NSNull(),
+                    "lastAccessedAt": lastAccessedAt
+                ]
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: payload).write(to: cacheURL)
     }
 }

@@ -9,15 +9,10 @@ final class PlaylistViewModel: ObservableObject {
     let playlistsStore: PlaylistsStore
     let sortState: SearchSortState
     let weights: PlaybackWeights
+    let preferencesStore: AppPreferencesStore
     private let stopPlaybackForQueueClear: () -> Void
 
-    private static let panelModeDefaultsKey = "userPlaylistPanelMode"
-
-    @Published private(set) var panelMode: PanelMode {
-        didSet {
-            UserDefaults.standard.set(panelMode.rawValue, forKey: Self.panelModeDefaultsKey)
-        }
-    }
+    @Published private(set) var panelMode: PanelMode
     @Published private(set) var queueVisibleFiles: [AudioFile] = []
     @Published private(set) var queueVisibleRevision: UInt64 = 0
     @Published var queueScrollTargetID: String?
@@ -55,7 +50,11 @@ final class PlaylistViewModel: ObservableObject {
         if !queueVisibleFiles.isEmpty || queueSourceFiles.isEmpty {
             return queueVisibleFiles
         }
-        return sortState.option(for: .queue).applying(to: queueSourceFiles, weightScope: .queue)
+        return sortState.option(for: .queue).applying(
+            to: queueSourceFiles,
+            weightScope: .queue,
+            weights: weights
+        )
     }
 
     var currentHighlightedURL: URL? {
@@ -110,12 +109,13 @@ final class PlaylistViewModel: ObservableObject {
         self.playlistManager = playlistManager
         self.playlistsStore = playlistsStore
         self.sortState = sortState ?? .shared
-        self.weights = weights ?? .shared
+        self.weights = weights ?? playlistManager.playbackWeights
+        self.preferencesStore = playlistManager.appPreferencesStore
         self.stopPlaybackForQueueClear = stopPlaybackForQueueClear ?? { [weak audioPlayer] in
             audioPlayer?.stopAndClearCurrent()
         }
         self.panelMode = PanelMode(
-            rawValue: UserDefaults.standard.integer(forKey: Self.panelModeDefaultsKey)
+            rawValue: playlistManager.appPreferencesStore.load().playlistPanelMode
         ) ?? .queue
 
         // 转发服务状态变化，让 SwiftUI 重新渲染；但不在这里刷新派生列表，
@@ -156,21 +156,41 @@ final class PlaylistViewModel: ObservableObject {
     // MARK: - Panel Switching
 
     func switchToQueue() {
-        panelMode = .queue
+        setPanelMode(.queue)
         blurSearchField()
         refreshQueueVisibleFiles()
     }
 
     func switchToPlaylists() {
-        panelMode = .playlists
+        setPanelMode(.playlists)
         blurSearchField()
     }
 
     func handleScopeBadgeTap(_ badge: PlaybackScopeBadge) {
-        panelMode = badge.targetPanel
+        setPanelMode(badge.targetPanel)
         blurSearchField()
         if panelMode == .queue {
             refreshQueueVisibleFiles()
+        }
+    }
+
+    private func setPanelMode(_ requestedMode: PanelMode) {
+        let authoritativeMode = PanelMode(
+            rawValue: preferencesStore.load().playlistPanelMode
+        ) ?? .queue
+        guard preferencesStore.persistenceState == .writable else {
+            panelMode = authoritativeMode
+            return
+        }
+        guard requestedMode != panelMode else { return }
+
+        panelMode = requestedMode
+        _ = preferencesStore.update { $0.playlistPanelMode = requestedMode.rawValue }
+        if case .failure = preferencesStore.persist() {
+            _ = preferencesStore.update {
+                $0.playlistPanelMode = authoritativeMode.rawValue
+            }
+            panelMode = authoritativeMode
         }
     }
 
@@ -323,7 +343,10 @@ final class PlaylistViewModel: ObservableObject {
             await Task.yield()
             guard !Task.isCancelled else { return }
             queueVisibleFiles = sortState.option(for: .queue).applying(
-                to: queueSourceFiles, weightScope: .queue)
+                to: queueSourceFiles,
+                weightScope: .queue,
+                weights: weights
+            )
             queueVisibleRevision &+= 1
         }
     }

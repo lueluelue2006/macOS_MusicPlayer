@@ -75,6 +75,356 @@ private final class ControlledPlaybackWeightsWriter: @unchecked Sendable {
 }
 
 final class PlaylistsDurabilityTests: XCTestCase {
+    func testPersistenceFailuresExposeRetryPolicy() {
+        XCTAssertTrue(PlaylistPersistenceFailure.storageUnavailable.isRetryable)
+        XCTAssertTrue(PlaylistPersistenceFailure.writeFailed("disk busy").isRetryable)
+        XCTAssertFalse(PlaylistPersistenceFailure.encodingFailed("invalid payload").isRetryable)
+        XCTAssertFalse(
+            PlaylistPersistenceFailure.capacityExceeded(maximumBytes: 16 * 1_024 * 1_024)
+                .isRetryable
+        )
+        XCTAssertFalse(
+            PlaylistPersistenceFailure.readOnly(.unreadable).isRetryable
+        )
+    }
+
+    @MainActor
+    func testEncodingFailureCompletesAsNonretryableWithoutWriting() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storeURL = root.appendingPathComponent("user-playlists.json")
+        let invalidPlaylist = UserPlaylist(
+            name: "Invalid Date",
+            tracks: [],
+            updatedAt: Date(timeIntervalSince1970: .infinity)
+        )
+        let store = PlaylistsStore(
+            playlistsFileURLOverride: storeURL,
+            automaticallyProcessesCleanup: false
+        )
+        store.debugSetPlaylistsForTesting([invalidPlaylist])
+
+        guard case .applied(_, let receipt) = store.createEmptyPlaylistResult(name: "New") else {
+            return XCTFail("the mutation should reach snapshot validation")
+        }
+        let result = await store.awaitDurableCommit(receipt)
+
+        guard case .failed(let revision, .encodingFailed(_), let retryable) = result else {
+            return XCTFail("invalid snapshots must report their encoding failure")
+        }
+        XCTAssertEqual(revision, receipt.revision)
+        XCTAssertFalse(retryable)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storeURL.path))
+    }
+
+    @MainActor
+    func testLibraryDatabaseBackendLoadsAuthoritativeSnapshot() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try LibraryDatabase(
+            fileURL: root.appendingPathComponent("Library.sqlite")
+        )
+        defer { database.close() }
+        let track = UserPlaylist.Track(
+            path: "/Music/Database.mp3",
+            signature: syntheticSignature(
+                path: "/Music/Database.mp3",
+                identity: "database-load"
+            )
+        )
+        let playlist = UserPlaylist(
+            name: "Database",
+            tracks: [track],
+            createdAt: Date(timeIntervalSince1970: 1),
+            updatedAt: Date(timeIntervalSince1970: 2)
+        )
+        let cleanup = PlaylistCleanupIntent(
+            kind: .removeTracks,
+            playlistID: playlist.id,
+            trackPaths: [track.path],
+            trackIDs: [track.id],
+            createdAt: Date(timeIntervalSince1970: 3)
+        )
+        try database.replacePlaylists(
+            LibraryPlaylistsSnapshot(
+                revision: 7,
+                playlists: [playlist],
+                pendingCleanup: [cleanup]
+            )
+        )
+
+        let store = PlaylistsStore(
+            libraryDatabase: database,
+            playbackWeights: PlaybackWeights(
+                cacheFileURLOverride: root.appendingPathComponent("weights.json")
+            ),
+            artworkStore: PlaylistArtworkStore(
+                customDirectoryOverride: root.appendingPathComponent("artwork")
+            ),
+            automaticallyProcessesCleanup: false
+        )
+        await store.ensureLoaded()
+
+        XCTAssertEqual(store.playlists, [playlist])
+        XCTAssertEqual(store.pendingCleanupIntents, [cleanup])
+        XCTAssertEqual(store.selectedPlaylistID, playlist.id)
+        XCTAssertEqual(store.persistenceState, .ready(durableRevision: 7))
+    }
+
+    @MainActor
+    func testLibraryDatabaseBackendCoalescesMutationsToLatestDurableRevision() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try LibraryDatabase(
+            fileURL: root.appendingPathComponent("Library.sqlite")
+        )
+        defer { database.close() }
+        let store = PlaylistsStore(
+            libraryDatabase: database,
+            automaticallyProcessesCleanup: false
+        )
+        await store.ensureLoaded()
+
+        guard case .applied(let firstID, let firstReceipt) = store.createEmptyPlaylistResult(
+            name: "First"
+        ), case .applied(let secondID, let secondReceipt) = store.createEmptyPlaylistResult(
+            name: "Second"
+        ) else {
+            return XCTFail("both mutations must be accepted before the writer drains")
+        }
+
+        guard case .committed(let throughRevision) = await store.awaitDurableCommit(
+            secondReceipt
+        ) else {
+            return XCTFail("the latest coalesced database snapshot must commit")
+        }
+        XCTAssertGreaterThanOrEqual(throughRevision, secondReceipt.revision)
+        guard case .committed(let firstThroughRevision) = await store.awaitDurableCommit(
+            firstReceipt
+        ) else {
+            return XCTFail("a newer durable snapshot must acknowledge the older receipt")
+        }
+        XCTAssertGreaterThanOrEqual(firstThroughRevision, secondReceipt.revision)
+
+        let snapshot = try database.loadPlaylists()
+        XCTAssertEqual(snapshot.revision, secondReceipt.revision)
+        XCTAssertEqual(snapshot.playlists.map(\.id), [secondID, firstID])
+        XCTAssertEqual(snapshot.playlists.map(\.name), ["Second", "First"])
+        XCTAssertEqual(store.persistenceState, .ready(durableRevision: secondReceipt.revision))
+    }
+
+    @MainActor
+    func testLibraryDatabaseCASConflictAndStaleEnterReloadProtection() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let conflictDatabase = try LibraryDatabase(
+            fileURL: root.appendingPathComponent("conflict-Library.sqlite")
+        )
+        defer { conflictDatabase.close() }
+        let conflictStore = PlaylistsStore(
+            libraryDatabase: conflictDatabase,
+            automaticallyProcessesCleanup: false
+        )
+        await conflictStore.ensureLoaded()
+        try conflictDatabase.replacePlaylists(
+            .init(
+                revision: 1,
+                playlists: [UserPlaylist(name: "External", tracks: [])],
+                pendingCleanup: []
+            )
+        )
+        guard case .applied(_, let conflictReceipt) = conflictStore.createEmptyPlaylistResult(
+            name: "Local"
+        ) else {
+            return XCTFail("local mutation should be accepted before CAS detects divergence")
+        }
+        guard case .failed(_, .readOnly(.databaseInconsistent(let conflictDetail)), false) =
+            await conflictStore.awaitDurableCommit(conflictReceipt) else {
+            return XCTFail("same-revision different content must require a reload")
+        }
+        XCTAssertTrue(conflictDetail.contains("不同内容"))
+
+        let staleDatabase = try LibraryDatabase(
+            fileURL: root.appendingPathComponent("stale-Library.sqlite")
+        )
+        defer { staleDatabase.close() }
+        let staleStore = PlaylistsStore(
+            libraryDatabase: staleDatabase,
+            automaticallyProcessesCleanup: false
+        )
+        await staleStore.ensureLoaded()
+        try staleDatabase.replacePlaylists(
+            .init(
+                revision: 2,
+                playlists: [UserPlaylist(name: "External Newer", tracks: [])],
+                pendingCleanup: []
+            )
+        )
+        guard case .applied(_, let staleReceipt) = staleStore.createEmptyPlaylistResult(
+            name: "Local Older"
+        ) else {
+            return XCTFail("local mutation should be accepted before CAS detects staleness")
+        }
+        guard case .failed(_, .readOnly(.databaseInconsistent(let staleDetail)), false) =
+            await staleStore.awaitDurableCommit(staleReceipt) else {
+            return XCTFail("stale revision must require a reload")
+        }
+        XCTAssertTrue(staleDetail.contains("已过期"))
+    }
+
+    @MainActor
+    func testLibraryDatabaseBackendPersistsCleanupIntentAndDurableAcknowledgement() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try LibraryDatabase(
+            fileURL: root.appendingPathComponent("Library.sqlite")
+        )
+        defer { database.close() }
+        let trackURL = root.appendingPathComponent("database-cleanup.mp3")
+        try Data("audio".utf8).write(to: trackURL)
+        let track = UserPlaylist.Track(
+            path: trackURL.path,
+            signature: syntheticSignature(
+                path: trackURL.path,
+                identity: "database-cleanup"
+            )
+        )
+        let playlist = UserPlaylist(name: "Cleanup", tracks: [track])
+        try database.replacePlaylists(
+            LibraryPlaylistsSnapshot(
+                revision: 1,
+                playlists: [playlist],
+                pendingCleanup: []
+            )
+        )
+        let weights = PlaybackWeights(
+            cacheFileURLOverride: root.appendingPathComponent("weights.json"),
+            persistenceDebounceInterval: 60
+        )
+        _ = weights.setLevel(.red, for: trackURL, scope: .playlist(playlist.id))
+        XCTAssertTrue(weights.flushPersistence().isDurable)
+        let store = PlaylistsStore(
+            libraryDatabase: database,
+            playbackWeights: weights,
+            artworkStore: PlaylistArtworkStore(
+                customDirectoryOverride: root.appendingPathComponent("artwork")
+            ),
+            automaticallyProcessesCleanup: false
+        )
+        await store.ensureLoaded()
+
+        guard case .committed = await store.awaitDurability(
+            of: store.removeTracksResult(trackIDs: [track.id], from: playlist.id)
+        ) else {
+            return XCTFail("the database must first persist the cleanup debt")
+        }
+        XCTAssertEqual(try database.loadPlaylists().pendingCleanup.count, 1)
+
+        let report = await store.processPendingCleanupIntents()
+        XCTAssertTrue(report.sidecarsDurable)
+        XCTAssertTrue(store.pendingCleanupIntents.isEmpty)
+        XCTAssertTrue(try database.loadPlaylists().pendingCleanup.isEmpty)
+        XCTAssertTrue(try database.loadPlaylists().playlists[0].tracks.isEmpty)
+        XCTAssertEqual(
+            weights.level(for: trackURL, scope: .playlist(playlist.id)),
+            .defaultLevel
+        )
+    }
+
+    @MainActor
+    func testFutureLibraryDatabaseLoadsDataButRejectsMutationsReadOnly() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let databaseURL = root.appendingPathComponent("Library.sqlite")
+        let initial = try LibraryDatabase(fileURL: databaseURL)
+        let playlist = UserPlaylist(name: "Future", tracks: [])
+        try initial.replacePlaylists(
+            LibraryPlaylistsSnapshot(
+                revision: 4,
+                playlists: [playlist],
+                pendingCleanup: []
+            )
+        )
+        initial.close()
+        let futureWriter = try SQLiteDatabase(
+            fileURL: databaseURL,
+            schema: SQLiteSchema(
+                applicationID: LibraryDatabase.applicationID,
+                version: 99,
+                migrations: [
+                    SQLiteMigration(
+                        fromVersion: LibraryDatabase.schemaVersion,
+                        toVersion: 99
+                    ) { _ in }
+                ]
+            )
+        )
+        futureWriter.close()
+        let future = try LibraryDatabase(fileURL: databaseURL)
+        defer { future.close() }
+        let store = PlaylistsStore(
+            libraryDatabase: future,
+            automaticallyProcessesCleanup: false
+        )
+
+        await store.ensureLoaded()
+
+        XCTAssertEqual(store.playlists, [playlist])
+        XCTAssertEqual(
+            store.persistenceState,
+            .readOnly(.futureVersion(found: 99, supported: LibraryDatabase.schemaVersion))
+        )
+        guard case .rejected(.readOnly(.futureVersion(let found, let supported))) =
+            store.createEmptyPlaylistResult(name: "Rejected") else {
+            return XCTFail("future database mutations must remain read-only")
+        }
+        XCTAssertEqual(found, 99)
+        XCTAssertEqual(supported, LibraryDatabase.schemaVersion)
+        XCTAssertEqual(try future.loadPlaylists().playlists, [playlist])
+        XCTAssertEqual(try future.loadPlaylists().revision, 4)
+    }
+
+    @MainActor
+    func testForeignLibraryDatabaseMapsToReadOnlyWithoutLegacyFallback() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let databaseURL = root.appendingPathComponent("Library.sqlite")
+        let foreignApplicationID: Int32 = 0x4652_474E // "FRGN"
+        let foreignWriter = try SQLiteDatabase(
+            fileURL: databaseURL,
+            schema: SQLiteSchema(
+                applicationID: foreignApplicationID,
+                version: 1,
+                migrations: [
+                    SQLiteMigration(fromVersion: 0, toVersion: 1) { connection in
+                        try connection.execute("CREATE TABLE foreign_fixture(value INTEGER)")
+                    }
+                ]
+            )
+        )
+        foreignWriter.close()
+        let foreign = try LibraryDatabase(fileURL: databaseURL)
+        defer { foreign.close() }
+        let store = PlaylistsStore(
+            libraryDatabase: foreign,
+            automaticallyProcessesCleanup: false
+        )
+
+        await store.ensureLoaded()
+
+        XCTAssertTrue(store.playlists.isEmpty)
+        XCTAssertEqual(
+            store.persistenceState,
+            .readOnly(.foreignDatabase(applicationID: foreignApplicationID))
+        )
+        guard case .rejected(.readOnly(.foreignDatabase(let actualID))) =
+            store.createEmptyPlaylistResult(name: "Rejected") else {
+            return XCTFail("a foreign database must never fall back to the JSON writer")
+        }
+        XCTAssertEqual(actualID, foreignApplicationID)
+    }
+
     @MainActor
     func testFlushReturnsFalseBeforeLoadingStarts() throws {
         let root = try makeTemporaryDirectory()
@@ -379,6 +729,135 @@ final class PlaylistsDurabilityTests: XCTestCase {
             .defaultLevel,
             "rekey success must survive a fresh sidecar reload"
         )
+    }
+
+    @MainActor
+    func testLocationBackedRelocationUpdatesRelativePathInsideStoredRoot() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let libraryRoot = root.appendingPathComponent("External Music", isDirectory: true)
+        let movedURL = libraryRoot.appendingPathComponent("Moved/song.mp3")
+        try FileManager.default.createDirectory(
+            at: movedURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("audio".utf8).write(to: movedURL)
+
+        let database = try LibraryDatabase(
+            fileURL: root.appendingPathComponent("Library.sqlite")
+        )
+        let location = try LibraryLocation(
+            kind: .directory,
+            bookmarkData: Data("bookmark".utf8),
+            bookmarkKind: .regular,
+            fallbackPath: libraryRoot.path,
+            displayName: "External Music"
+        )
+        XCTAssertTrue(try database.upsertLibraryLocation(
+            LibraryLocationRecord(location: location, updatedAt: Date()),
+            expectedRevision: 0,
+            nextRevision: 1
+        ))
+
+        let oldPath = libraryRoot.appendingPathComponent("Old/song.mp3").path
+        let playlist = UserPlaylist(
+            name: "External",
+            tracks: [.init(
+                path: oldPath,
+                signature: syntheticSignature(path: oldPath, identity: "external-file"),
+                locationID: location.id,
+                relativePath: "Old/song.mp3"
+            )]
+        )
+        let store = PlaylistsStore(
+            libraryDatabase: database,
+            playbackWeights: PlaybackWeights(
+                cacheFileURLOverride: root.appendingPathComponent("weights.json")
+            ),
+            artworkStore: PlaylistArtworkStore(
+                customDirectoryOverride: root.appendingPathComponent("artwork")
+            ),
+            automaticallyProcessesCleanup: false
+        )
+        store.debugSetPlaylistsForTesting([playlist])
+
+        let mutation = store.relocateMissingTracksResult(using: [
+            FileRelocationCandidate(
+                url: movedURL,
+                signature: syntheticSignature(path: movedURL.path, identity: "external-file")
+            )
+        ])
+        guard case .committed = await store.awaitDurability(of: mutation),
+              let relocated = store.playlist(for: playlist.id)?.tracks.first else {
+            return XCTFail("same-root relocation must persist")
+        }
+        XCTAssertEqual(relocated.path, movedURL.path)
+        XCTAssertEqual(relocated.locationID, location.id)
+        XCTAssertEqual(relocated.relativePath, "Moved/song.mp3")
+    }
+
+    @MainActor
+    func testLocationBackedRelocationRejectsCandidateOutsideStoredRoot() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let libraryRoot = root.appendingPathComponent("External Music", isDirectory: true)
+        let outsideURL = root.appendingPathComponent("Elsewhere/song.mp3")
+        try FileManager.default.createDirectory(
+            at: outsideURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("audio".utf8).write(to: outsideURL)
+
+        let database = try LibraryDatabase(
+            fileURL: root.appendingPathComponent("Library.sqlite")
+        )
+        let location = try LibraryLocation(
+            kind: .directory,
+            bookmarkData: Data("bookmark".utf8),
+            bookmarkKind: .regular,
+            fallbackPath: libraryRoot.path,
+            displayName: "External Music"
+        )
+        XCTAssertTrue(try database.upsertLibraryLocation(
+            LibraryLocationRecord(location: location, updatedAt: Date()),
+            expectedRevision: 0,
+            nextRevision: 1
+        ))
+
+        let oldPath = libraryRoot.appendingPathComponent("Old/song.mp3").path
+        let playlist = UserPlaylist(
+            name: "External",
+            tracks: [.init(
+                path: oldPath,
+                signature: syntheticSignature(path: oldPath, identity: "external-file"),
+                locationID: location.id,
+                relativePath: "Old/song.mp3"
+            )]
+        )
+        let store = PlaylistsStore(
+            libraryDatabase: database,
+            playbackWeights: PlaybackWeights(
+                cacheFileURLOverride: root.appendingPathComponent("weights.json")
+            ),
+            artworkStore: PlaylistArtworkStore(
+                customDirectoryOverride: root.appendingPathComponent("artwork")
+            ),
+            automaticallyProcessesCleanup: false
+        )
+        store.debugSetPlaylistsForTesting([playlist])
+
+        let result = store.relocateMissingTracksResult(using: [
+            FileRelocationCandidate(
+                url: outsideURL,
+                signature: syntheticSignature(path: outsideURL.path, identity: "external-file")
+            )
+        ])
+        guard case .unchanged(let summary) = result else {
+            return XCTFail("candidate outside the stored root must be ignored")
+        }
+        XCTAssertEqual(summary.relocatedTrackCount, 0)
+        XCTAssertEqual(store.playlist(for: playlist.id)?.tracks.first, playlist.tracks.first)
+        XCTAssertTrue(store.pendingCleanupIntents.isEmpty)
     }
 
     @MainActor
@@ -836,6 +1315,137 @@ final class PlaylistsDurabilityTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testNewDurableIntentWakesLongMaintenanceSleep() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstURL = root.appendingPathComponent("maintenance-first.mp3")
+        let secondURL = root.appendingPathComponent("maintenance-second.mp3")
+        try Data("first".utf8).write(to: firstURL)
+        try Data("second".utf8).write(to: secondURL)
+        let firstTrack = UserPlaylist.Track(path: firstURL.path)
+        let secondTrack = UserPlaylist.Track(path: secondURL.path)
+        let playlist = UserPlaylist(
+            name: "Wake Maintenance",
+            tracks: [firstTrack, secondTrack]
+        )
+        let writer = ControlledPlaybackWeightsWriter()
+        let weights = PlaybackWeights(
+            cacheFileURLOverride: root.appendingPathComponent("weights.json"),
+            fileWriter: writer.write,
+            persistenceDebounceInterval: 60,
+            maximumAutomaticRetryAttempts: 0
+        )
+        _ = weights.setLevel(.red, for: firstURL, scope: .playlist(playlist.id))
+        _ = weights.setLevel(.red, for: secondURL, scope: .playlist(playlist.id))
+        XCTAssertTrue(weights.flushPersistence().isDurable)
+        let baselineWriteCount = writer.writeCount
+
+        let store = PlaylistsStore(
+            playlistsFileURLOverride: root.appendingPathComponent("playlists.json"),
+            playbackWeights: weights,
+            automaticallyProcessesCleanup: true,
+            cleanupRetryDelays: [0.005],
+            cleanupMaintenanceRetryDelay: 60
+        )
+        defer { store.prepareForImmediateTermination() }
+        store.debugSetPlaylistsForTesting([playlist])
+        writer.armFailingWrites(2)
+
+        guard case .committed = await store.awaitDurability(
+            of: store.removeTracksResult(trackIDs: [firstTrack.id], from: playlist.id)
+        ) else {
+            return XCTFail("the first cleanup intent must be durable")
+        }
+        let enteredMaintenanceSleep = await waitUntil {
+            store.debugIsCleanupMaintenanceRetryWaitingForTesting
+        }
+        XCTAssertTrue(enteredMaintenanceSleep)
+        XCTAssertEqual(writer.writeCount, baselineWriteCount + 2)
+
+        guard case .committed = await store.awaitDurability(
+            of: store.removeTracksResult(trackIDs: [secondTrack.id], from: playlist.id)
+        ) else {
+            return XCTFail("the new cleanup intent must be durable")
+        }
+
+        let maintenanceWasWoken = await waitUntil(timeout: 2) {
+            store.pendingCleanupIntents.isEmpty
+        }
+        XCTAssertTrue(
+            maintenanceWasWoken,
+            "a durable new intent must wake the 60-second maintenance sleep"
+        )
+        XCTAssertFalse(store.debugIsCleanupMaintenanceRetryWaitingForTesting)
+        XCTAssertEqual(writer.writeCount, baselineWriteCount + 3)
+    }
+
+    @MainActor
+    func testNewDurableIntentDoesNotCancelActiveCleanupPass() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstURL = root.appendingPathComponent("active-first.mp3")
+        let secondURL = root.appendingPathComponent("active-second.mp3")
+        try Data("first".utf8).write(to: firstURL)
+        try Data("second".utf8).write(to: secondURL)
+        let firstTrack = UserPlaylist.Track(path: firstURL.path)
+        let secondTrack = UserPlaylist.Track(path: secondURL.path)
+        let playlist = UserPlaylist(
+            name: "Keep Active Pass",
+            tracks: [firstTrack, secondTrack]
+        )
+        let writer = ControlledPlaybackWeightsWriter()
+        let weights = PlaybackWeights(
+            cacheFileURLOverride: root.appendingPathComponent("weights.json"),
+            fileWriter: writer.write,
+            persistenceDebounceInterval: 60,
+            maximumAutomaticRetryAttempts: 0
+        )
+        _ = weights.setLevel(.red, for: firstURL, scope: .playlist(playlist.id))
+        _ = weights.setLevel(.red, for: secondURL, scope: .playlist(playlist.id))
+        XCTAssertTrue(weights.flushPersistence().isDurable)
+
+        let store = PlaylistsStore(
+            playlistsFileURLOverride: root.appendingPathComponent("playlists.json"),
+            playbackWeights: weights,
+            automaticallyProcessesCleanup: true,
+            cleanupRetryDelays: [0.005],
+            cleanupMaintenanceRetryDelay: 60
+        )
+        defer {
+            writer.releaseBlockedWrite()
+            store.prepareForImmediateTermination()
+        }
+        store.debugSetPlaylistsForTesting([playlist])
+        writer.armBlockingWrite()
+
+        guard case .committed = await store.awaitDurability(
+            of: store.removeTracksResult(trackIDs: [firstTrack.id], from: playlist.id)
+        ) else {
+            return XCTFail("the first cleanup intent must be durable")
+        }
+        try await waitUntilWriterBlocks(writer)
+        XCTAssertTrue(store.debugIsAutomaticCleanupProcessingForTesting)
+
+        guard case .committed = await store.awaitDurability(
+            of: store.removeTracksResult(trackIDs: [secondTrack.id], from: playlist.id)
+        ) else {
+            return XCTFail("the second cleanup intent must be durable")
+        }
+        XCTAssertTrue(writer.isBlocked)
+        XCTAssertTrue(store.debugIsAutomaticCleanupProcessingForTesting)
+        XCTAssertFalse(store.debugAutomaticCleanupProcessingIsCancelledForTesting)
+
+        writer.releaseBlockedWrite()
+        let activePassFinished = await waitUntil(timeout: 2) {
+            store.pendingCleanupIntents.isEmpty
+        }
+        XCTAssertTrue(
+            activePassFinished,
+            "the active pass may finish, then a fresh pass must acknowledge both intents"
+        )
+    }
+
     private func syntheticSignature(path: String, identity: String) -> FileSignature {
         FileSignature(
             pathKey: PathKey.canonical(path: path),
@@ -865,5 +1475,17 @@ final class PlaylistsDurabilityTests: XCTestCase {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         XCTAssertTrue(writer.isBlocked, "timed out waiting for the injected write barrier")
+    }
+
+    @MainActor
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        condition: @escaping @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        return condition()
     }
 }

@@ -175,14 +175,6 @@ enum RegressionTests {
     }
 
     private static func testPlaybackScopeRestoreFromPlaylist() async -> Bool {
-        let suiteName = "musicplayer.regression.scope.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suiteName) else { return false }
-        let kindKey = "userPlaybackScopeKind"
-        let playlistIDKey = "userPlaybackScopePlaylistID"
-        defer {
-            defaults.removePersistentDomain(forName: suiteName)
-        }
-
         let fm = FileManager.default
         let tempRoot = fm.temporaryDirectory.appendingPathComponent("musicplayer-regression-scope-\(UUID().uuidString)", isDirectory: true)
         defer { try? fm.removeItem(at: tempRoot) }
@@ -198,13 +190,20 @@ enum RegressionTests {
                 instance.debugSetPlaylistsForTesting([playlist], selectedID: playlist.id)
                 return instance
             }
-
-            defaults.set("playlist", forKey: kindKey)
-            defaults.set(playlist.id.uuidString, forKey: playlistIDKey)
-            let preferences = AppPreferencesStore(userDefaults: defaults)
+            let sessionStore = PlaybackSessionStore(
+                debounceInterval: 60,
+                load: { nil },
+                persist: { session, _ in .committed(revision: session.revision) }
+            )
+            _ = sessionStore.mergeScope(.playlist(playlist.id))
+            _ = sessionStore.mergeInstalledTrack(
+                queueEntryID: nil,
+                scopeTrackID: playlist.tracks[0].id,
+                fallbackPath: trackURL.path
+            )
             let manager = PlaylistManager(
                 disablePersistence: true,
-                appPreferencesStore: preferences
+                playbackSessionStore: sessionStore
             )
 
             await manager.restorePlaybackScopeIfNeeded(playlistsStore: store)

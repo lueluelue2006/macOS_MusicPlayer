@@ -20,6 +20,9 @@ final class PlaybackStateStoreTests: XCTestCase {
         let state = try? XCTUnwrap(store.loadState())
         XCTAssertEqual(state?.filePath, "/Users/test/music.mp3")
         XCTAssertEqual(state?.lastPlayedTime, 42.5)
+        XCTAssertTrue(store.hasUnpersistedChanges)
+        XCTAssertTrue(store.flush())
+        XCTAssertFalse(store.hasUnpersistedChanges)
     }
 
     func testSaveUsesOneVersionedEnvelope() throws {
@@ -54,6 +57,7 @@ final class PlaybackStateStoreTests: XCTestCase {
         XCTAssertNotNil(defaults.data(forKey: PlaybackStateStore.envelopeKey))
         XCTAssertNil(defaults.object(forKey: PlaybackStateStore.legacyFilePathKey))
         XCTAssertNil(defaults.object(forKey: PlaybackStateStore.legacyFileTimeKey))
+        XCTAssertFalse(store.hasUnpersistedChanges)
     }
 
     func testLegacyPathWithoutTimeMigratesAtZero() throws {
@@ -347,6 +351,8 @@ final class PlaybackStateStoreTests: XCTestCase {
         )
 
         XCTAssertFalse(store.flush())
+        XCTAssertEqual(store.lastFlushSucceeded, false)
+        XCTAssertTrue(store.hasUnpersistedChanges)
         XCTAssertEqual(
             store.loadState(),
             PlaybackStateStore.State(
@@ -354,6 +360,87 @@ final class PlaybackStateStoreTests: XCTestCase {
                 lastPlayedTime: 8
             )
         )
+    }
+
+    func testFailedFlushKeepsLatestGenerationRetryable() throws {
+        let suiteName = "test-playback-state-flush-retry-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(
+            SequencedSynchronizationUserDefaults(suiteName: suiteName)
+        )
+        defaults.setSynchronizationResults([false, true])
+        addTeardownBlock {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let store = PlaybackStateStore(userDefaults: defaults)
+        store.saveState(
+            fileURL: URL(fileURLWithPath: "/Users/test/retry.mp3"),
+            time: 19
+        )
+
+        XCTAssertTrue(store.hasUnpersistedChanges)
+        XCTAssertFalse(store.flush())
+        XCTAssertTrue(store.hasUnpersistedChanges)
+        XCTAssertTrue(store.flush())
+        XCTAssertFalse(store.hasUnpersistedChanges)
+        XCTAssertEqual(store.lastFlushSucceeded, true)
+    }
+
+    func testLegacyKeysSurviveFailedEnvelopeSyncAndCleanupRetries() throws {
+        let suiteName = "test-playback-state-legacy-retry-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(
+            SequencedSynchronizationUserDefaults(suiteName: suiteName)
+        )
+        defaults.setSynchronizationResults([false, true, true])
+        defaults.set(
+            "/Users/test/legacy-retry.mp3",
+            forKey: PlaybackStateStore.legacyFilePathKey
+        )
+        defaults.set(27.5, forKey: PlaybackStateStore.legacyFileTimeKey)
+        addTeardownBlock {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let store = PlaybackStateStore(userDefaults: defaults)
+
+        XCTAssertEqual(try XCTUnwrap(store.loadState()).lastPlayedTime, 27.5)
+        XCTAssertNotNil(defaults.object(forKey: PlaybackStateStore.legacyFilePathKey))
+        XCTAssertNotNil(defaults.object(forKey: PlaybackStateStore.legacyFileTimeKey))
+        XCTAssertTrue(store.hasUnpersistedChanges)
+
+        XCTAssertTrue(store.flush())
+        XCTAssertNil(defaults.object(forKey: PlaybackStateStore.legacyFilePathKey))
+        XCTAssertNil(defaults.object(forKey: PlaybackStateStore.legacyFileTimeKey))
+        XCTAssertFalse(store.hasUnpersistedChanges)
+    }
+
+    func testOlderFlushCannotClearNewerConcurrentMutation() throws {
+        let suiteName = "test-playback-state-concurrent-flush-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(
+            FirstSynchronizationBlockingUserDefaults(suiteName: suiteName)
+        )
+        addTeardownBlock {
+            defaults.releaseFirstSynchronization()
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let store = PlaybackStateStore(userDefaults: defaults)
+        store.saveState(
+            fileURL: URL(fileURLWithPath: "/Users/test/older.mp3"),
+            time: 1
+        )
+        let runner = PlaybackStateFlushRunner(store: store)
+
+        runner.start()
+        XCTAssertTrue(defaults.waitUntilFirstSynchronizationStarts(timeout: 1))
+        store.saveState(
+            fileURL: URL(fileURLWithPath: "/Users/test/newer.mp3"),
+            time: 2
+        )
+        defaults.releaseFirstSynchronization()
+
+        XCTAssertEqual(runner.waitForResult(timeout: 1), false)
+        XCTAssertTrue(store.hasUnpersistedChanges)
+        XCTAssertEqual(store.loadState()?.filePath, "/Users/test/newer.mp3")
+        XCTAssertTrue(store.flush())
+        XCTAssertFalse(store.hasUnpersistedChanges)
     }
 
     func testRekeyReportsFailureWhenUserDefaultsCannotSynchronize() throws {
@@ -371,6 +458,7 @@ final class PlaybackStateStoreTests: XCTestCase {
 
         XCTAssertEqual(store.rekeyIfMatching(from: oldURL, to: newURL), .failed)
         XCTAssertEqual(store.loadState()?.filePath, newURL.path)
+        XCTAssertTrue(store.hasUnpersistedChanges)
     }
 
     func testClearIfMatchingRemovesMatchingState() {
@@ -433,6 +521,9 @@ final class PlaybackStateStoreTests: XCTestCase {
 
         let afterClear = store.loadState()
         XCTAssertNil(afterClear)
+        XCTAssertTrue(store.hasUnpersistedChanges)
+        XCTAssertTrue(store.flush())
+        XCTAssertFalse(store.hasUnpersistedChanges)
     }
 
     func testDisablesPersistencePreventsAllOperations() {
@@ -488,5 +579,91 @@ final class PlaybackStateStoreTests: XCTestCase {
 private final class SynchronizationFailingUserDefaults: UserDefaults {
     override func synchronize() -> Bool {
         false
+    }
+}
+
+private final class SequencedSynchronizationUserDefaults: UserDefaults {
+    private let resultLock = NSLock()
+    private var synchronizationResults: [Bool] = []
+
+    func setSynchronizationResults(_ results: [Bool]) {
+        resultLock.lock()
+        synchronizationResults = results
+        resultLock.unlock()
+    }
+
+    override func synchronize() -> Bool {
+        resultLock.lock()
+        defer { resultLock.unlock() }
+        guard !synchronizationResults.isEmpty else { return true }
+        return synchronizationResults.removeFirst()
+    }
+}
+
+private final class FirstSynchronizationBlockingUserDefaults: UserDefaults {
+    private let condition = NSCondition()
+    private var shouldBlockFirstSynchronization = true
+    private var firstSynchronizationStarted = false
+    private var firstSynchronizationReleased = false
+
+    override func synchronize() -> Bool {
+        condition.lock()
+        if shouldBlockFirstSynchronization {
+            shouldBlockFirstSynchronization = false
+            firstSynchronizationStarted = true
+            condition.broadcast()
+            while !firstSynchronizationReleased {
+                condition.wait()
+            }
+        }
+        condition.unlock()
+        return true
+    }
+
+    func waitUntilFirstSynchronizationStarts(timeout: TimeInterval) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !firstSynchronizationStarted {
+            guard condition.wait(until: deadline) else { break }
+        }
+        return firstSynchronizationStarted
+    }
+
+    func releaseFirstSynchronization() {
+        condition.lock()
+        firstSynchronizationReleased = true
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
+private final class PlaybackStateFlushRunner: @unchecked Sendable {
+    private let store: PlaybackStateStore
+    private let condition = NSCondition()
+    private var result: Bool?
+
+    init(store: PlaybackStateStore) {
+        self.store = store
+    }
+
+    func start() {
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let value = store.flush()
+            condition.lock()
+            result = value
+            condition.broadcast()
+            condition.unlock()
+        }
+    }
+
+    func waitForResult(timeout: TimeInterval) -> Bool? {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while result == nil {
+            guard condition.wait(until: deadline) else { break }
+        }
+        return result
     }
 }

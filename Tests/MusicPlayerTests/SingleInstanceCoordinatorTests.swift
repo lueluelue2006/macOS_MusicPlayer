@@ -378,6 +378,123 @@ final class SingleInstanceCoordinatorTests: XCTestCase {
         }
     }
 
+    func testSecondaryTakeoverPreservesOpenRequestAfterPrimaryReleasesLock() throws {
+        try withTemporaryDirectory { directory in
+            let lockURL = directory.appendingPathComponent("single-writer.lock")
+            let transport = FakeSingleInstanceTransport()
+            let name = Notification.Name("single-instance-test-\(UUID().uuidString)")
+            let primary = makeCoordinator(lockURL: lockURL, transport: transport, name: name)
+            let secondary = makeCoordinator(lockURL: lockURL, transport: transport, name: name)
+            XCTAssertEqual(try primary.acquire(), .primary)
+            let oldToken = try handoffToken(at: lockURL)
+            XCTAssertEqual(try secondary.acquire(), .secondary)
+            let requestedURL = directory.appendingPathComponent("takeover.mp3")
+
+            let released = expectation(description: "old primary releases writer lock")
+            DispatchQueue.global(qos: .userInitiated).async {
+                usleep(40_000)
+                primary.release()
+                released.fulfill()
+            }
+
+            let resolution = try secondary.resolveSecondaryLaunch(
+                openURLs: [requestedURL],
+                takeoverTimeout: 0.50,
+                retryInterval: 0.005
+            )
+            wait(for: [released], timeout: 1)
+
+            XCTAssertEqual(
+                resolution,
+                .becamePrimary(openURLs: [requestedURL.standardizedFileURL])
+            )
+            let newToken = try handoffToken(at: lockURL)
+            XCTAssertNotEqual(newToken, oldToken)
+            var received: [[URL]] = []
+            secondary.setOpenRequestHandler { received.append($0) }
+            XCTAssertEqual(received, [[requestedURL.standardizedFileURL]])
+            secondary.release()
+        }
+    }
+
+    func testSecondaryTakeoverTimeoutIsFiniteWhilePrimaryRemainsHealthy() throws {
+        try withTemporaryDirectory { directory in
+            let lockURL = directory.appendingPathComponent("single-writer.lock")
+            let transport = FakeSingleInstanceTransport()
+            let name = Notification.Name("single-instance-test-\(UUID().uuidString)")
+            let primary = makeCoordinator(lockURL: lockURL, transport: transport, name: name)
+            let secondary = makeCoordinator(lockURL: lockURL, transport: transport, name: name)
+            XCTAssertEqual(try primary.acquire(), .primary)
+            XCTAssertEqual(try secondary.acquire(), .secondary)
+
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            let resolution = try secondary.resolveSecondaryLaunch(
+                openURLs: [],
+                takeoverTimeout: 0.03,
+                retryInterval: 0.005
+            )
+            let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
+
+            XCTAssertEqual(resolution, .forwardedToPrimary)
+            XCTAssertGreaterThanOrEqual(elapsed, 0.02)
+            XCTAssertLessThan(elapsed, 0.20)
+            let contender = makeCoordinator(lockURL: lockURL, transport: transport, name: name)
+            XCTAssertEqual(try contender.acquire(), .secondary)
+            contender.release()
+            secondary.release()
+            primary.release()
+        }
+    }
+
+    func testOnlyOneSecondaryWinsConcurrentTakeover() throws {
+        try withTemporaryDirectory { directory in
+            let lockURL = directory.appendingPathComponent("single-writer.lock")
+            let transport = FakeSingleInstanceTransport()
+            let name = Notification.Name("single-instance-test-\(UUID().uuidString)")
+            let primary = makeCoordinator(lockURL: lockURL, transport: transport, name: name)
+            let secondaryA = makeCoordinator(lockURL: lockURL, transport: transport, name: name)
+            let secondaryB = makeCoordinator(lockURL: lockURL, transport: transport, name: name)
+            XCTAssertEqual(try primary.acquire(), .primary)
+            XCTAssertEqual(try secondaryA.acquire(), .secondary)
+            XCTAssertEqual(try secondaryB.acquire(), .secondary)
+
+            let resultsLock = NSLock()
+            var results: [(String, SingleInstanceCoordinator.SecondaryLaunchResolution)] = []
+            let group = DispatchGroup()
+            for (label, coordinator) in [("a", secondaryA), ("b", secondaryB)] {
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    defer { group.leave() }
+                    let url = directory.appendingPathComponent("\(label).mp3")
+                    guard let result = try? coordinator.resolveSecondaryLaunch(
+                        openURLs: [url],
+                        takeoverTimeout: 0.35,
+                        retryInterval: 0.005
+                    ) else { return }
+                    resultsLock.lock()
+                    results.append((label, result))
+                    resultsLock.unlock()
+                }
+            }
+            usleep(40_000)
+            primary.release()
+            XCTAssertEqual(group.wait(timeout: .now() + 1), .success)
+
+            resultsLock.lock()
+            let snapshot = results
+            resultsLock.unlock()
+            let winners = snapshot.filter {
+                if case .becamePrimary = $0.1 { return true }
+                return false
+            }
+            XCTAssertEqual(snapshot.count, 2)
+            XCTAssertEqual(winners.count, 1)
+            XCTAssertEqual(snapshot.filter { $0.1 == .forwardedToPrimary }.count, 1)
+            secondaryA.release()
+            secondaryB.release()
+        }
+    }
+
     func testAuthenticatedRequestAccepts128PathsAndRejects129() throws {
         try withTemporaryDirectory { directory in
             let transport = FakeSingleInstanceTransport()

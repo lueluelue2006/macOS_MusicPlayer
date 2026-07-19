@@ -18,7 +18,20 @@ struct ContentView: View {
     @State private var showVolumeNormalizationAnalysis = false
     @State private var pendingSearchFocus = false
     @State private var pendingSearchFocusTargetRaw: String?
-    @AppStorage("compactRootPane") private var compactPaneRaw = CompactRootPane.nowPlaying.rawValue
+    @State private var compactPaneRaw: Int
+
+    init(
+        audioPlayer: AudioPlayer,
+        playlistManager: PlaylistManager,
+        playlistsStore: PlaylistsStore
+    ) {
+        self.audioPlayer = audioPlayer
+        self.playlistManager = playlistManager
+        self.playlistsStore = playlistsStore
+        _compactPaneRaw = State(
+            initialValue: playlistManager.appPreferencesStore.load().compactRootPane
+        )
+    }
 
     private var theme: AppTheme { AppTheme(scheme: colorScheme) }
     private var currentVersion: String {
@@ -100,7 +113,7 @@ struct ContentView: View {
             .onChange(of: playlistManager.isAddingFiles) { _ in triggerAutoUpdateCheck() }
             .onChange(of: playlistManager.isRestoringPlaylist) { _ in triggerAutoUpdateCheck() }
             .onChange(of: compactPaneRaw) { _ in
-                handleCompactPaneChange()
+                persistCompactPaneSelection()
             }
             .onReceive(NotificationCenter.default.publisher(for: .loadLastPlayedFile)) { notification in
                 handleLoadLastPlayedFile(notification)
@@ -287,6 +300,27 @@ struct ContentView: View {
         compactPaneRaw = pane.rawValue
     }
 
+    private func persistCompactPaneSelection() {
+        let store = playlistManager.appPreferencesStore
+        let authoritativeRawValue = store.load().compactRootPane
+        guard store.persistenceState == .writable else {
+            if compactPaneRaw != authoritativeRawValue {
+                compactPaneRaw = authoritativeRawValue
+            }
+            handleCompactPaneChange()
+            return
+        }
+
+        _ = store.update { $0.compactRootPane = compactPaneRaw }
+        if case .failure = store.persist() {
+            _ = store.update { $0.compactRootPane = authoritativeRawValue }
+            if compactPaneRaw != authoritativeRawValue {
+                compactPaneRaw = authoritativeRawValue
+            }
+        }
+        handleCompactPaneChange()
+    }
+
     private func revealLibraryAndRefocusIfNeeded(_ notification: Notification) {
         guard compactPane != .library else { return }
         let requestedTarget = (notification.userInfo?["target"] as? String)
@@ -391,8 +425,6 @@ struct ContentView: View {
             return
         }
 
-        playlistManager.currentIndex = index
-        playlistManager.savePlaylist()
         audioPlayer.prepareInitialSeekForRestore(to: time, for: url)
         if let file = playlistManager.selectFile(at: index) {
             audioPlayer.play(file, autostart: false, bypassConfirm: true)

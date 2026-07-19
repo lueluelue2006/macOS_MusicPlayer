@@ -193,7 +193,11 @@ final class SearchSortState: ObservableObject {
 }
 
 extension SearchSortOption {
-    func applying(to files: [AudioFile], weightScope: PlaybackWeights.Scope?) -> [AudioFile] {
+    func applying(
+        to files: [AudioFile],
+        weightScope: PlaybackWeights.Scope?,
+        weights: PlaybackWeights = .shared
+    ) -> [AudioFile] {
         guard files.count >= 2 else { return files }
         if field == .original {
             return direction == .ascending ? files : Array(files.reversed())
@@ -201,8 +205,6 @@ extension SearchSortOption {
 
         let field = self.field
         let direction = self.direction
-        let weights = PlaybackWeights.shared
-
         func compareStringAscending(_ a: String, _ b: String) -> Int {
             switch a.localizedStandardCompare(b) {
             case .orderedAscending: return -1

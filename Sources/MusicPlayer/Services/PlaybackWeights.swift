@@ -33,20 +33,26 @@ final class PlaybackWeights: ObservableObject, @unchecked Sendable {
 
     enum ReadOnlyReason: Equatable, Sendable {
         case unsupportedVersion(Int)
+        case foreignDatabase(Int32)
         case unreadable
         case quarantineFailed
         case capacityExceeded
+        case databaseConflict(storedRevision: UInt64)
 
         var diagnosticMessage: String {
             switch self {
             case .unsupportedVersion(let version):
                 return "权重文件版本 v\(version) 不受支持"
+            case .foreignDatabase(let applicationID):
+                return "权重数据库标识不匹配（\(applicationID)）"
             case .unreadable:
                 return "权重文件不可读"
             case .quarantineFailed:
                 return "权重文件损坏且隔离失败"
             case .capacityExceeded:
                 return "权重数据超过安全容量上限"
+            case .databaseConflict(let storedRevision):
+                return "权重数据库已被其他写入更新（修订号 \(storedRevision)），需要重新加载"
             }
         }
     }
@@ -147,6 +153,7 @@ final class PlaybackWeights: ObservableObject, @unchecked Sendable {
     private static let maximumPlaylistCount = 2_000
     private static let maximumEntriesPerPlaylist = 50_000
     private static let maximumTotalEntries = 100_000
+    private let libraryDatabase: LibraryDatabase?
     private let cacheFileURLOverride: URL?
     /// Optional legacy hooks are retained for deterministic failure tests. Normal
     /// production IO always goes through `DerivedCacheFileIO`.
@@ -183,6 +190,9 @@ final class PlaybackWeights: ObservableObject, @unchecked Sendable {
     private var logicalRevision: UInt64 = 0
     private var dirtyGeneration: UInt64 = 0
     private var durableGeneration: UInt64 = 0
+    /// Last revision actually acknowledged by the authoritative SQLite domain.
+    /// It is deliberately separate from the coalesced in-memory generation.
+    private var durableDatabaseRevision: UInt64 = 0
     private var lastFailureNotificationGeneration: UInt64?
     private var persistenceRevision: UInt64 = 0
     private var automaticRetryAttempt = 0
@@ -194,8 +204,10 @@ final class PlaybackWeights: ObservableObject, @unchecked Sendable {
         fileWriter: ((Data, URL) throws -> Void)? = nil,
         persistenceDebounceInterval: TimeInterval = 0.5,
         persistenceRetryBaseInterval: TimeInterval = 1.0,
-        maximumAutomaticRetryAttempts: Int = 3
+        maximumAutomaticRetryAttempts: Int = 3,
+        libraryDatabase: LibraryDatabase? = nil
     ) {
+        self.libraryDatabase = libraryDatabase
         self.cacheFileURLOverride = cacheFileURLOverride
         self.fileMover = fileMover
         self.fileWriter = fileWriter
@@ -728,6 +740,11 @@ final class PlaybackWeights: ObservableObject, @unchecked Sendable {
         isLoaded = true
         lock.unlock()
 
+        if let libraryDatabase {
+            loadFromLibraryDatabase(libraryDatabase)
+            return
+        }
+
         guard let url = cacheFileURL() else {
             PersistenceLogger.log("随机权重缓存目录不可访问")
             lock.lock()
@@ -846,6 +863,68 @@ final class PlaybackWeights: ObservableObject, @unchecked Sendable {
 
         if needsPersistence {
             _ = flushPersistence()
+        }
+    }
+
+    private func loadFromLibraryDatabase(_ database: LibraryDatabase) {
+        let protectedReason: ReadOnlyReason?
+        switch database.accessMode {
+        case .writable:
+            protectedReason = nil
+        case .readOnlyFuture(let version):
+            protectedReason = .unsupportedVersion(version)
+        case .readOnlyForeign(let applicationID):
+            lock.lock()
+            _persistenceState = .readOnlyPreserved(.foreignDatabase(applicationID))
+            lock.unlock()
+            return
+        }
+
+        do {
+            let snapshot = try database.loadWeights()
+            let decoded = CacheFile(
+                version: formatVersion,
+                queueLevels: snapshot.queueLevels,
+                playlistLevels: Dictionary(
+                    uniqueKeysWithValues: snapshot.playlistLevels.map {
+                        ($0.key.uuidString, $0.value)
+                    }
+                )
+            )
+            guard Self.validate(decoded, requireCanonicalSparseForm: false) else {
+                lock.lock()
+                _persistenceState = .readOnlyPreserved(.capacityExceeded)
+                lock.unlock()
+                return
+            }
+
+            let normalizedQueue = normalizeLevelMap(decoded.queueLevels)
+            let normalizedPlaylists = normalizePlaylistLevelMaps(decoded.playlistLevels)
+            let needsPersistence = protectedReason == nil
+                && (normalizedQueue != decoded.queueLevels
+                    || normalizedPlaylists != decoded.playlistLevels)
+
+            lock.lock()
+            queueLevels = normalizedQueue
+            playlistLevels = normalizedPlaylists
+            refreshResourceCountersLocked()
+            dirtyGeneration = snapshot.revision
+            durableGeneration = snapshot.revision
+            durableDatabaseRevision = snapshot.revision
+            _persistenceState = protectedReason.map(PersistenceState.readOnlyPreserved) ?? .ready
+            if needsPersistence {
+                needsReplacementWrite = true
+                markDirtyLocked()
+            }
+            lock.unlock()
+
+            if needsPersistence {
+                _ = flushPersistence()
+            }
+        } catch {
+            lock.lock()
+            _persistenceState = .readOnlyPreserved(protectedReason ?? .unreadable)
+            lock.unlock()
         }
     }
 
@@ -1046,15 +1125,8 @@ final class PlaybackWeights: ObservableObject, @unchecked Sendable {
 
         let snapshotQueue = queueLevels
         let snapshotPlaylists = playlistLevels
+        let expectedDatabaseRevision = durableDatabaseRevision
         lock.unlock()
-
-        guard let url = cacheFileURL() else {
-            PersistenceLogger.log("随机权重缓存目录不可访问，无法保存")
-            return failedFlushResult(
-                generation: attemptedGeneration,
-                failure: .storageUnavailable
-            )
-        }
 
         let payload = CacheFile(
             version: formatVersion,
@@ -1068,6 +1140,72 @@ final class PlaybackWeights: ObservableObject, @unchecked Sendable {
                 failure: .capacityExceeded
             )
         }
+
+        if let libraryDatabase {
+            guard let librarySnapshot = makeLibrarySnapshot(
+                generation: attemptedGeneration,
+                queueLevels: snapshotQueue,
+                playlistLevels: snapshotPlaylists
+            ) else {
+                return failedFlushResult(
+                    generation: attemptedGeneration,
+                    failure: .capacityExceeded
+                )
+            }
+            do {
+                let result = try libraryDatabase.replaceWeights(
+                    librarySnapshot,
+                    expectedRevision: expectedDatabaseRevision
+                )
+                switch result {
+                case .committed(let revision):
+                    return completedFlushResult(
+                        generation: attemptedGeneration,
+                        databaseRevision: revision,
+                        outcome: .persisted
+                    )
+                case .alreadyCurrent(let revision):
+                    return completedFlushResult(
+                        generation: attemptedGeneration,
+                        databaseRevision: revision,
+                        outcome: .alreadyCurrent
+                    )
+                case .stale(let storedRevision):
+                    return databaseConflictFlushResult(
+                        generation: attemptedGeneration,
+                        storedRevision: storedRevision
+                    )
+                case .conflict(let revision):
+                    return databaseConflictFlushResult(
+                        generation: attemptedGeneration,
+                        storedRevision: revision
+                    )
+                }
+            } catch {
+                PersistenceLogger.log("保存随机权重到音乐库数据库失败: \(error.localizedDescription)")
+                if shouldNotifyWriteFailure(for: attemptedGeneration) {
+                    DispatchQueue.main.async {
+                        PersistenceLogger.notifyUser(
+                            title: "随机权重保存失败",
+                            subtitle: "请检查磁盘权限或空间"
+                        )
+                    }
+                }
+                return failedFlushResult(
+                    generation: attemptedGeneration,
+                    failure: .writeFailed
+                )
+            }
+        }
+
+        guard let url = cacheFileURL() else {
+            PersistenceLogger.log("随机权重缓存目录不可访问，无法保存")
+            return failedFlushResult(
+                generation: attemptedGeneration,
+                failure: .storageUnavailable
+            )
+        }
+
         do {
             let data = try JSONEncoder().encode(payload)
             guard data.count <= Self.maximumFileBytes else {
@@ -1081,18 +1219,7 @@ final class PlaybackWeights: ObservableObject, @unchecked Sendable {
             } else {
                 try DerivedCacheFileIO.atomicWrite(data, to: url)
             }
-
-            lock.lock()
-            durableGeneration = attemptedGeneration
-            if dirtyGeneration == attemptedGeneration {
-                needsReplacementWrite = false
-            }
-            let result = makeFlushResultLocked(
-                outcome: .persisted,
-                attemptedGeneration: attemptedGeneration
-            )
-            lock.unlock()
-            return result
+            return completedFlushResult(generation: attemptedGeneration)
         } catch {
             PersistenceLogger.log("保存随机权重失败: 写入错误")
             if shouldNotifyWriteFailure(for: attemptedGeneration) {
@@ -1105,6 +1232,62 @@ final class PlaybackWeights: ObservableObject, @unchecked Sendable {
                 failure: .writeFailed
             )
         }
+    }
+
+    private func makeLibrarySnapshot(
+        generation: UInt64,
+        queueLevels: [String: Int],
+        playlistLevels: [String: [String: Int]]
+    ) -> LibraryWeightsSnapshot? {
+        var convertedPlaylists: [UUID: [String: Int]] = [:]
+        convertedPlaylists.reserveCapacity(playlistLevels.count)
+        for (rawPlaylistID, levels) in playlistLevels {
+            guard let playlistID = UUID(uuidString: rawPlaylistID),
+                  convertedPlaylists[playlistID] == nil else { return nil }
+            convertedPlaylists[playlistID] = levels
+        }
+        return LibraryWeightsSnapshot(
+            revision: generation,
+            queueLevels: queueLevels,
+            playlistLevels: convertedPlaylists
+        )
+    }
+
+    private func completedFlushResult(
+        generation: UInt64,
+        databaseRevision: UInt64? = nil,
+        outcome: PersistenceFlushResult.Outcome = .persisted
+    ) -> PersistenceFlushResult {
+        lock.lock()
+        durableGeneration = generation
+        if let databaseRevision {
+            durableDatabaseRevision = max(durableDatabaseRevision, databaseRevision)
+        }
+        if dirtyGeneration == generation {
+            needsReplacementWrite = false
+        }
+        let result = makeFlushResultLocked(
+            outcome: outcome,
+            attemptedGeneration: generation
+        )
+        lock.unlock()
+        return result
+    }
+
+    private func databaseConflictFlushResult(
+        generation: UInt64,
+        storedRevision: UInt64
+    ) -> PersistenceFlushResult {
+        lock.lock()
+        let reason = ReadOnlyReason.databaseConflict(storedRevision: storedRevision)
+        _persistenceState = .readOnlyPreserved(reason)
+        let result = makeFlushResultLocked(
+            outcome: .rejectedReadOnly(reason),
+            attemptedGeneration: generation
+        )
+        lock.unlock()
+        PersistenceLogger.log(reason.diagnosticMessage)
+        return result
     }
 
     /// Must be called while `lock` is held.

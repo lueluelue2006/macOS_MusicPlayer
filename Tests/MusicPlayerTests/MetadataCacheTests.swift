@@ -2,6 +2,14 @@ import XCTest
 @testable import MusicPlayer
 
 final class MetadataCacheTests: XCTestCase {
+    private final class Clock: @unchecked Sendable {
+        var value: TimeInterval
+
+        init(_ value: TimeInterval) {
+            self.value = value
+        }
+    }
+
     func testCacheMissReturnsNil() async throws {
         try await withTemporaryCache { cacheURL, directory in
             let cache = MetadataCache(cacheFileURLOverride: cacheURL)
@@ -451,6 +459,248 @@ final class MetadataCacheTests: XCTestCase {
         }
     }
 
+    func testDerivedBackendPersistsPerKeyAndInvalidatesReplacedFile() async throws {
+        try await withTemporaryDerivedCache { directory, store, legacyURL in
+            let url = directory.appendingPathComponent("derived-track.mp3")
+            try Data("original".utf8).write(to: url)
+            let snapshot = FileValidationSnapshot.load(for: url)
+            let metadata = AudioMetadata(
+                title: "SQLite Song",
+                artist: "SQLite Artist",
+                album: "SQLite Album",
+                year: "2026",
+                genre: "Pop",
+                artwork: nil
+            )
+            let writer = MetadataCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+
+            await writer.storeBasicMetadata(metadata, for: url, snapshot: snapshot)
+            guard case .success(let flush) = await writer.flushPersistence() else {
+                return XCTFail("Expected the SQLite metadata write to flush")
+            }
+            XCTAssertTrue(flush.wroteFile)
+            XCTAssertEqual(store.persistedEntryCount(for: .metadata), 1)
+
+            let reader = MetadataCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+            let loaded = await reader.cachedMetadataIfValid(for: url, snapshot: snapshot)
+            XCTAssertEqual(loaded?.title, metadata.title)
+            XCTAssertEqual(loaded?.artist, metadata.artist)
+            XCTAssertEqual(loaded?.year, metadata.year)
+
+            let replacement = FileValidationSnapshot(
+                exists: true,
+                fileSize: snapshot.fileSize + 1,
+                mtimeNs: snapshot.mtimeNs,
+                inode: snapshot.inode
+            )
+            let replacedFileMetadata = await reader.cachedMetadataIfValid(
+                for: url,
+                snapshot: replacement
+            )
+            XCTAssertNil(replacedFileMetadata)
+            _ = await reader.flushPersistence()
+            XCTAssertEqual(store.persistedEntryCount(for: .metadata), 0)
+        }
+    }
+
+    func testDerivedBackendTouchIsThrottledAndDurable() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-metadata-derived-touch-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let clock = Clock(1_000)
+        let store = try DerivedCacheStore(
+            databaseURL: directory.appendingPathComponent("derived.sqlite3"),
+            limits: .init(
+                maximumPendingOperations: 32,
+                writeDelay: 60,
+                accessRefreshInterval: 10
+            ),
+            now: { clock.value }
+        )
+        let legacyURL = directory.appendingPathComponent("missing-legacy.json")
+        let url = directory.appendingPathComponent("touch.mp3")
+        try Data("touch".utf8).write(to: url)
+        let snapshot = FileValidationSnapshot.load(for: url)
+        let cache = MetadataCache(
+            now: { Date(timeIntervalSince1970: clock.value) },
+            derivedStoreOverride: store,
+            legacyMigrationURLOverride: legacyURL
+        )
+        await cache.storeBasicMetadata(
+            AudioMetadata(
+                title: "Touch", artist: "Artist", album: "Album",
+                year: nil, genre: nil, artwork: nil
+            ),
+            for: url,
+            snapshot: snapshot
+        )
+        _ = await cache.flushPersistence()
+
+        clock.value = 1_005
+        let beforeRefreshInterval = await cache.cachedMetadataIfValid(
+            for: url,
+            snapshot: snapshot
+        )
+        XCTAssertNotNil(beforeRefreshInterval)
+        XCTAssertFalse(try store.flush().get().wroteDatabase)
+
+        clock.value = 1_011
+        let afterRefreshInterval = await cache.cachedMetadataIfValid(
+            for: url,
+            snapshot: snapshot
+        )
+        XCTAssertNotNil(afterRefreshInterval)
+        _ = await cache.flushPersistence()
+        let record = store.record(
+            kind: .metadata,
+            key: MetadataCache.key(for: url),
+            variant: MetadataCache.derivedVariant,
+            touch: false
+        )
+        XCTAssertEqual(record?.lastAccessedAt, 1_011)
+    }
+
+    func testDerivedClearIsDurableAndAdvancesGeneration() async throws {
+        try await withTemporaryDerivedCache { directory, store, legacyURL in
+            let url = directory.appendingPathComponent("clear.mp3")
+            try Data("clear".utf8).write(to: url)
+            let snapshot = FileValidationSnapshot.load(for: url)
+            let cache = MetadataCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+            await cache.storeBasicMetadata(
+                AudioMetadata(
+                    title: "Clear", artist: "Artist", album: "Album",
+                    year: nil, genre: nil, artwork: nil
+                ),
+                for: url,
+                snapshot: snapshot
+            )
+            _ = await cache.flushPersistence()
+            let generation = store.generation(for: .metadata)
+
+            guard case .success(let report) = await cache.clearPersistence() else {
+                return XCTFail("Expected SQLite metadata clear to succeed")
+            }
+            XCTAssertEqual(report.removedEntryCount, 1)
+            XCTAssertEqual(report.quarantinedFileCount, 0)
+            XCTAssertEqual(store.persistedEntryCount(for: .metadata), 0)
+            XCTAssertEqual(store.generation(for: .metadata), generation + 1)
+            let metadataAfterClear = await cache.cachedMetadataIfValid(
+                for: url,
+                snapshot: snapshot
+            )
+            XCTAssertNil(metadataAfterClear)
+        }
+    }
+
+    func testCurrentLegacyJSONMigratesOnceIntoDerivedStore() async throws {
+        try await withTemporaryDerivedCache { directory, store, legacyURL in
+            let url = directory.appendingPathComponent("migrated.mp3")
+            try Data("migration-source".utf8).write(to: url)
+            let snapshot = FileValidationSnapshot.load(for: url)
+            let legacyObject: [String: Any] = [
+                "version": 2,
+                "entries": [
+                    MetadataCache.key(for: url): [
+                        "title": "Migrated Song",
+                        "artist": "Migrated Artist",
+                        "album": "Migrated Album",
+                        "year": "2026",
+                        "genre": "Pop",
+                        "fileSize": snapshot.fileSize,
+                        "mtimeNs": snapshot.mtimeNs,
+                        "inode": snapshot.inode.map { $0 as Any } ?? NSNull(),
+                        "lastAccessedAt": 1_000
+                    ]
+                ]
+            ]
+            try JSONSerialization.data(withJSONObject: legacyObject).write(to: legacyURL)
+            let cache = MetadataCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+
+            let migrated = await cache.cachedMetadataIfValid(for: url, snapshot: snapshot)
+            XCTAssertEqual(migrated?.title, "Migrated Song")
+            XCTAssertEqual(migrated?.artist, "Migrated Artist")
+            XCTAssertEqual(store.persistedEntryCount(for: .metadata), 1)
+            XCTAssertNotNil(
+                store.migrationMarker(for: MetadataCache.derivedMigrationMarkerKey)
+            )
+            XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path))
+
+            let reader = MetadataCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+            let reloaded = await reader.cachedMetadataIfValid(
+                for: url,
+                snapshot: snapshot
+            )
+            XCTAssertEqual(reloaded?.album, "Migrated Album")
+        }
+    }
+
+    func testFutureLegacyJSONIsPreservedDuringDerivedMigration() async throws {
+        try await withTemporaryDerivedCache { directory, store, legacyURL in
+            let future = Data(#"{"version":999,"future":"preserve"}"#.utf8)
+            try future.write(to: legacyURL)
+            let url = directory.appendingPathComponent("future.mp3")
+            let cache = MetadataCache(
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+
+            let result = await cache.cachedMetadataIfValid(
+                for: url,
+                snapshot: .missing
+            )
+            XCTAssertNil(result)
+            XCTAssertEqual(try Data(contentsOf: legacyURL), future)
+            XCTAssertNil(
+                store.migrationMarker(for: MetadataCache.derivedMigrationMarkerKey)
+            )
+        }
+    }
+
+    func testOversizedLegacyJSONIsNotLoadedByDerivedMigration() async throws {
+        try await withTemporaryDerivedCache { directory, store, legacyURL in
+            let oversized = Data(repeating: 0x41, count: 2_048)
+            try oversized.write(to: legacyURL)
+            let cache = MetadataCache(
+                limits: DerivedCacheLimits(
+                    maximumEntries: 3,
+                    lowWatermark: 2,
+                    maximumFileBytes: 1_024
+                ),
+                derivedStoreOverride: store,
+                legacyMigrationURLOverride: legacyURL
+            )
+
+            let result = await cache.cachedMetadataIfValid(
+                for: directory.appendingPathComponent("missing.mp3"),
+                snapshot: .missing
+            )
+            XCTAssertNil(result)
+            XCTAssertEqual(try Data(contentsOf: legacyURL), oversized)
+            XCTAssertNil(
+                store.migrationMarker(for: MetadataCache.derivedMigrationMarkerKey)
+            )
+            XCTAssertEqual(store.persistedEntryCount(for: .metadata), 0)
+        }
+    }
+
     private func withTemporaryCache(
         _ body: (URL, URL) async throws -> Void
     ) async throws {
@@ -463,6 +713,23 @@ final class MetadataCacheTests: XCTestCase {
 
         let cacheURL = directory.appendingPathComponent("metadata-cache.json")
         try await body(cacheURL, directory)
+    }
+
+    private func withTemporaryDerivedCache(
+        _ body: (URL, DerivedCacheStore, URL) async throws -> Void
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-metadata-derived-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try DerivedCacheStore(
+            databaseURL: directory.appendingPathComponent("derived.sqlite3"),
+            limits: .init(maximumPendingOperations: 32, writeDelay: 60)
+        )
+        let legacyURL = directory.appendingPathComponent("metadata-cache.json")
+        try await body(directory, store, legacyURL)
     }
 
     private func quarantineFiles(nextTo cacheURL: URL) throws -> [URL] {

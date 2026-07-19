@@ -10,6 +10,7 @@ enum PlaylistPersistenceFailure: Error, Equatable, Sendable {
     case encodingFailed(String)
     case writeFailed(String)
     case capacityExceeded(maximumBytes: Int)
+    case readOnly(PlaylistReadOnlyReason)
 
     var diagnosticMessage: String {
         switch self {
@@ -21,6 +22,17 @@ enum PlaylistPersistenceFailure: Error, Equatable, Sendable {
             return "歌单写入失败：\(message)"
         case .capacityExceeded(let maximumBytes):
             return "歌单数据超过 \(maximumBytes / 1_024 / 1_024) MB 安全上限"
+        case .readOnly(let reason):
+            return reason.diagnosticMessage
+        }
+    }
+
+    var isRetryable: Bool {
+        switch self {
+        case .storageUnavailable, .writeFailed:
+            return true
+        case .encodingFailed, .capacityExceeded, .readOnly:
+            return false
         }
     }
 }
@@ -31,6 +43,8 @@ enum PlaylistReadOnlyReason: Equatable, Sendable {
     case corrupt(backupURL: URL?)
     case oversized(maximumBytes: Int)
     case unreadable
+    case foreignDatabase(applicationID: Int32)
+    case databaseInconsistent(String)
 
     var diagnosticMessage: String {
         switch self {
@@ -47,6 +61,13 @@ enum PlaylistReadOnlyReason: Equatable, Sendable {
             return "歌单文件超过安全读取上限（\(maximumBytes / 1_024 / 1_024) MB）"
         case .unreadable:
             return "歌单文件不可读"
+        case .foreignDatabase(let applicationID):
+            return String(
+                format: "音乐库数据库属于其他应用（application ID %08X）",
+                UInt32(bitPattern: applicationID)
+            )
+        case .databaseInconsistent(let detail):
+            return "音乐库歌单状态不一致：\(detail)"
         }
     }
 }
@@ -220,6 +241,7 @@ final class PlaylistsStore: ObservableObject {
     private let formatVersion = 2
     private let maximumStoreBytes = 16 * 1_024 * 1_024
     private let playlistsFileURLOverride: URL?
+    private let libraryDatabase: LibraryDatabase?
 
     private struct StoreFile: Codable, @unchecked Sendable {
         let version: Int
@@ -237,6 +259,12 @@ final class PlaylistsStore: ObservableObject {
         let version: Int?
     }
 
+    private typealias SnapshotPersistence = @Sendable (
+        StoreFile,
+        URL,
+        UInt64
+    ) -> Result<UInt64?, PlaylistPersistenceFailure>
+
     private final class SnapshotWriter: @unchecked Sendable {
         private static let maximumPayloadBytes = 16 * 1_024 * 1_024
         private struct Snapshot: @unchecked Sendable {
@@ -251,6 +279,7 @@ final class PlaylistsStore: ObservableObject {
         }
 
         private let queue: DispatchQueue
+        private let persistSnapshot: SnapshotPersistence
         private let lock = NSLock()
         private let completion: @Sendable (
             UInt64,
@@ -260,6 +289,7 @@ final class PlaylistsStore: ObservableObject {
         private var pendingSnapshot: Snapshot?
         private var isDrainScheduled = false
         private var durableRevision: UInt64 = 0
+        private var durableDatabaseRevision: UInt64 = 0
         private var highestSubmittedRevision: UInt64 = 0
         private var lastFailure: (revision: UInt64, failure: PlaylistPersistenceFailure)?
         private var waiters: [Waiter] = []
@@ -267,18 +297,28 @@ final class PlaylistsStore: ObservableObject {
 
         init(
             queue: DispatchQueue,
+            persist: SnapshotPersistence? = nil,
             completion: @escaping @Sendable (
                 UInt64,
                 Result<Void, PlaylistPersistenceFailure>
             ) -> Void
         ) {
             self.queue = queue
+            self.persistSnapshot = persist ?? { payload, url, _ in
+                Self.persistToJSON(payload, to: url)
+            }
             self.completion = completion
         }
 
-        func seedDurableRevision(_ revision: UInt64) {
+        func seedDurableRevision(
+            _ revision: UInt64,
+            databaseRevision: UInt64? = nil
+        ) {
             lock.lock()
             durableRevision = max(durableRevision, revision)
+            if let databaseRevision {
+                durableDatabaseRevision = max(durableDatabaseRevision, databaseRevision)
+            }
             highestSubmittedRevision = max(highestSubmittedRevision, revision)
             if let lastFailure, lastFailure.revision <= durableRevision {
                 self.lastFailure = nil
@@ -332,7 +372,7 @@ final class PlaylistsStore: ObservableObject {
                         returning: .failed(
                             revision: revision,
                             failure: lastFailure.failure,
-                            retryable: true
+                            retryable: lastFailure.failure.isRetryable
                         )
                     )
                     return
@@ -361,7 +401,7 @@ final class PlaylistsStore: ObservableObject {
                 return .failed(
                     revision: revision,
                     failure: lastFailure.failure,
-                    retryable: true
+                    retryable: lastFailure.failure.isRetryable
                 )
             }
             return nil
@@ -380,17 +420,28 @@ final class PlaylistsStore: ObservableObject {
 
         private func drain() {
             while let snapshot = takeNextSnapshot() {
-                let result = Self.persist(snapshot.payload, to: snapshot.url)
-                if case .failure = result,
-                   scheduleAutomaticRetryIfEligible(snapshot) {
+                lock.lock()
+                let expectedDatabaseRevision = durableDatabaseRevision
+                lock.unlock()
+                let result = persistSnapshot(
+                    snapshot.payload,
+                    snapshot.url,
+                    expectedDatabaseRevision
+                )
+                if case .failure(let failure) = result,
+                   scheduleAutomaticRetryIfEligible(snapshot, failure: failure) {
                     return
                 }
                 finish(snapshot: snapshot, result: result)
-                completion(snapshot.revision, result)
+                completion(snapshot.revision, result.map { _ in () })
             }
         }
 
-        private func scheduleAutomaticRetryIfEligible(_ snapshot: Snapshot) -> Bool {
+        private func scheduleAutomaticRetryIfEligible(
+            _ snapshot: Snapshot,
+            failure: PlaylistPersistenceFailure
+        ) -> Bool {
+            guard failure.isRetryable else { return false }
             lock.lock()
             if let newer = pendingSnapshot, newer.revision > snapshot.revision {
                 lock.unlock()
@@ -416,16 +467,19 @@ final class PlaylistsStore: ObservableObject {
 
         private func finish(
             snapshot: Snapshot,
-            result: Result<Void, PlaylistPersistenceFailure>
+            result: Result<UInt64?, PlaylistPersistenceFailure>
         ) {
             let completedWaiters: [Waiter]
             let completionResult: PlaylistDurableCommitResult
 
             lock.lock()
             switch result {
-            case .success:
+            case .success(let databaseRevision):
                 retryAttemptsByRevision.removeValue(forKey: snapshot.revision)
                 durableRevision = max(durableRevision, snapshot.revision)
+                if let databaseRevision {
+                    durableDatabaseRevision = max(durableDatabaseRevision, databaseRevision)
+                }
                 if let lastFailure, lastFailure.revision <= durableRevision {
                     self.lastFailure = nil
                 }
@@ -434,18 +488,34 @@ final class PlaylistsStore: ObservableObject {
                 completionResult = .committed(throughRevision: durableRevision)
 
             case .failure(let failure):
-                lastFailure = (snapshot.revision, failure)
-                let newerSnapshotWillRetryState = (pendingSnapshot?.revision ?? 0) > snapshot.revision
-                if newerSnapshotWillRetryState {
-                    completedWaiters = []
+                if case .readOnly = failure {
+                    let protectedThroughRevision = max(
+                        snapshot.revision,
+                        max(pendingSnapshot?.revision ?? 0, highestSubmittedRevision)
+                    )
+                    pendingSnapshot = nil
+                    isDrainScheduled = false
+                    retryAttemptsByRevision.removeAll()
+                    lastFailure = (protectedThroughRevision, failure)
+                    completedWaiters = waiters.filter {
+                        $0.revision <= protectedThroughRevision
+                    }
+                    waiters.removeAll { $0.revision <= protectedThroughRevision }
                 } else {
-                    completedWaiters = waiters.filter { $0.revision <= snapshot.revision }
-                    waiters.removeAll { $0.revision <= snapshot.revision }
+                    lastFailure = (snapshot.revision, failure)
+                    let newerSnapshotWillRetryState =
+                        (pendingSnapshot?.revision ?? 0) > snapshot.revision
+                    if newerSnapshotWillRetryState {
+                        completedWaiters = []
+                    } else {
+                        completedWaiters = waiters.filter { $0.revision <= snapshot.revision }
+                        waiters.removeAll { $0.revision <= snapshot.revision }
+                    }
                 }
                 completionResult = .failed(
                     revision: snapshot.revision,
                     failure: failure,
-                    retryable: true
+                    retryable: failure.isRetryable
                 )
             }
             lock.unlock()
@@ -468,10 +538,10 @@ final class PlaylistsStore: ObservableObject {
             }
         }
 
-        private static func persist(
+        private static func persistToJSON(
             _ payload: StoreFile,
             to url: URL
-        ) -> Result<Void, PlaylistPersistenceFailure> {
+        ) -> Result<UInt64?, PlaylistPersistenceFailure> {
             if let failure = PlaylistsStore.validationFailure(in: payload) {
                 return .failure(.encodingFailed(failure))
             }
@@ -487,11 +557,126 @@ final class PlaylistsStore: ObservableObject {
 
             do {
                 try DerivedCacheFileIO.atomicWrite(data, to: url)
-                return .success(())
+                return .success(nil)
             } catch {
                 return .failure(.writeFailed(error.localizedDescription))
             }
         }
+    }
+
+    private enum LibraryLoadOutcome: Sendable {
+        case loaded(LibraryPlaylistsSnapshot)
+        case protected(PlaylistReadOnlyReason)
+    }
+
+    nonisolated private static func persist(
+        _ payload: StoreFile,
+        to database: LibraryDatabase,
+        expectedRevision: UInt64
+    ) -> Result<UInt64?, PlaylistPersistenceFailure> {
+        if let failure = validationFailure(in: payload) {
+            return .failure(.encodingFailed(failure))
+        }
+        do {
+            let result = try database.replacePlaylists(
+                LibraryPlaylistsSnapshot(
+                    revision: payload.storeRevision,
+                    playlists: payload.playlists,
+                    pendingCleanup: payload.pendingCleanup
+                ),
+                expectedRevision: expectedRevision
+            )
+            switch result {
+            case .committed(let revision), .alreadyCurrent(let revision):
+                return .success(revision)
+            case .stale(let storedRevision):
+                return .failure(
+                    .readOnly(
+                        .databaseInconsistent(
+                            "歌单写入已过期，数据库修订号为 \(storedRevision)"
+                        )
+                    )
+                )
+            case .conflict(let revision):
+                return .failure(
+                    .readOnly(
+                        .databaseInconsistent(
+                            "歌单修订号 \(revision) 对应不同内容，需要重新加载"
+                        )
+                    )
+                )
+            }
+        } catch {
+            return .failure(databasePersistenceFailure(error, database: database))
+        }
+    }
+
+    nonisolated private static func databasePersistenceFailure(
+        _ error: Error,
+        database: LibraryDatabase
+    ) -> PlaylistPersistenceFailure {
+        if let error = error as? LibraryDatabaseError {
+            switch error {
+            case .invalidData(let detail):
+                return .encodingFailed(detail)
+            case .readOnly:
+                return .readOnly(
+                    databaseReadOnlyReason(for: database.accessMode)
+                        ?? .databaseInconsistent(error.localizedDescription)
+                )
+            case .inconsistentState(let detail):
+                return .readOnly(.databaseInconsistent(detail))
+            }
+        }
+        if let error = error as? SQLitePersistenceError {
+            switch error.kind {
+            case .readOnly, .foreignDatabase, .futureVersion:
+                return .readOnly(
+                    databaseReadOnlyReason(for: database.accessMode)
+                        ?? .databaseInconsistent(error.localizedDescription)
+                )
+            default:
+                return .writeFailed(error.localizedDescription)
+            }
+        }
+        return .writeFailed(error.localizedDescription)
+    }
+
+    nonisolated private static func databaseReadOnlyReason(
+        for accessMode: LibraryDatabase.AccessMode
+    ) -> PlaylistReadOnlyReason? {
+        switch accessMode {
+        case .writable:
+            return nil
+        case .readOnlyFuture(let version):
+            return .futureVersion(
+                found: version,
+                supported: LibraryDatabase.schemaVersion
+            )
+        case .readOnlyForeign(let applicationID):
+            return .foreignDatabase(applicationID: applicationID)
+        }
+    }
+
+    nonisolated private static func databaseLoadFailure(
+        _ error: Error,
+        accessMode: LibraryDatabase.AccessMode
+    ) -> PlaylistReadOnlyReason {
+        if let accessReason = databaseReadOnlyReason(for: accessMode) {
+            return accessReason
+        }
+        if let error = error as? LibraryDatabaseError {
+            switch error {
+            case .invalidData(let detail), .inconsistentState(let detail):
+                return .databaseInconsistent(detail)
+            case .readOnly:
+                return .unreadable
+            }
+        }
+        if let error = error as? SQLitePersistenceError {
+            return .databaseInconsistent(error.localizedDescription)
+        }
+        return .databaseInconsistent(error.localizedDescription)
     }
 
     private var isLoaded = false
@@ -505,7 +690,17 @@ final class PlaylistsStore: ObservableObject {
     private var trackGenerations: [UUID: UInt64] = [:]
     private var enrichmentTasks: [UUID: Task<Void, Never>] = [:]
     private var scheduledEnrichmentTargets: Set<SignatureCaptureTarget> = []
-    private var cleanupTask: Task<Void, Never>?
+    private enum CleanupRetrySleepKind {
+        case fast
+        case maintenance
+    }
+
+    private var cleanupProcessingTask: Task<Void, Never>?
+    private var cleanupRetrySleepTask: Task<Void, Never>?
+    private var cleanupRetrySleepKind: CleanupRetrySleepKind?
+    private var cleanupRetrySleepGeneration: UInt64 = 0
+    private var cleanupMaintenanceBaselineIntentGeneration: UInt64?
+    private var cleanupIntentAdditionGeneration: UInt64 = 0
     private var cleanupRetryAttempt = 0
     private var isCleanupProcessing = false
 
@@ -516,14 +711,29 @@ final class PlaylistsStore: ObservableObject {
     private let cleanupRetryDelaysNanoseconds: [UInt64]
     private let cleanupMaintenanceRetryDelayNanoseconds: UInt64
 
-    private lazy var snapshotWriter = SnapshotWriter(queue: ioQueue) { [weak self] revision, result in
-        Task { @MainActor [weak self] in
-            self?.handlePersistenceCompletion(revision: revision, result: result)
+    private lazy var snapshotWriter: SnapshotWriter = {
+        let persist: SnapshotPersistence?
+        if let libraryDatabase {
+            persist = { payload, _, expectedRevision in
+                Self.persist(
+                    payload,
+                    to: libraryDatabase,
+                    expectedRevision: expectedRevision
+                )
+            }
+        } else {
+            persist = nil
         }
-    }
+        return SnapshotWriter(queue: ioQueue, persist: persist) { [weak self] revision, result in
+            Task { @MainActor [weak self] in
+                self?.handlePersistenceCompletion(revision: revision, result: result)
+            }
+        }
+    }()
 
     init(
         playlistsFileURLOverride: URL? = nil,
+        libraryDatabase: LibraryDatabase? = nil,
         signatureCaptureService: SignatureCaptureService? = nil,
         playbackWeights: PlaybackWeights = .shared,
         artworkStore: PlaylistArtworkStore = .shared,
@@ -532,6 +742,7 @@ final class PlaylistsStore: ObservableObject {
         cleanupMaintenanceRetryDelay: TimeInterval = 15 * 60
     ) {
         self.playlistsFileURLOverride = playlistsFileURLOverride
+        self.libraryDatabase = libraryDatabase
         let service = signatureCaptureService ?? SignatureCaptureService()
         self.signatureCaptureCoordinator = SignatureCaptureCoordinator(service: service)
         self.playbackWeights = playbackWeights
@@ -561,6 +772,10 @@ final class PlaylistsStore: ObservableObject {
     }
 
     private func loadFromDisk() async {
+        if let libraryDatabase {
+            await loadFromLibraryDatabase(libraryDatabase)
+            return
+        }
         guard let url = playlistsFileURL() else {
             loadTask = nil
             isReady = true
@@ -720,7 +935,7 @@ final class PlaylistsStore: ObservableObject {
                 }
             case .unsupportedVersion(let version):
                 PersistenceLogger.log("歌单文件版本 \(version) 不受支持，进入只读模式")
-            case .corrupt, .oversized, .unreadable:
+            case .corrupt, .oversized, .unreadable, .foreignDatabase, .databaseInconsistent:
                 break
             }
         }
@@ -744,6 +959,77 @@ final class PlaylistsStore: ObservableObject {
         } else {
             receipt = PlaylistCommitReceipt(revision: currentRevision)
         }
+        scheduleAllMissingSignatureEnrichment(after: receipt)
+        scheduleCleanupProcessingIfNeeded()
+    }
+
+    private func loadFromLibraryDatabase(_ database: LibraryDatabase) async {
+        let accessMode = database.accessMode
+        let supportedStoreVersion = formatVersion
+        let outcome: LibraryLoadOutcome = await withCheckedContinuation { continuation in
+            ioQueue.async {
+                do {
+                    let snapshot = try database.loadPlaylists()
+                    let payload = StoreFile(
+                        version: supportedStoreVersion,
+                        storeRevision: snapshot.revision,
+                        playlists: snapshot.playlists,
+                        pendingCleanup: snapshot.pendingCleanup
+                    )
+                    if let failure = Self.validationFailure(in: payload) {
+                        continuation.resume(
+                            returning: .protected(.databaseInconsistent(failure))
+                        )
+                    } else {
+                        continuation.resume(returning: .loaded(snapshot))
+                    }
+                } catch {
+                    continuation.resume(
+                        returning: .protected(
+                            Self.databaseLoadFailure(error, accessMode: accessMode)
+                        )
+                    )
+                }
+            }
+        }
+
+        switch outcome {
+        case .loaded(let snapshot):
+            playlists = snapshot.playlists
+            pendingCleanupIntents = snapshot.pendingCleanup
+            currentRevision = snapshot.revision
+            durableRevision = snapshot.revision
+            readOnlyReason = Self.databaseReadOnlyReason(for: accessMode)
+
+        case .protected(let reason):
+            playlists = []
+            pendingCleanupIntents = []
+            currentRevision = 0
+            durableRevision = 0
+            readOnlyReason = reason
+        }
+
+        if selectedPlaylistID == nil {
+            selectedPlaylistID = playlists.first?.id
+        }
+        loadTask = nil
+        isReady = true
+        rebuildTrackGenerations(revision: currentRevision)
+        snapshotWriter.seedDurableRevision(
+            durableRevision,
+            databaseRevision: durableRevision
+        )
+
+        if let readOnlyReason {
+            persistenceState = .readOnly(readOnlyReason)
+            PersistenceLogger.log(
+                "Library.sqlite 歌单后端进入只读保护：\(readOnlyReason.diagnosticMessage)"
+            )
+            return
+        }
+
+        persistenceState = .ready(durableRevision: durableRevision)
+        let receipt = PlaylistCommitReceipt(revision: durableRevision)
         scheduleAllMissingSignatureEnrichment(after: receipt)
         scheduleCleanupProcessingIfNeeded()
     }
@@ -926,6 +1212,7 @@ final class PlaylistsStore: ObservableObject {
                 trackIDs: Array(Set(previouslyRemovedTrackIDs + removed.tracks.map(\.id)))
             )
         )
+        cleanupIntentAdditionGeneration &+= 1
         cleanupRetryAttempt = 0
 
         let receipt = enqueueCurrentSnapshot(to: url)
@@ -942,6 +1229,29 @@ final class PlaylistsStore: ObservableObject {
         _ urls: [URL],
         to playlistID: UserPlaylist.ID
     ) async -> PlaylistMutationResult<PlaylistTrackMutationSummary> {
+        await addTracksResult(
+            normalizedTracks: normalizeTracks(from: urls),
+            expectedInputCount: urls.count,
+            to: playlistID
+        )
+    }
+
+    func addTracksResult(
+        _ tracks: [UserPlaylist.Track],
+        to playlistID: UserPlaylist.ID
+    ) async -> PlaylistMutationResult<PlaylistTrackMutationSummary> {
+        await addTracksResult(
+            normalizedTracks: normalizeTracks(tracks),
+            expectedInputCount: tracks.count,
+            to: playlistID
+        )
+    }
+
+    private func addTracksResult(
+        normalizedTracks newTracks: [UserPlaylist.Track],
+        expectedInputCount: Int,
+        to playlistID: UserPlaylist.ID
+    ) async -> PlaylistMutationResult<PlaylistTrackMutationSummary> {
         await ensureLoaded()
         if let rejection = mutationRejection() {
             return .rejected(rejection)
@@ -950,8 +1260,7 @@ final class PlaylistsStore: ObservableObject {
             return .rejected(.playlistNotFound(playlistID))
         }
 
-        let newTracks = normalizeTracks(from: urls)
-        guard newTracks.count == urls.count else {
+        guard newTracks.count == expectedInputCount else {
             return .rejected(.invalidInput("歌曲路径无效或过长"))
         }
         guard !newTracks.isEmpty else {
@@ -1090,6 +1399,7 @@ final class PlaylistsStore: ObservableObject {
                 trackIDs: removed.map(\.id)
             )
         )
+        cleanupIntentAdditionGeneration &+= 1
         cleanupRetryAttempt = 0
 
         let receipt = enqueueCurrentSnapshot(to: url)
@@ -1150,9 +1460,30 @@ final class PlaylistsStore: ObservableObject {
             let track: UserPlaylist.Track
             let candidate: FileRelocationCandidate
             let newPath: String
+            let newRelativePath: String?
         }
 
         let fileManager = FileManager.default
+        let referencedLocationIDs = Set(
+            playlists.lazy
+                .flatMap(\.tracks)
+                .compactMap(\.locationID)
+        )
+        var locationsByID: [UUID: LibraryLocation] = [:]
+        if !referencedLocationIDs.isEmpty, let libraryDatabase {
+            do {
+                _ = try libraryDatabase.forEachLibraryLocation { record in
+                    if referencedLocationIDs.contains(record.location.id) {
+                        locationsByID[record.location.id] = record.location
+                    }
+                    return locationsByID.count < referencedLocationIDs.count
+                }
+            } catch {
+                PersistenceLogger.log(
+                    "读取歌单重定位根目录失败，位置型歌曲保持原引用：\(error.localizedDescription)"
+                )
+            }
+        }
         var proposals: [ProposedRelocation] = []
         for playlistIndex in playlists.indices {
             for trackIndex in playlists[playlistIndex].tracks.indices {
@@ -1166,13 +1497,33 @@ final class PlaylistsStore: ObservableObject {
                 let newPath = candidate.url.standardizedFileURL.path
                     .precomposedStringWithCanonicalMapping
                 guard pathKey(track.path) != pathKey(newPath) else { continue }
+                let newRelativePath: String?
+                if let locationID = track.locationID {
+                    guard let location = locationsByID[locationID] else { continue }
+                    switch location.kind {
+                    case .directory:
+                        guard let relativePath = try? LibraryRelativePath.make(
+                            childURL: candidate.url,
+                            relativeTo: location.fallbackURL
+                        ) else { continue }
+                        newRelativePath = relativePath
+                    case .singleFile:
+                        guard track.relativePath == nil,
+                              pathKey(location.fallbackPath) == pathKey(newPath) else { continue }
+                        newRelativePath = nil
+                    }
+                } else {
+                    guard track.relativePath == nil else { continue }
+                    newRelativePath = nil
+                }
                 proposals.append(
                     ProposedRelocation(
                         playlistIndex: playlistIndex,
                         trackIndex: trackIndex,
                         track: track,
                         candidate: candidate,
-                        newPath: newPath
+                        newPath: newPath,
+                        newRelativePath: newRelativePath
                     )
                 )
             }
@@ -1195,7 +1546,9 @@ final class PlaylistsStore: ObservableObject {
             playlists[proposal.playlistIndex].tracks[proposal.trackIndex] = UserPlaylist.Track(
                 id: proposal.track.id,
                 path: proposal.newPath,
-                signature: proposal.candidate.signature
+                signature: proposal.candidate.signature,
+                locationID: proposal.track.locationID,
+                relativePath: proposal.newRelativePath
             )
             let relocation = PlaylistCleanupIntent.TrackRelocation(
                 trackID: proposal.track.id,
@@ -1220,6 +1573,7 @@ final class PlaylistsStore: ObservableObject {
             )
         }
         if !relocationsByPlaylist.isEmpty {
+            cleanupIntentAdditionGeneration &+= 1
             cleanupRetryAttempt = 0
         }
 
@@ -1519,6 +1873,7 @@ final class PlaylistsStore: ObservableObject {
         guard let url = playlistsFileURL() else { return }
 
         var changedTrackIDs = Set<UUID>()
+        var changedPlaylistIndices = Set<Int>()
         for entry in result.entries {
             guard let signature = entry.signature else { continue }
             let target = entry.target
@@ -1537,12 +1892,19 @@ final class PlaylistsStore: ObservableObject {
             playlists[playlistIndex].tracks[trackIndex] = UserPlaylist.Track(
                 id: currentTrack.id,
                 path: currentTrack.path,
-                signature: signature
+                signature: signature,
+                locationID: currentTrack.locationID,
+                relativePath: currentTrack.relativePath
             )
             changedTrackIDs.insert(currentTrack.id)
+            changedPlaylistIndices.insert(playlistIndex)
         }
 
         guard !changedTrackIDs.isEmpty else { return }
+        let now = Date()
+        for index in changedPlaylistIndices {
+            playlists[index].updatedAt = now
+        }
         let receipt = enqueueCurrentSnapshot(to: url)
         for trackID in changedTrackIDs {
             trackGenerations[trackID] = receipt.revision
@@ -1595,6 +1957,17 @@ final class PlaylistsStore: ObservableObject {
             scheduleCleanupProcessingIfNeeded()
 
         case .failure(let failure):
+            if case .readOnly(let reason) = failure {
+                readOnlyReason = reason
+                persistenceState = .readOnly(reason)
+                cleanupProcessingTask?.cancel()
+                cleanupProcessingTask = nil
+                cancelCleanupRetrySleep()
+                PersistenceLogger.log(
+                    "歌单后端进入只读保护：\(reason.diagnosticMessage)"
+                )
+                return
+            }
             guard revision > durableRevision else { return }
             if case .dirty(let revision, .some(let existingFailure)) = persistenceState,
                revision == currentRevision,
@@ -1624,8 +1997,9 @@ final class PlaylistsStore: ObservableObject {
         for task in tasks {
             task.cancel()
         }
-        cleanupTask?.cancel()
-        cleanupTask = nil
+        cleanupProcessingTask?.cancel()
+        cleanupProcessingTask = nil
+        cancelCleanupRetrySleep()
         let coordinator = signatureCaptureCoordinator
         Task {
             await coordinator.cancelForTermination()
@@ -2160,7 +2534,7 @@ final class PlaylistsStore: ObservableObject {
 
     private func scheduleCleanupProcessingIfNeeded() {
         guard automaticallyProcessesCleanup,
-              cleanupTask == nil,
+              cleanupProcessingTask == nil,
               !isCleanupProcessing,
               isReady,
               loadTask == nil,
@@ -2169,36 +2543,84 @@ final class PlaylistsStore: ObservableObject {
               durableRevision >= currentRevision,
               !pendingCleanupIntents.isEmpty else { return }
 
-        cleanupTask = Task { @MainActor [weak self] in
+        if cleanupRetrySleepTask != nil {
+            guard cleanupRetrySleepKind == .maintenance,
+                  let baseline = cleanupMaintenanceBaselineIntentGeneration,
+                  cleanupIntentAdditionGeneration > baseline else {
+                return
+            }
+            cancelCleanupRetrySleep()
+        }
+
+        cleanupProcessingTask = Task { @MainActor [weak self] in
             guard let self else { return }
             let report = await self.processPendingCleanupIntents()
             guard !Task.isCancelled, !self.isTerminating else {
-                self.cleanupTask = nil
+                self.cleanupProcessingTask = nil
                 return
             }
+            self.cleanupProcessingTask = nil
             if report.sidecarsDurable {
                 self.cleanupRetryAttempt = 0
-                self.cleanupTask = nil
                 return
             }
-            let delay: UInt64
-            if self.cleanupRetryAttempt < self.cleanupRetryDelaysNanoseconds.count {
-                delay = self.cleanupRetryDelaysNanoseconds[self.cleanupRetryAttempt]
-                self.cleanupRetryAttempt += 1
-            } else {
-                // Keep one cancellable maintenance retry alive after the fast
-                // recovery budget. A long fixed delay avoids both abandoned
-                // cleanup debt and unbounded timer/backoff bookkeeping.
-                delay = self.cleanupMaintenanceRetryDelayNanoseconds
-            }
-            try? await Task.sleep(nanoseconds: delay)
-            guard !Task.isCancelled else {
-                self.cleanupTask = nil
+            guard self.cleanupFailureAllowsAutomaticRetry else { return }
+            self.scheduleCleanupRetrySleep()
+        }
+    }
+
+    private var cleanupFailureAllowsAutomaticRetry: Bool {
+        guard case .dirty(_, let failure?) = persistenceState else { return true }
+        return failure.isRetryable
+    }
+
+    private func scheduleCleanupRetrySleep() {
+        guard cleanupRetrySleepTask == nil,
+              !isTerminating,
+              !pendingCleanupIntents.isEmpty else { return }
+
+        let delay: UInt64
+        let kind: CleanupRetrySleepKind
+        if cleanupRetryAttempt < cleanupRetryDelaysNanoseconds.count {
+            delay = cleanupRetryDelaysNanoseconds[cleanupRetryAttempt]
+            cleanupRetryAttempt += 1
+            kind = .fast
+        } else {
+            // Keep one cancellable maintenance retry alive after the fast
+            // recovery budget. A newly durable cleanup intent may wake this
+            // sleep, while an active cleanup pass is never cancelled.
+            delay = cleanupMaintenanceRetryDelayNanoseconds
+            kind = .maintenance
+        }
+
+        cleanupRetrySleepGeneration &+= 1
+        let generation = cleanupRetrySleepGeneration
+        cleanupRetrySleepKind = kind
+        cleanupMaintenanceBaselineIntentGeneration = kind == .maintenance
+            ? cleanupIntentAdditionGeneration
+            : nil
+        cleanupRetrySleepTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delay)
+            } catch {
                 return
             }
-            self.cleanupTask = nil
+            guard let self,
+                  generation == self.cleanupRetrySleepGeneration,
+                  !Task.isCancelled else { return }
+            self.cleanupRetrySleepTask = nil
+            self.cleanupRetrySleepKind = nil
+            self.cleanupMaintenanceBaselineIntentGeneration = nil
             self.scheduleCleanupProcessingIfNeeded()
         }
+    }
+
+    private func cancelCleanupRetrySleep() {
+        cleanupRetrySleepGeneration &+= 1
+        cleanupRetrySleepTask?.cancel()
+        cleanupRetrySleepTask = nil
+        cleanupRetrySleepKind = nil
+        cleanupMaintenanceBaselineIntentGeneration = nil
     }
 
     /// Compatibility entry point: termination no longer waits for enrichment.
@@ -2369,6 +2791,9 @@ final class PlaylistsStore: ObservableObject {
     // MARK: - Paths and normalization
 
     private func playlistsFileURL() -> URL? {
+        if let libraryDatabase {
+            return libraryDatabase.fileURL
+        }
         if let playlistsFileURLOverride {
             do {
                 try DerivedCacheFileIO.ensureParentDirectory(for: playlistsFileURLOverride)
@@ -2423,7 +2848,9 @@ final class PlaylistsStore: ObservableObject {
                 UserPlaylist.Track(
                     id: track.id,
                     path: path,
-                    signature: track.signature
+                    signature: track.signature,
+                    locationID: track.locationID,
+                    relativePath: track.relativePath
                 )
             )
         }
@@ -2440,7 +2867,13 @@ final class PlaylistsStore: ObservableObject {
                 id = UUID()
             }
             guard id != track.id else { return track }
-            return UserPlaylist.Track(id: id, path: track.path, signature: track.signature)
+            return UserPlaylist.Track(
+                id: id,
+                path: track.path,
+                signature: track.signature,
+                locationID: track.locationID,
+                relativePath: track.relativePath
+            )
         }
     }
 
@@ -2463,6 +2896,15 @@ final class PlaylistsStore: ObservableObject {
         guard track.path.hasPrefix("/"),
               pathBytes > 0,
               pathBytes <= PlaylistStoreLimits.maximumPathBytes else { return false }
+        if let relativePath = track.relativePath {
+            guard track.locationID != nil,
+                  (try? LibraryRelativePath.validate(relativePath, allowEmpty: false)) != nil else {
+                return false
+            }
+        }
+        if track.locationID != nil, track.relativePath == nil {
+            // A nil relative path is valid for a single-file location.
+        }
         guard let signature = track.signature else { return true }
         return signature.size >= 0
             && signature.pathKey.utf8.count <= PlaylistStoreLimits.maximumPathBytes
@@ -2638,6 +3080,9 @@ extension PlaylistsStore {
         _ items: [UserPlaylist],
         selectedID: UserPlaylist.ID? = nil
     ) {
+        cleanupProcessingTask?.cancel()
+        cleanupProcessingTask = nil
+        cancelCleanupRetrySleep()
         playlists = items
         selectedPlaylistID = selectedID ?? items.first?.id
         pendingCleanupIntents = []
@@ -2647,10 +3092,25 @@ extension PlaylistsStore {
         isTerminating = false
         readOnlyReason = nil
         scheduledEnrichmentTargets = []
+        cleanupIntentAdditionGeneration = 0
+        cleanupRetryAttempt = 0
+        isCleanupProcessing = false
         currentRevision = 0
         durableRevision = 0
         rebuildTrackGenerations(revision: 0)
         snapshotWriter.seedDurableRevision(0)
         persistenceState = .ready(durableRevision: 0)
+    }
+
+    var debugIsCleanupMaintenanceRetryWaitingForTesting: Bool {
+        cleanupRetrySleepTask != nil && cleanupRetrySleepKind == .maintenance
+    }
+
+    var debugIsAutomaticCleanupProcessingForTesting: Bool {
+        cleanupProcessingTask != nil || isCleanupProcessing
+    }
+
+    var debugAutomaticCleanupProcessingIsCancelledForTesting: Bool {
+        cleanupProcessingTask?.isCancelled ?? false
     }
 }

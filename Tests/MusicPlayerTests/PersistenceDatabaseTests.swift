@@ -78,6 +78,149 @@ final class PersistenceDatabaseTests: XCTestCase {
         XCTAssertEqual(try database.scalarInt("SELECT COUNT(*) FROM records"), 2)
     }
 
+    func testReadTransactionHoldsOneSnapshotAcrossStatements() throws {
+        let url = databaseURL()
+        let reader = try SQLiteDatabase(fileURL: url, schema: schema(version: 1))
+        defer { reader.close() }
+        try reader.execute(
+            "INSERT INTO records(id, integer_value) VALUES(1, 10)"
+        )
+        let writer = try SQLiteDatabase(fileURL: url, schema: schema(version: 1))
+        defer { writer.close() }
+
+        let values = try reader.readTransaction { connection -> [Int64?] in
+            let first = try connection.scalarInt(
+                "SELECT integer_value FROM records WHERE id = 1"
+            )
+            try writer.execute("UPDATE records SET integer_value = 20 WHERE id = 1")
+            let second = try connection.scalarInt(
+                "SELECT integer_value FROM records WHERE id = 1"
+            )
+            return [first, second]
+        }
+
+        XCTAssertEqual(values.compactMap { $0 }, [10, 10])
+        XCTAssertEqual(
+            try reader.scalarInt("SELECT integer_value FROM records WHERE id = 1"),
+            20
+        )
+    }
+
+    func testStreamingRowsStopsEarlyWithoutMaterializingRemainingRows() throws {
+        let database = try makeDatabase()
+        defer { database.close() }
+
+        var values: [Int64] = []
+        let visited = try database.forEachRow(
+            """
+            WITH RECURSIVE sequence(value) AS (
+                SELECT 1
+                UNION ALL
+                SELECT value + 1 FROM sequence WHERE value < ?
+            )
+            SELECT value FROM sequence
+            """,
+            bindings: [.integer(100_000)]
+        ) { row in
+            values.append(row.int64(at: 0) ?? -1)
+            return values.count < 3
+        }
+
+        XCTAssertEqual(visited, 3)
+        XCTAssertEqual(values, [1, 2, 3])
+    }
+
+    func testStreamingBodyErrorFinalizesStatementAndKeepsConnectionUsable() throws {
+        let database = try makeDatabase()
+        defer { database.close() }
+
+        var visited = 0
+        XCTAssertThrowsError(
+            try database.forEachRow(
+                "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3"
+            ) { _ in
+                visited += 1
+                if visited == 2 { throw TestFailure.expected }
+                return true
+            }
+        ) { error in
+            XCTAssertTrue(error is TestFailure)
+        }
+        XCTAssertEqual(visited, 2)
+
+        try database.execute(
+            "INSERT INTO records(id, integer_value) VALUES (?, ?)",
+            bindings: [.integer(1), .integer(42)]
+        )
+        XCTAssertEqual(try database.scalarInt("SELECT integer_value FROM records WHERE id = 1"), 42)
+    }
+
+    func testStreamingLargeResultSetKeepsOnlyCallerState() throws {
+        let database = try makeDatabase()
+        defer { database.close() }
+
+        var sum: Int64 = 0
+        let visited = try database.forEachRow(
+            """
+            WITH RECURSIVE sequence(value) AS (
+                SELECT 1
+                UNION ALL
+                SELECT value + 1 FROM sequence WHERE value < 50000
+            )
+            SELECT value FROM sequence
+            """
+        ) { row in
+            sum += row.int64(at: 0) ?? 0
+            return true
+        }
+
+        XCTAssertEqual(visited, 50_000)
+        XCTAssertEqual(sum, 1_250_025_000)
+    }
+
+    func testConfigurationSupportsDeleteAndWALJournalModes() throws {
+        let url = databaseURL()
+        var deleteConfiguration = SQLiteConfiguration.production
+        deleteConfiguration.journalMode = .delete
+        let deleteDatabase = try SQLiteDatabase(
+            fileURL: url,
+            schema: schema(version: 1),
+            configuration: deleteConfiguration
+        )
+        XCTAssertEqual(try journalMode(of: deleteDatabase), "delete")
+        deleteDatabase.close()
+
+        var walConfiguration = SQLiteConfiguration.production
+        walConfiguration.journalMode = .wal
+        let walDatabase = try SQLiteDatabase(
+            fileURL: url,
+            schema: schema(version: 1),
+            configuration: walConfiguration
+        )
+        defer { walDatabase.close() }
+        XCTAssertEqual(try journalMode(of: walDatabase), "wal")
+    }
+
+    func testQuickAndFullIntegrityChecksReportHealthyDatabase() throws {
+        let database = try makeDatabase()
+        defer { database.close() }
+
+        try database.execute(
+            "INSERT INTO records(id, integer_value) VALUES (?, ?)",
+            bindings: [.integer(1), .integer(42)]
+        )
+
+        let quick = try database.integrityCheck(.quick, maximumErrors: 1)
+        XCTAssertEqual(quick.mode, .quick)
+        XCTAssertEqual(quick.messages, ["ok"])
+        XCTAssertTrue(quick.isHealthy)
+
+        let full = try database.integrityCheck(.full, maximumErrors: 1)
+        XCTAssertEqual(full.mode, .full)
+        XCTAssertEqual(full.messages, ["ok"])
+        XCTAssertTrue(full.isHealthy)
+    }
+
     func testMigrationIsAtomicAndIdempotent() throws {
         let url = databaseURL()
         let database = try SQLiteDatabase(fileURL: url, schema: schema(version: 2))
@@ -118,6 +261,43 @@ final class PersistenceDatabaseTests: XCTestCase {
             ),
             0
         )
+        inspection.close()
+
+        let retried = try SQLiteDatabase(fileURL: url, schema: schema(version: 1))
+        defer { retried.close() }
+        XCTAssertEqual(retried.accessMode, .writable)
+        XCTAssertEqual(try retried.userVersion(), 1)
+        XCTAssertEqual(try retried.scalarInt("PRAGMA application_id"), Int64(testApplicationID))
+    }
+
+    func testValidatedOpenRejectsForeignKeyViolation() throws {
+        let url = databaseURL()
+        let seed = try SQLiteDatabase(fileURL: url, schema: schema(version: 1))
+        try seed.execute("CREATE TABLE parents(id INTEGER PRIMARY KEY)")
+        try seed.execute(
+            """
+            CREATE TABLE children(
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER NOT NULL REFERENCES parents(id)
+            )
+            """
+        )
+        try seed.execute("PRAGMA foreign_keys = OFF")
+        try seed.execute("INSERT INTO children(id, parent_id) VALUES(1, 999)")
+        try seed.checkpoint()
+        seed.close()
+
+        var configuration = SQLiteConfiguration.production
+        configuration.validatesIntegrityOnOpen = true
+        XCTAssertThrowsError(
+            try SQLiteDatabase(
+                fileURL: url,
+                schema: schema(version: 1),
+                configuration: configuration
+            )
+        ) { error in
+            XCTAssertEqual((error as? SQLitePersistenceError)?.kind, .integrity)
+        }
     }
 
     func testFutureSchemaReopensPhysicallyReadOnlyAndPreservesMainFileBytes() throws {
@@ -339,6 +519,10 @@ final class PersistenceDatabaseTests: XCTestCase {
 
     private func databaseURL() -> URL {
         tempDirectory.appendingPathComponent("persistence.sqlite3", isDirectory: false)
+    }
+
+    private func journalMode(of database: SQLiteDatabase) throws -> String? {
+        try database.query("PRAGMA journal_mode") { $0.string(at: 0) }.first ?? nil
     }
 
     private func schema(version: Int) -> SQLiteSchema {

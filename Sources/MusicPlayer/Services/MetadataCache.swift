@@ -9,8 +9,13 @@ actor MetadataCache {
     private static let formatVersion = 2
     private static let legacyFormatVersion = 1
     private static let accessRefreshInterval: TimeInterval = 24 * 60 * 60
+    static let derivedVariant = "metadata-v2"
+    static let derivedMigrationMarkerKey = "metadata-cache-json-v2-to-derived-v1"
+    private static let migrationBatchSize = 128
 
     private let cacheFileURLOverride: URL?
+    private let derivedStore: DerivedCacheStore?
+    private let legacyMigrationURLOverride: URL?
     private let limits: DerivedCacheLimits
     private let now: @Sendable () -> Date
     private let saveDebounce: TimeInterval
@@ -21,9 +26,15 @@ actor MetadataCache {
         limits: DerivedCacheLimits = .standard,
         now: @escaping @Sendable () -> Date = { Date() },
         saveDebounce: TimeInterval = 0.75,
-        maximumSaveLatency: TimeInterval = 5
+        maximumSaveLatency: TimeInterval = 5,
+        derivedStoreOverride: DerivedCacheStore? = nil,
+        legacyMigrationURLOverride: URL? = nil
     ) {
         self.cacheFileURLOverride = cacheFileURLOverride
+        derivedStore = cacheFileURLOverride == nil
+            ? (derivedStoreOverride ?? DerivedCacheStore.shared)
+            : nil
+        self.legacyMigrationURLOverride = legacyMigrationURLOverride
         self.limits = limits
         self.now = now
         self.saveDebounce = max(0.01, saveDebounce)
@@ -80,6 +91,15 @@ actor MetadataCache {
         var lastAccessedAt: Int64
     }
 
+    private struct DerivedPayload: Codable, Equatable {
+        let version: Int
+        let title: String
+        let artist: String
+        let album: String
+        let year: String?
+        let genre: String?
+    }
+
     private struct FileSignature: Equatable {
         let fileSize: Int64
         let mtimeNs: Int64
@@ -97,6 +117,7 @@ actor MetadataCache {
     private var pendingPrunedEntryCount = 0
     private var blockedQuarantineReason: DerivedCacheQuarantineReason?
     private var blockedPersistenceError: DerivedCachePersistenceError?
+    private var didAttemptDerivedMigration = false
 
     nonisolated static func key(for url: URL) -> String {
         PathKey.canonical(for: url)
@@ -110,6 +131,14 @@ actor MetadataCache {
         for url: URL,
         snapshot: FileValidationSnapshot? = nil
     ) -> AudioMetadata? {
+        if let derivedStore {
+            ensureDerivedMigrationIfNeeded(using: derivedStore)
+            return cachedDerivedMetadataIfValid(
+                for: url,
+                snapshot: snapshot,
+                store: derivedStore
+            )
+        }
         loadIfNeeded()
 
         let key = Self.key(for: url)
@@ -170,6 +199,16 @@ actor MetadataCache {
         for url: URL,
         snapshot: FileValidationSnapshot? = nil
     ) {
+        if let derivedStore {
+            ensureDerivedMigrationIfNeeded(using: derivedStore)
+            storeDerivedMetadata(
+                metadata,
+                for: url,
+                snapshot: snapshot,
+                store: derivedStore
+            )
+            return
+        }
         loadIfNeeded()
         guard isCacheable(metadata) else {
             removeEntryWithoutLoading(for: url)
@@ -202,6 +241,11 @@ actor MetadataCache {
     }
 
     func remove(for url: URL) {
+        if let derivedStore {
+            ensureDerivedMigrationIfNeeded(using: derivedStore)
+            removeDerivedMetadata(for: url, store: derivedStore)
+            return
+        }
         loadIfNeeded()
         removeEntryWithoutLoading(for: url)
     }
@@ -210,6 +254,13 @@ actor MetadataCache {
     /// User-facing commands should prefer `clearPersistence()` so they can
     /// report a real disk result rather than optimistic success.
     func removeAll() {
+        if let derivedStore {
+            ensureDerivedMigrationIfNeeded(using: derivedStore)
+            if case .failure(let error) = derivedStore.clear(.metadata) {
+                PersistenceLogger.log("清空元数据 SQLite 派生缓存失败：\(error.localizedDescription)")
+            }
+            return
+        }
         loadIfNeeded()
         guard !entries.isEmpty else { return }
         pendingPrunedEntryCount += entries.count
@@ -219,13 +270,55 @@ actor MetadataCache {
 
     @discardableResult
     func flushPersistence() -> Result<DerivedCacheFlushReport, DerivedCachePersistenceError> {
+        if let derivedStore {
+            ensureDerivedMigrationIfNeeded(using: derivedStore)
+            return flushDerivedPersistence(derivedStore)
+        }
         loadIfNeeded()
+        if cacheFileURLOverride == nil {
+            return .success(
+                DerivedCacheFlushReport(
+                    wroteFile: false,
+                    entryCount: entries.count,
+                    prunedEntryCount: 0
+                )
+            )
+        }
         return flushPersistenceInternal(cancelPending: true, retryOnFailure: false)
     }
 
     @discardableResult
     func clearPersistence() -> Result<DerivedCacheClearReport, DerivedCachePersistenceError> {
+        if let derivedStore {
+            ensureDerivedMigrationIfNeeded(using: derivedStore)
+            switch derivedStore.clear(.metadata) {
+            case .success(let report):
+                return .success(
+                    DerivedCacheClearReport(
+                        removedEntryCount: report.removedEntryCount,
+                        quarantinedFileCount: 0
+                    )
+                )
+            case .failure(let error):
+                return .failure(mapDerivedStoreError(error))
+            }
+        }
         loadIfNeeded()
+        if cacheFileURLOverride == nil {
+            let removedEntryCount = entries.count
+            entries.removeAll(keepingCapacity: false)
+            mutationGeneration &+= 1
+            persistedGeneration = mutationGeneration
+            firstDirtyAt = nil
+            retryAttempt = 0
+            pendingPrunedEntryCount = 0
+            return .success(
+                DerivedCacheClearReport(
+                    removedEntryCount: removedEntryCount,
+                    quarantinedFileCount: 0
+                )
+            )
+        }
         cancelPendingSave()
 
         var quarantinedFileCount = 0
@@ -280,12 +373,355 @@ actor MetadataCache {
         _ = flushPersistence()
     }
 
+    // MARK: - Incremental SQLite backend
+
+    private func cachedDerivedMetadataIfValid(
+        for url: URL,
+        snapshot: FileValidationSnapshot?,
+        store: DerivedCacheStore
+    ) -> AudioMetadata? {
+        let key = Self.key(for: url)
+        let legacyKey = Self.legacyKey(for: url)
+        guard let signature = fileSignature(for: url, snapshot: snapshot) else {
+            removeDerivedMetadata(for: url, store: store)
+            return nil
+        }
+        let identity = derivedIdentity(signature)
+
+        if let record = store.record(
+            kind: .metadata,
+            key: key,
+            variant: Self.derivedVariant,
+            matching: identity
+        ) {
+            guard let metadata = metadata(fromDerivedRecord: record) else {
+                deleteDerivedRecord(key: key, store: store)
+                return nil
+            }
+            return metadata
+        }
+
+        guard legacyKey != key,
+              let legacyRecord = store.record(
+                kind: .metadata,
+                key: legacyKey,
+                variant: Self.derivedVariant,
+                matching: identity
+              ) else { return nil }
+        guard let metadata = metadata(fromDerivedRecord: legacyRecord) else {
+            deleteDerivedRecord(key: legacyKey, store: store)
+            return nil
+        }
+
+        let generation = store.generation(for: .metadata)
+        let canonical = DerivedCacheStore.Record(
+            kind: .metadata,
+            key: key,
+            variant: Self.derivedVariant,
+            payload: legacyRecord.payload,
+            fileIdentity: legacyRecord.fileIdentity,
+            updatedAt: legacyRecord.updatedAt,
+            lastAccessedAt: legacyRecord.lastAccessedAt
+        )
+        let result = store.enqueue([
+            .upsert(canonical, expectedGeneration: generation),
+            .delete(
+                kind: .metadata,
+                key: legacyKey,
+                variant: Self.derivedVariant,
+                expectedGeneration: generation
+            )
+        ])
+        if case .failure(let error) = result {
+            PersistenceLogger.log("迁移元数据 SQLite 路径键失败：\(error.localizedDescription)")
+        }
+        return metadata
+    }
+
+    private func storeDerivedMetadata(
+        _ metadata: AudioMetadata,
+        for url: URL,
+        snapshot: FileValidationSnapshot?,
+        store: DerivedCacheStore
+    ) {
+        guard isCacheable(metadata),
+              let signature = fileSignature(for: url, snapshot: snapshot),
+              let payload = try? encodedDerivedPayload(metadata) else {
+            removeDerivedMetadata(for: url, store: store)
+            return
+        }
+
+        let key = Self.key(for: url)
+        let legacyKey = Self.legacyKey(for: url)
+        let timestamp = now().timeIntervalSince1970
+        guard timestamp.isFinite else { return }
+        let generation = store.generation(for: .metadata)
+        let record = DerivedCacheStore.Record(
+            kind: .metadata,
+            key: key,
+            variant: Self.derivedVariant,
+            payload: payload,
+            fileIdentity: derivedIdentity(signature),
+            updatedAt: timestamp,
+            lastAccessedAt: timestamp
+        )
+        var mutations: [DerivedCacheStore.Mutation] = [
+            .upsert(record, expectedGeneration: generation)
+        ]
+        if legacyKey != key {
+            mutations.append(
+                .delete(
+                    kind: .metadata,
+                    key: legacyKey,
+                    variant: Self.derivedVariant,
+                    expectedGeneration: generation
+                )
+            )
+        }
+        if case .failure(let error) = store.enqueue(mutations) {
+            PersistenceLogger.log("保存元数据 SQLite 派生缓存失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func removeDerivedMetadata(for url: URL, store: DerivedCacheStore) {
+        let generation = store.generation(for: .metadata)
+        var seen = Set<String>()
+        let mutations = [Self.key(for: url), Self.legacyKey(for: url)].compactMap {
+            key -> DerivedCacheStore.Mutation? in
+            guard seen.insert(key).inserted else { return nil }
+            return .delete(
+                kind: .metadata,
+                key: key,
+                variant: Self.derivedVariant,
+                expectedGeneration: generation
+            )
+        }
+        if case .failure(let error) = store.enqueue(mutations) {
+            PersistenceLogger.log("删除元数据 SQLite 派生缓存失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func deleteDerivedRecord(key: String, store: DerivedCacheStore) {
+        let generation = store.generation(for: .metadata)
+        if case .failure(let error) = store.enqueue([
+            .delete(
+                kind: .metadata,
+                key: key,
+                variant: Self.derivedVariant,
+                expectedGeneration: generation
+            )
+        ]) {
+            PersistenceLogger.log("清理损坏的元数据 SQLite 记录失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func flushDerivedPersistence(
+        _ store: DerivedCacheStore
+    ) -> Result<DerivedCacheFlushReport, DerivedCachePersistenceError> {
+        switch store.flush() {
+        case .success(let report):
+            return .success(
+                DerivedCacheFlushReport(
+                    wroteFile: report.wroteDatabase,
+                    entryCount: store.persistedEntryCount(for: .metadata),
+                    prunedEntryCount: report.prunedEntryCount
+                )
+            )
+        case .failure(let error):
+            return .failure(mapDerivedStoreError(error))
+        }
+    }
+
+    private func metadata(fromDerivedRecord record: DerivedCacheStore.Record) -> AudioMetadata? {
+        guard let payload = try? JSONDecoder().decode(DerivedPayload.self, from: record.payload),
+              payload.version == Self.formatVersion else { return nil }
+        let metadata = AudioMetadata(
+            title: payload.title,
+            artist: payload.artist,
+            album: payload.album,
+            year: payload.year,
+            genre: payload.genre,
+            artwork: nil
+        )
+        return isCacheable(metadata) ? metadata : nil
+    }
+
+    private func encodedDerivedPayload(_ metadata: AudioMetadata) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(
+            DerivedPayload(
+                version: Self.formatVersion,
+                title: metadata.title,
+                artist: metadata.artist,
+                album: metadata.album,
+                year: metadata.year,
+                genre: metadata.genre
+            )
+        )
+    }
+
+    private func derivedIdentity(_ signature: FileSignature) -> DerivedCacheStore.FileIdentity {
+        DerivedCacheStore.FileIdentity(
+            fileSize: signature.fileSize,
+            modificationTimeNanoseconds: signature.mtimeNs,
+            fileIdentifier: signature.inode
+        )
+    }
+
+    private func mapDerivedStoreError(
+        _ error: DerivedCacheStore.StoreError
+    ) -> DerivedCachePersistenceError {
+        switch error {
+        case .storageUnavailable:
+            return .storageUnavailable
+        case .invalidKey, .invalidVariant, .payloadTooLarge, .invalidRecord,
+             .invalidMigrationMarker, .staleGeneration:
+            return .encodeFailed(error.localizedDescription)
+        case .readOnly, .databaseFailure:
+            return .writeFailed(error.localizedDescription)
+        }
+    }
+
+    // MARK: - Legacy JSON to SQLite migration
+
+    private func ensureDerivedMigrationIfNeeded(using store: DerivedCacheStore) {
+        guard !didAttemptDerivedMigration else { return }
+        didAttemptDerivedMigration = true
+        guard let sourceURL = legacyMigrationFileURL(),
+              FileManager.default.fileExists(atPath: sourceURL.path) else { return }
+
+        if let marker = store.migrationMarker(for: Self.derivedMigrationMarkerKey) {
+            cleanupMigratedLegacyFileIfMatching(marker, at: sourceURL)
+            return
+        }
+
+        guard let data = readBoundedLegacyMigrationData(at: sourceURL),
+              let probe = try? JSONDecoder().decode(CacheVersionProbe.self, from: data),
+              probe.version == Self.formatVersion,
+              let decoded = try? JSONDecoder().decode(CacheFile.self, from: data) else {
+            // Unknown, corrupt and future cache files are deliberately preserved.
+            // They are derived data, but a downgrade must not silently destroy
+            // bytes written by a newer application version.
+            return
+        }
+
+        var rejectedCount = decoded.rejectedEntryCount
+        var normalized = normalizeAndValidate(decoded.entries, rejectedCount: &rejectedCount)
+        if normalized.count > limits.maximumEntries {
+            let keep = normalized.sorted { lhs, rhs in
+                if lhs.value.lastAccessedAt == rhs.value.lastAccessedAt {
+                    return lhs.key < rhs.key
+                }
+                return lhs.value.lastAccessedAt > rhs.value.lastAccessedAt
+            }.prefix(limits.lowWatermark)
+            normalized = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+        }
+
+        let generation = store.generation(for: .metadata)
+        var batch: [DerivedCacheStore.Mutation] = []
+        batch.reserveCapacity(Self.migrationBatchSize)
+        for key in normalized.keys.sorted() {
+            guard let entry = normalized[key],
+                  let payload = try? encodedDerivedPayload(
+                    AudioMetadata(
+                        title: entry.title,
+                        artist: entry.artist,
+                        album: entry.album,
+                        year: entry.year,
+                        genre: entry.genre,
+                        artwork: nil
+                    )
+                  ) else { continue }
+            let timestamp = TimeInterval(entry.lastAccessedAt)
+            let record = DerivedCacheStore.Record(
+                kind: .metadata,
+                key: key,
+                variant: Self.derivedVariant,
+                payload: payload,
+                fileIdentity: DerivedCacheStore.FileIdentity(
+                    fileSize: entry.fileSize,
+                    modificationTimeNanoseconds: entry.mtimeNs,
+                    fileIdentifier: entry.inode
+                ),
+                updatedAt: timestamp,
+                lastAccessedAt: timestamp
+            )
+            batch.append(.upsert(record, expectedGeneration: generation))
+            if batch.count == Self.migrationBatchSize {
+                guard case .success = store.enqueue(batch) else { return }
+                batch.removeAll(keepingCapacity: true)
+            }
+        }
+
+        let marker = DerivedCacheStore.MigrationMarker(
+            key: Self.derivedMigrationMarkerKey,
+            sourceFingerprint: Self.migrationFingerprint(data),
+            completedAt: now().timeIntervalSince1970
+        )
+        guard case .success = store.enqueue(batch, migrationMarkers: [marker]),
+              case .success = store.flush(),
+              store.migrationMarker(for: marker.key) == marker else { return }
+        cleanupMigratedLegacyFileIfMatching(marker, at: sourceURL)
+    }
+
+    private func legacyMigrationFileURL() -> URL? {
+        if let legacyMigrationURLOverride { return legacyMigrationURLOverride }
+        guard let base = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else { return nil }
+        return base
+            .appendingPathComponent("MusicPlayer", isDirectory: true)
+            .appendingPathComponent(Self.cacheFileName, isDirectory: false)
+    }
+
+    private func readBoundedLegacyMigrationData(at url: URL) -> Data? {
+        do {
+            guard try DerivedCacheFileIO.fileSize(at: url) <= limits.maximumFileBytes else {
+                return nil
+            }
+            return try DerivedCacheFileIO.readBoundedRegularFile(
+                at: url,
+                maximumBytes: limits.maximumFileBytes
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    private func cleanupMigratedLegacyFileIfMatching(
+        _ marker: DerivedCacheStore.MigrationMarker,
+        at sourceURL: URL
+    ) {
+        guard let current = readBoundedLegacyMigrationData(at: sourceURL),
+              Self.migrationFingerprint(current) == marker.sourceFingerprint else { return }
+        do {
+            try FileManager.default.removeItem(at: sourceURL)
+        } catch {
+            PersistenceLogger.log("清理已迁移的元数据 JSON 缓存失败：\(error.localizedDescription)")
+        }
+    }
+
+    nonisolated private static func migrationFingerprint(_ data: Data) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return String(format: "fnv1a64:%016llx:%d", hash, data.count)
+    }
+
     // MARK: - Loading
 
     private func loadIfNeeded() {
         guard !isLoaded else { return }
         isLoaded = true
 
+        // A nil override now means SQLite (or a bounded session-only fallback
+        // when the shared store could not initialize), never the old production
+        // JSON path. Explicit overrides retain the deterministic legacy backend.
+        guard cacheFileURLOverride != nil else { return }
         guard let url = rawCacheFileURL() else { return }
         guard FileManager.default.fileExists(atPath: url.path) else { return }
 
@@ -380,6 +816,7 @@ actor MetadataCache {
     }
 
     private func scheduleSave() {
+        guard cacheFileURLOverride != nil else { return }
         guard blockedPersistenceError == nil else { return }
         pendingSaveTask?.cancel()
 
@@ -618,14 +1055,7 @@ actor MetadataCache {
     // MARK: - Paths and signatures
 
     private func rawCacheFileURL() -> URL? {
-        if let cacheFileURLOverride { return cacheFileURLOverride }
-        guard let base = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first else { return nil }
-        return base
-            .appendingPathComponent("MusicPlayer", isDirectory: true)
-            .appendingPathComponent(Self.cacheFileName, isDirectory: false)
+        cacheFileURLOverride
     }
 
     private func cacheFileURL() -> URL? {

@@ -7,6 +7,9 @@ final class AudioRouteMonitor {
     private var onHeadphonesDisconnected: () -> Void
     private var onHeadphonesConnected: () -> Void
     private var onDeviceChanged: (String) -> Void
+    private let lifecycleLock = NSLock()
+    private var callbackGeneration: UInt64 = 0
+    private var stoppedForTerminationGeneration: UInt64?
 
     private let systemObjectID = AudioObjectID(kAudioObjectSystemObject)
 
@@ -45,25 +48,44 @@ final class AudioRouteMonitor {
     }
 
     deinit {
-        teardown()
+        stopForTermination(generation: .max)
+    }
+
+    /// Invalidates listeners and queued listener callbacks without waiting for
+    /// CoreAudio. Repeated calls for the same or an older generation are no-ops.
+    func stopForTermination(generation: UInt64) {
+        lifecycleLock.lock()
+        if let stoppedGeneration = stoppedForTerminationGeneration {
+            if generation > stoppedGeneration {
+                stoppedForTerminationGeneration = generation
+            }
+            lifecycleLock.unlock()
+            return
+        }
+        stoppedForTerminationGeneration = generation
+        callbackGeneration &+= 1
+        lifecycleLock.unlock()
+
+        teardownListeners()
     }
 
     private func setup() {
+        guard let generation = activeCallbackGeneration() else { return }
         // Track default output device changes.
         var addr = defaultDeviceAddress
         let defaultBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.handleDefaultDeviceChanged()
+            self?.handleDefaultDeviceChanged(callbackGeneration: generation)
         }
         defaultDeviceListenerBlock = defaultBlock
         AudioObjectAddPropertyListenerBlock(systemObjectID, &addr, .main, defaultBlock)
 
         // Prime current default and start listening to its jack/data source changes.
         currentDefaultDevice = queryDefaultOutputDevice()
-        attachDeviceLevelListeners(to: currentDefaultDevice)
-        emitCurrentDeviceName()
+        attachDeviceLevelListeners(to: currentDefaultDevice, callbackGeneration: generation)
+        emitCurrentDeviceName(callbackGeneration: generation)
     }
 
-    private func teardown() {
+    private func teardownListeners() {
         var addr = defaultDeviceAddress
         if let block = defaultDeviceListenerBlock {
             AudioObjectRemovePropertyListenerBlock(systemObjectID, &addr, .main, block)
@@ -72,23 +94,43 @@ final class AudioRouteMonitor {
         detachDeviceLevelListeners(from: currentDefaultDevice)
     }
 
+    private func activeCallbackGeneration() -> UInt64? {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        guard stoppedForTerminationGeneration == nil else { return nil }
+        return callbackGeneration
+    }
+
+    private func isCallbackActive(generation: UInt64) -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return stoppedForTerminationGeneration == nil
+            && callbackGeneration == generation
+    }
+
     // MARK: - Default output device
-    private func handleDefaultDeviceChanged() {
+    private func handleDefaultDeviceChanged(callbackGeneration: UInt64) {
+        guard isCallbackActive(generation: callbackGeneration) else { return }
         let newDevice = queryDefaultOutputDevice()
         if newDevice != currentDefaultDevice {
             let oldDevice = currentDefaultDevice
             // Classify new device and emit connect/disconnect accordingly.
+            guard isCallbackActive(generation: callbackGeneration) else { return }
             if isHeadphoneLike(deviceID: newDevice) {
                 onHeadphonesConnected()
             } else {
                 onHeadphonesDisconnected()
             }
             currentDefaultDevice = newDevice
-            emitCurrentDeviceName()
+            emitCurrentDeviceName(callbackGeneration: callbackGeneration)
 
             // Rewire listeners to the new device.
+            guard isCallbackActive(generation: callbackGeneration) else { return }
             detachDeviceLevelListeners(from: oldDevice)
-            attachDeviceLevelListeners(to: newDevice)
+            attachDeviceLevelListeners(
+                to: newDevice,
+                callbackGeneration: callbackGeneration
+            )
         }
     }
 
@@ -104,14 +146,21 @@ final class AudioRouteMonitor {
     }
 
     // MARK: - Device-level listeners
-    private func attachDeviceLevelListeners(to deviceID: AudioDeviceID) {
-        guard deviceID != 0 else { return }
+    private func attachDeviceLevelListeners(
+        to deviceID: AudioDeviceID,
+        callbackGeneration: UInt64
+    ) {
+        guard deviceID != 0,
+              isCallbackActive(generation: callbackGeneration) else { return }
 
         // Jack connection change (covers built-in 3.5mm headphones)
         var jack = jackAddress
         if AudioObjectHasProperty(deviceID, &jack) {
             let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-                self?.handleJackOrDataSourceChanged(on: deviceID)
+                self?.handleJackOrDataSourceChanged(
+                    on: deviceID,
+                    callbackGeneration: callbackGeneration
+                )
             }
             jackListenerBlock = block
             AudioObjectAddPropertyListenerBlock(deviceID, &jack, .main, block)
@@ -123,7 +172,10 @@ final class AudioRouteMonitor {
         var ds = dataSourceAddress
         if AudioObjectHasProperty(deviceID, &ds) {
             let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-                self?.handleJackOrDataSourceChanged(on: deviceID)
+                self?.handleJackOrDataSourceChanged(
+                    on: deviceID,
+                    callbackGeneration: callbackGeneration
+                )
             }
             dataSourceListenerBlock = block
             AudioObjectAddPropertyListenerBlock(deviceID, &ds, .main, block)
@@ -150,7 +202,11 @@ final class AudioRouteMonitor {
         dataSourceListenerBlock = nil
     }
 
-    private func handleJackOrDataSourceChanged(on deviceID: AudioDeviceID) {
+    private func handleJackOrDataSourceChanged(
+        on deviceID: AudioDeviceID,
+        callbackGeneration: UInt64
+    ) {
+        guard isCallbackActive(generation: callbackGeneration) else { return }
         // Try jack property first
         var jack = jackAddress
         if AudioObjectHasProperty(deviceID, &jack) {
@@ -158,12 +214,14 @@ final class AudioRouteMonitor {
             var size = UInt32(MemoryLayout<UInt32>.size)
             if AudioObjectGetPropertyData(deviceID, &jack, 0, nil, &size, &connected) == noErr {
                 if connected == 0 { // 0 => disconnected
+                    guard isCallbackActive(generation: callbackGeneration) else { return }
                     onHeadphonesDisconnected()
-                    emitCurrentDeviceName()
+                    emitCurrentDeviceName(callbackGeneration: callbackGeneration)
                     return
                 } else {
+                    guard isCallbackActive(generation: callbackGeneration) else { return }
                     onHeadphonesConnected()
-                    emitCurrentDeviceName()
+                    emitCurrentDeviceName(callbackGeneration: callbackGeneration)
                     return
                 }
             }
@@ -174,21 +232,26 @@ final class AudioRouteMonitor {
             let lowered = name.lowercased()
             // If current source looks like internal speakers, treat as unplug.
             if lowered.contains("internal") || lowered.contains("speaker") || lowered.contains("扬声器") || lowered.contains("内置") {
+                guard isCallbackActive(generation: callbackGeneration) else { return }
                 onHeadphonesDisconnected()
-                emitCurrentDeviceName()
+                emitCurrentDeviceName(callbackGeneration: callbackGeneration)
             } else if lowered.contains("head") || lowered.contains("耳机") {
+                guard isCallbackActive(generation: callbackGeneration) else { return }
                 onHeadphonesConnected()
-                emitCurrentDeviceName()
+                emitCurrentDeviceName(callbackGeneration: callbackGeneration)
             }
         } else {
             // As a conservative fallback, pause on unknown state change.
+            guard isCallbackActive(generation: callbackGeneration) else { return }
             onHeadphonesDisconnected()
-            emitCurrentDeviceName()
+            emitCurrentDeviceName(callbackGeneration: callbackGeneration)
         }
     }
 
-    private func emitCurrentDeviceName() {
+    private func emitCurrentDeviceName(callbackGeneration: UInt64) {
+        guard isCallbackActive(generation: callbackGeneration) else { return }
         let name = readableOutputName(for: currentDefaultDevice) ?? "未知输出设备"
+        guard isCallbackActive(generation: callbackGeneration) else { return }
         onDeviceChanged(name)
     }
 

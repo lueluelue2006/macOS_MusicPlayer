@@ -25,6 +25,7 @@ struct SQLitePersistenceError: Error, Equatable, LocalizedError, Sendable {
         case migration
         case futureVersion
         case configuration
+        case integrity
     }
 
     let kind: Kind
@@ -43,13 +44,23 @@ struct SQLiteConfiguration: Equatable, Sendable {
         case normal = "NORMAL"
     }
 
+    enum JournalMode: String, Equatable, Sendable {
+        case wal = "WAL"
+        case delete = "DELETE"
+    }
+
     var busyTimeoutMilliseconds = 1_500
     var pageCacheKiB = 2_048
     var journalSizeLimitBytes = 1_048_576
     var walAutoCheckpointPages = 256
     var durability: Durability = .normal
+    var journalMode: JournalMode = .wal
     var keepsTemporaryTablesInMemory = false
     var secureFilePermissions = true
+    /// Authoritative stores may opt into a bounded structural and foreign-key
+    /// check before an existing writable database is reopened. Derived caches
+    /// leave this disabled so startup never scans reconstructable data.
+    var validatesIntegrityOnOpen = false
 
     static let production = SQLiteConfiguration()
 }
@@ -82,6 +93,20 @@ struct SQLiteSchema {
     }
 
     static let unversioned = SQLiteSchema(applicationID: 0, version: 0, migrations: [])
+}
+
+enum SQLiteIntegrityCheckMode: Equatable, Sendable {
+    case quick
+    case full
+}
+
+struct SQLiteIntegrityCheckReport: Equatable, Sendable {
+    let mode: SQLiteIntegrityCheckMode
+    let messages: [String]
+
+    var isHealthy: Bool {
+        messages.count == 1 && messages[0].caseInsensitiveCompare("ok") == .orderedSame
+    }
 }
 
 /// A copied SQLite row. Values remain valid after the prepared statement is finalized.
@@ -207,9 +232,46 @@ struct SQLiteConnection {
         }
     }
 
+    /// Visits copied rows one at a time without first accumulating the result set.
+    /// Return `true` to continue or `false` to stop immediately. The return value
+    /// is the number of rows delivered to `body`, including the row that stopped
+    /// iteration. A thrown body error is propagated after finalizing the statement.
+    @discardableResult
+    func forEachRow(
+        _ sql: String,
+        bindings: [SQLiteValue] = [],
+        _ body: (SQLiteRow) throws -> Bool
+    ) throws -> Int {
+        let statement = try prepare(sql, operation: "prepare streaming query")
+        defer { sqlite3_finalize(statement) }
+        try bind(bindings, to: statement)
+
+        var visitedRowCount = 0
+        while true {
+            let result = sqlite3_step(statement)
+            switch result {
+            case SQLITE_ROW:
+                visitedRowCount += 1
+                guard try body(SQLiteRow(copying: statement)) else {
+                    return visitedRowCount
+                }
+            case SQLITE_DONE:
+                return visitedRowCount
+            default:
+                throw makeSQLiteError(result, operation: "streaming query", handle: handle)
+            }
+        }
+    }
+
     func scalarInt(_ sql: String, bindings: [SQLiteValue] = []) throws -> Int64? {
         let values = try query(sql, bindings: bindings) { $0.int64(at: 0) }
         return values.first ?? nil
+    }
+
+    /// Number of rows affected by the most recently completed statement on this
+    /// connection. Call while the owning database lock/transaction is held.
+    func changes() -> Int64 {
+        sqlite3_changes64(handle)
     }
 
     func userVersion() throws -> Int {
@@ -417,7 +479,17 @@ final class SQLiteDatabase: @unchecked Sendable {
                 let diskApplicationID = try inspectionConnection.applicationID()
                 let diskVersion = try inspectionConnection.userVersion()
 
-                if schema.applicationID != 0, diskApplicationID != schema.applicationID {
+                let mayInitializeUnmarkedDatabase: Bool
+                if diskApplicationID == 0, diskVersion == 0 {
+                    mayInitializeUnmarkedDatabase = try Self.hasNoUserSchemaObjects(
+                        inspectionConnection
+                    )
+                } else {
+                    mayInitializeUnmarkedDatabase = false
+                }
+                if schema.applicationID != 0,
+                   diskApplicationID != schema.applicationID,
+                   !mayInitializeUnmarkedDatabase {
                     accessMode = .readOnlyForeign(applicationID: diskApplicationID)
                     try inspectionConnection.execute("PRAGMA query_only = ON")
                     return
@@ -427,6 +499,11 @@ final class SQLiteDatabase: @unchecked Sendable {
                     accessMode = .readOnlyFuture(schemaVersion: diskVersion)
                     try inspectionConnection.execute("PRAGMA query_only = ON")
                     return
+                }
+
+                if configuration.validatesIntegrityOnOpen,
+                   diskApplicationID == schema.applicationID {
+                    try Self.validateExistingDatabase(inspectionConnection)
                 }
 
                 sqlite3_close_v2(inspectionHandle)
@@ -515,12 +592,51 @@ final class SQLiteDatabase: @unchecked Sendable {
         try withConnection { try $0.query(sql, bindings: bindings, map: map) }
     }
 
+    /// Streams copied rows through `body` without retaining an intermediate row
+    /// array. Return `true` to continue or `false` to stop immediately.
+    @discardableResult
+    func forEachRow(
+        _ sql: String,
+        bindings: [SQLiteValue] = [],
+        _ body: (SQLiteRow) throws -> Bool
+    ) throws -> Int {
+        try withConnection {
+            try $0.forEachRow(sql, bindings: bindings, body)
+        }
+    }
+
     func scalarInt(_ sql: String, bindings: [SQLiteValue] = []) throws -> Int64? {
         try withConnection { try $0.scalarInt(sql, bindings: bindings) }
     }
 
     func userVersion() throws -> Int {
         try withConnection { try $0.userVersion() }
+    }
+
+    /// Runs SQLite's bounded on-disk consistency check. `maximumErrors` is
+    /// clamped so a damaged database cannot cause an unbounded diagnostic array.
+    func integrityCheck(
+        _ mode: SQLiteIntegrityCheckMode = .quick,
+        maximumErrors: Int = 100
+    ) throws -> SQLiteIntegrityCheckReport {
+        let boundedMaximumErrors = min(max(1, maximumErrors), 1_000)
+        let pragma: String
+        switch mode {
+        case .quick:
+            pragma = "quick_check"
+        case .full:
+            pragma = "integrity_check"
+        }
+
+        var messages: [String] = []
+        messages.reserveCapacity(min(boundedMaximumErrors, 16))
+        try forEachRow("PRAGMA \(pragma)(\(boundedMaximumErrors))") { row in
+            if let message = row.string(at: 0) {
+                messages.append(message)
+            }
+            return messages.count < boundedMaximumErrors
+        }
+        return SQLiteIntegrityCheckReport(mode: mode, messages: messages)
     }
 
     @discardableResult
@@ -532,6 +648,23 @@ final class SQLiteDatabase: @unchecked Sendable {
         defer { lock.unlock() }
         let connection = try writableConnectionLocked(operation: "begin transaction")
         return try runTransactionLocked(connection, mode: mode, body: body)
+    }
+
+    /// Holds one SQLite read snapshot across every statement in `body`. Unlike
+    /// the write transaction API, this remains available for future/foreign
+    /// databases because BEGIN DEFERRED does not mutate their contents.
+    @discardableResult
+    func readTransaction<T>(
+        body: (SQLiteConnection) throws -> T
+    ) throws -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let handle else { throw closedError(operation: "begin read transaction") }
+        return try runTransactionLocked(
+            SQLiteConnection(handle: handle),
+            mode: .deferred,
+            body: body
+        )
     }
 
     func checkpoint() throws {
@@ -720,7 +853,19 @@ final class SQLiteDatabase: @unchecked Sendable {
         configuration: SQLiteConfiguration
     ) throws {
         try connection.execute("PRAGMA foreign_keys = ON")
-        try connection.execute("PRAGMA journal_mode = WAL")
+        let journalModeRows = try connection.query(
+            "PRAGMA journal_mode = \(configuration.journalMode.rawValue)"
+        ) { $0.string(at: 0) }
+        let appliedJournalMode = journalModeRows.first ?? nil
+        guard appliedJournalMode?.caseInsensitiveCompare(configuration.journalMode.rawValue)
+                == .orderedSame else {
+            throw SQLitePersistenceError(
+                kind: .configuration,
+                code: SQLITE_ERROR,
+                operation: "configure journal mode",
+                detail: "SQLite did not apply the requested journal mode"
+            )
+        }
         try connection.execute("PRAGMA synchronous = \(configuration.durability.rawValue)")
         try connection.execute(
             "PRAGMA temp_store = \(configuration.keepsTemporaryTablesInMemory ? "MEMORY" : "FILE")"
@@ -731,6 +876,44 @@ final class SQLiteDatabase: @unchecked Sendable {
         try connection.execute(
             "PRAGMA wal_autocheckpoint = \(max(1, configuration.walAutoCheckpointPages))"
         )
+    }
+
+    private static func hasNoUserSchemaObjects(_ connection: SQLiteConnection) throws -> Bool {
+        try connection.scalarInt(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'"
+        ) == 0
+    }
+
+    private static func validateExistingDatabase(_ connection: SQLiteConnection) throws {
+        var quickCheckMessage: String?
+        let quickCheckRows = try connection.forEachRow("PRAGMA quick_check(1)") { row in
+            quickCheckMessage = row.string(at: 0)
+            return false
+        }
+        guard quickCheckRows == 1, quickCheckMessage == "ok" else {
+            throw SQLitePersistenceError(
+                kind: .integrity,
+                code: SQLITE_CORRUPT,
+                operation: "quick check existing database",
+                detail: quickCheckMessage ?? "Database returned no integrity result"
+            )
+        }
+
+        var foreignKeyViolation: String?
+        _ = try connection.forEachRow("PRAGMA foreign_key_check") { row in
+            let table = row.string(at: 0) ?? "unknown"
+            let rowID = row.int64(at: 1).map(String.init) ?? "unknown"
+            foreignKeyViolation = "Foreign-key violation in \(table), rowid \(rowID)"
+            return false
+        }
+        if let foreignKeyViolation {
+            throw SQLitePersistenceError(
+                kind: .integrity,
+                code: SQLITE_CONSTRAINT,
+                operation: "foreign key check existing database",
+                detail: foreignKeyViolation
+            )
+        }
     }
 
     private static func openHandle(

@@ -7,6 +7,7 @@ final class IPCServer {
     private let audioPlayer: AudioPlayer
     private let playlistManager: PlaylistManager
     private let playlistsStore: PlaylistsStore
+    private let playbackWeights: PlaybackWeights
     private let center = DistributedNotificationCenter.default()
     private let instanceID: String
     private let requestNotificationName: Notification.Name
@@ -19,14 +20,22 @@ final class IPCServer {
     private var inFlightRequestIDs: Set<String> = []
     private var recentReplyOrder: [String] = []
     private var recentReplies: [String: IPCReply] = [:]
+    private var requestGeneration: UInt64 = 0
+    private var stoppedForTerminationGeneration: UInt64?
     private static let maximumPayloadBytes = 256 * 1_024
     private static let maximumInFlightRequests = 16
     private static let maximumRememberedReplies = 128
 
-    init(audioPlayer: AudioPlayer, playlistManager: PlaylistManager, playlistsStore: PlaylistsStore) {
+    init(
+        audioPlayer: AudioPlayer,
+        playlistManager: PlaylistManager,
+        playlistsStore: PlaylistsStore,
+        playbackWeights: PlaybackWeights = .shared
+    ) {
         self.audioPlayer = audioPlayer
         self.playlistManager = playlistManager
         self.playlistsStore = playlistsStore
+        self.playbackWeights = playbackWeights
         let instanceID = UUID().uuidString
         self.instanceID = instanceID
         self.requestNotificationName = MusicPlayerIPC.requestNotification(for: instanceID)
@@ -38,10 +47,42 @@ final class IPCServer {
     }
 
     deinit {
-        if let observer {
-            center.removeObserver(observer)
+        stopForTermination(generation: .max)
+    }
+
+    /// Synchronously closes IPC admission for the supplied app-termination
+    /// generation. The method deliberately does not wait for decoding or
+    /// MainActor work: admitted work carries the old request generation and is
+    /// rejected before its handler can mutate application state.
+    func stopForTermination(generation: UInt64) {
+        let observerToRemove: NSObjectProtocol?
+        requestStateLock.lock()
+        if let stoppedGeneration = stoppedForTerminationGeneration {
+            if generation > stoppedGeneration {
+                stoppedForTerminationGeneration = generation
+            }
+            requestStateLock.unlock()
+            return
+        }
+        stoppedForTerminationGeneration = generation
+        requestGeneration &+= 1
+        observerToRemove = observer
+        observer = nil
+        inFlightRequestIDs.removeAll()
+        requestStateLock.unlock()
+
+        if let observerToRemove {
+            center.removeObserver(observerToRemove)
         }
         unregisterInstance()
+    }
+
+    /// Test seam and diagnostics only; production callers should use
+    /// `stopForTermination(generation:)` as their lifecycle hook.
+    var isAcceptingRequests: Bool {
+        requestStateLock.lock()
+        defer { requestStateLock.unlock() }
+        return stoppedForTerminationGeneration == nil && observer != nil
     }
 
     private func start() {
@@ -58,20 +99,27 @@ final class IPCServer {
     }
 
     private func handle(_ notification: Notification) {
-        guard let data = notification.userInfo?[MusicPlayerIPC.payloadKey] as? Data,
+        guard let admittedGeneration = activeRequestGeneration(),
+              let data = notification.userInfo?[MusicPlayerIPC.payloadKey] as? Data,
               !data.isEmpty,
               data.count <= Self.maximumPayloadBytes else { return }
 
         decodeQueue.async { [weak self] in
             guard let self,
+                  self.isRequestActive(generation: admittedGeneration),
                   let request = try? MusicPlayerIPC.decodePayload(IPCRequest.self, from: data),
                   self.isAuthenticated(request),
                   Self.isStructurallyValid(request) else { return }
 
             self.requestStateLock.lock()
+            guard self.stoppedForTerminationGeneration == nil,
+                  self.requestGeneration == admittedGeneration else {
+                self.requestStateLock.unlock()
+                return
+            }
             if let cached = self.recentReplies[request.id] {
                 self.requestStateLock.unlock()
-                self.postReply(cached)
+                self.postReply(cached, generation: admittedGeneration)
                 return
             }
             if self.inFlightRequestIDs.contains(request.id) {
@@ -81,7 +129,8 @@ final class IPCServer {
             guard self.inFlightRequestIDs.count < Self.maximumInFlightRequests else {
                 self.requestStateLock.unlock()
                 self.postReply(
-                    IPCReply(id: request.id, ok: false, message: "IPC 忙，请稍后重试")
+                    IPCReply(id: request.id, ok: false, message: "IPC 忙，请稍后重试"),
+                    generation: admittedGeneration
                 )
                 return
             }
@@ -90,15 +139,27 @@ final class IPCServer {
 
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                let reply = await self.handleRequest(request)
-                self.finishRequest(reply)
+                guard self.isRequestActive(generation: admittedGeneration) else {
+                    self.abandonRequest(id: request.id)
+                    return
+                }
+                let reply = await self.handleRequest(
+                    request,
+                    generation: admittedGeneration
+                )
+                self.finishRequest(reply, generation: admittedGeneration)
             }
         }
     }
 
-    private func finishRequest(_ reply: IPCReply) {
+    private func finishRequest(_ reply: IPCReply, generation: UInt64) {
         requestStateLock.lock()
         inFlightRequestIDs.remove(reply.id)
+        guard stoppedForTerminationGeneration == nil,
+              requestGeneration == generation else {
+            requestStateLock.unlock()
+            return
+        }
         if recentReplies[reply.id] == nil {
             recentReplyOrder.append(reply.id)
         }
@@ -108,7 +169,27 @@ final class IPCServer {
             recentReplies.removeValue(forKey: removed)
         }
         requestStateLock.unlock()
-        postReply(reply)
+        postReply(reply, generation: generation)
+    }
+
+    private func abandonRequest(id: String) {
+        requestStateLock.lock()
+        inFlightRequestIDs.remove(id)
+        requestStateLock.unlock()
+    }
+
+    private func activeRequestGeneration() -> UInt64? {
+        requestStateLock.lock()
+        defer { requestStateLock.unlock() }
+        guard stoppedForTerminationGeneration == nil else { return nil }
+        return requestGeneration
+    }
+
+    private func isRequestActive(generation: UInt64) -> Bool {
+        requestStateLock.lock()
+        defer { requestStateLock.unlock() }
+        return stoppedForTerminationGeneration == nil
+            && requestGeneration == generation
     }
 
     private static func isStructurallyValid(_ request: IPCRequest) -> Bool {
@@ -138,7 +219,13 @@ final class IPCServer {
     }
 
     @MainActor
-    private func handleRequest(_ request: IPCRequest) async -> IPCReply {
+    private func handleRequest(
+        _ request: IPCRequest,
+        generation: UInt64
+    ) async -> IPCReply {
+        guard isRequestActive(generation: generation) else {
+            return Self.makeTerminationRejection(requestID: request.id)
+        }
         guard isAuthenticated(request) else {
             return IPCReply(
                 id: request.id,
@@ -184,6 +271,9 @@ final class IPCServer {
             }()
 
             let report = await LoadBenchmark.run(folderURL: folderURL, limit: limit)
+            guard isRequestActive(generation: generation) else {
+                return Self.makeTerminationRejection(requestID: request.id)
+            }
             let outURL = LoadBenchmark.defaultReportURL()
             do {
                 try LoadBenchmark.writeReport(report, to: outURL)
@@ -213,6 +303,9 @@ final class IPCServer {
 
         case .clearLyricsCache:
             await LyricsService.shared.invalidateAll()
+            guard isRequestActive(generation: generation) else {
+                return Self.makeTerminationRejection(requestID: request.id)
+            }
             // Also clear in-memory timeline attached to the current track to avoid confusing "still showing old lyrics".
             audioPlayer.lyricsTimeline = nil
             if let current = audioPlayer.currentFile {
@@ -246,28 +339,28 @@ final class IPCServer {
             return await handlePlaylistTracksSnapshot(request)
 
         case .createPlaylist:
-            return await handleCreatePlaylist(request)
+            return await handleCreatePlaylist(request, generation: generation)
 
         case .renamePlaylist:
-            return await handleRenamePlaylist(request)
+            return await handleRenamePlaylist(request, generation: generation)
 
         case .deletePlaylist:
-            return await handleDeletePlaylist(request)
+            return await handleDeletePlaylist(request, generation: generation)
 
         case .selectPlaylist:
-            return await handleSelectPlaylist(request)
+            return await handleSelectPlaylist(request, generation: generation)
 
         case .addTracksToPlaylist:
-            return await handleAddTracksToPlaylist(request)
+            return await handleAddTracksToPlaylist(request, generation: generation)
 
         case .removeTracksFromPlaylist:
-            return await handleRemoveTracksFromPlaylist(request)
+            return await handleRemoveTracksFromPlaylist(request, generation: generation)
 
         case .playPlaylistTrack:
-            return await handlePlayPlaylistTrack(request)
+            return await handlePlayPlaylistTrack(request, generation: generation)
 
         case .setPlaybackScope:
-            return await handleSetPlaybackScope(request)
+            return await handleSetPlaybackScope(request, generation: generation)
 
         case .locateNowPlaying:
             return handleLocateNowPlaying(request)
@@ -282,7 +375,7 @@ final class IPCServer {
             return await handleClearWeights(request)
 
         case .syncPlaylistWeightsToQueue:
-            return await handleSyncPlaylistWeightsToQueue(request)
+            return await handleSyncPlaylistWeightsToQueue(request, generation: generation)
 
         case .setLyricsVisible:
             return handleSetLyricsVisible(request)
@@ -291,7 +384,7 @@ final class IPCServer {
             return handleToggleLyricsVisible(request)
 
         case .volumePreanalysis:
-            return await handleVolumePreanalysis(request)
+            return await handleVolumePreanalysis(request, generation: generation)
 
         case .setAnalysisOptions:
             return handleSetAnalysisOptions(request)
@@ -300,7 +393,7 @@ final class IPCServer {
             return handleSetScanSubfolders(request)
 
         case .refreshMetadata:
-            return await handleRefreshMetadata(request)
+            return await handleRefreshMetadata(request, generation: generation)
 
         case .setSearchSortOption:
             guard let rawTarget = request.arguments?["target"] else {
@@ -778,13 +871,25 @@ final class IPCServer {
             newValue = value
         }
 
-        IPCDebugSettings.setEnabled(newValue)
-        return IPCReply(
-            id: request.id,
-            ok: true,
-            message: newValue ? "CLI 调试模式已开启" : "CLI 调试模式已关闭",
-            data: ["enabled": boolString(newValue)]
-        )
+        switch IPCDebugSettings.persistEnabled(
+            newValue,
+            preferencesStore: playlistManager.appPreferencesStore
+        ) {
+        case .success(let storedValue):
+            return IPCReply(
+                id: request.id,
+                ok: true,
+                message: storedValue ? "CLI 调试模式已开启" : "CLI 调试模式已关闭",
+                data: ["enabled": boolString(storedValue)]
+            )
+        case .failure(let error):
+            return IPCReply(
+                id: request.id,
+                ok: false,
+                message: "CLI 调试模式未更改：\(String(describing: error))",
+                data: ["enabled": boolString(IPCDebugSettings.isEnabled())]
+            )
+        }
     }
 
     @MainActor
@@ -933,6 +1038,7 @@ final class IPCServer {
         // main-thread scan merely because the playlist itself is large.
         let pageTracks = Array(playlist.tracks.enumerated().dropFirst(start).prefix(limit))
         let currentLookup = currentTrackLookupSet()
+        let weights = playbackWeights
         let page: [PlaylistTrackItem] = await Task.detached(priority: .utility) {
             pageTracks.map { entry in
                 let path = entry.element.path
@@ -945,8 +1051,8 @@ final class IPCServer {
                     fileName: url.lastPathComponent,
                     exists: exists,
                     isCurrent: !currentLookup.isDisjoint(with: lookup),
-                    queueWeight: PlaybackWeights.shared.level(for: url, scope: .queue).rawValue,
-                    playlistWeight: PlaybackWeights.shared.level(for: url, scope: .playlist(playlistID)).rawValue
+                    queueWeight: weights.level(for: url, scope: .queue).rawValue,
+                    playlistWeight: weights.level(for: url, scope: .playlist(playlistID)).rawValue
                 )
             }
         }.value
@@ -981,9 +1087,19 @@ final class IPCServer {
         IPCReply(id: requestID, ok: false, message: "playlists store is read-only")
     }
 
+    internal static func makeTerminationRejection(requestID: String) -> IPCReply {
+        IPCReply(id: requestID, ok: false, message: "application is terminating")
+    }
+
     @MainActor
-    private func checkPlaylistsStoreWritable(_ request: IPCRequest) async -> IPCReply? {
+    private func checkPlaylistsStoreWritable(
+        _ request: IPCRequest,
+        generation: UInt64
+    ) async -> IPCReply? {
         await playlistsStore.ensureLoaded()
+        guard isRequestActive(generation: generation) else {
+            return Self.makeTerminationRejection(requestID: request.id)
+        }
         guard !playlistsStore.isPersistenceReadOnly else {
             return Self.makeReadOnlyRejection(requestID: request.id)
         }
@@ -991,13 +1107,19 @@ final class IPCServer {
     }
 
     @MainActor
-    private func handleCreatePlaylist(_ request: IPCRequest) async -> IPCReply {
-        if let rejection = await checkPlaylistsStoreWritable(request) {
+    private func handleCreatePlaylist(
+        _ request: IPCRequest,
+        generation: UInt64
+    ) async -> IPCReply {
+        if let rejection = await checkPlaylistsStoreWritable(request, generation: generation) {
             return rejection
         }
         let name = request.arguments?["name"] ?? ""
         let urls: [URL] = (request.paths ?? []).map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
         let mutation = await playlistsStore.createPlaylistResult(name: name, trackURLs: urls)
+        guard isRequestActive(generation: generation) else {
+            return Self.makeTerminationRejection(requestID: request.id)
+        }
         switch await playlistsStore.awaitDurability(of: mutation) {
         case .committed(let id), .unchanged(let id):
             return IPCReply(
@@ -1018,8 +1140,11 @@ final class IPCServer {
     }
 
     @MainActor
-    private func handleRenamePlaylist(_ request: IPCRequest) async -> IPCReply {
-        if let rejection = await checkPlaylistsStoreWritable(request) {
+    private func handleRenamePlaylist(
+        _ request: IPCRequest,
+        generation: UInt64
+    ) async -> IPCReply {
+        if let rejection = await checkPlaylistsStoreWritable(request, generation: generation) {
             return rejection
         }
         guard let playlistID = resolvePlaylistID(arguments: request.arguments, allowSelected: false) else {
@@ -1043,8 +1168,11 @@ final class IPCServer {
     }
 
     @MainActor
-    private func handleDeletePlaylist(_ request: IPCRequest) async -> IPCReply {
-        if let rejection = await checkPlaylistsStoreWritable(request) {
+    private func handleDeletePlaylist(
+        _ request: IPCRequest,
+        generation: UInt64
+    ) async -> IPCReply {
+        if let rejection = await checkPlaylistsStoreWritable(request, generation: generation) {
             return rejection
         }
         guard let playlistID = resolvePlaylistID(arguments: request.arguments, allowSelected: false) else {
@@ -1068,8 +1196,14 @@ final class IPCServer {
     }
 
     @MainActor
-    private func handleSelectPlaylist(_ request: IPCRequest) async -> IPCReply {
+    private func handleSelectPlaylist(
+        _ request: IPCRequest,
+        generation: UInt64
+    ) async -> IPCReply {
         await playlistsStore.ensureLoaded()
+        guard isRequestActive(generation: generation) else {
+            return Self.makeTerminationRejection(requestID: request.id)
+        }
         guard let playlistID = resolvePlaylistID(arguments: request.arguments, allowSelected: false) else {
             return IPCReply(id: request.id, ok: false, message: "missing/invalid playlistID")
         }
@@ -1081,8 +1215,11 @@ final class IPCServer {
     }
 
     @MainActor
-    private func handleAddTracksToPlaylist(_ request: IPCRequest) async -> IPCReply {
-        if let rejection = await checkPlaylistsStoreWritable(request) {
+    private func handleAddTracksToPlaylist(
+        _ request: IPCRequest,
+        generation: UInt64
+    ) async -> IPCReply {
+        if let rejection = await checkPlaylistsStoreWritable(request, generation: generation) {
             return rejection
         }
         guard let playlistID = resolvePlaylistID(arguments: request.arguments, allowSelected: false) else {
@@ -1104,6 +1241,9 @@ final class IPCServer {
 
         let urls = pathList.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
         let mutation = await playlistsStore.addTracksResult(urls, to: playlistID)
+        guard isRequestActive(generation: generation) else {
+            return Self.makeTerminationRejection(requestID: request.id)
+        }
         let added: Int
         switch await playlistsStore.awaitDurability(of: mutation) {
         case .committed(let summary), .unchanged(let summary):
@@ -1119,7 +1259,10 @@ final class IPCServer {
         }
 
         if playlistManager.playbackScope == .playlist(playlistID) {
-            refreshPlaybackScopePlaylistTracks(playlistID)
+            await refreshPlaybackScopePlaylistTracks(
+                playlistID,
+                generation: generation
+            )
         }
 
         return IPCReply(
@@ -1135,8 +1278,11 @@ final class IPCServer {
     }
 
     @MainActor
-    private func handleRemoveTracksFromPlaylist(_ request: IPCRequest) async -> IPCReply {
-        if let rejection = await checkPlaylistsStoreWritable(request) {
+    private func handleRemoveTracksFromPlaylist(
+        _ request: IPCRequest,
+        generation: UInt64
+    ) async -> IPCReply {
+        if let rejection = await checkPlaylistsStoreWritable(request, generation: generation) {
             return rejection
         }
         guard let playlistID = resolvePlaylistID(arguments: request.arguments, allowSelected: false) else {
@@ -1230,7 +1376,10 @@ final class IPCServer {
         }
 
         if playlistManager.playbackScope == .playlist(playlistID) {
-            refreshPlaybackScopePlaylistTracks(playlistID)
+            await refreshPlaybackScopePlaylistTracks(
+                playlistID,
+                generation: generation
+            )
         }
 
         let remaining = playlistsStore.playlist(for: playlistID)?.tracks.count ?? 0
@@ -1247,8 +1396,14 @@ final class IPCServer {
     }
 
     @MainActor
-    private func handlePlayPlaylistTrack(_ request: IPCRequest) async -> IPCReply {
+    private func handlePlayPlaylistTrack(
+        _ request: IPCRequest,
+        generation: UInt64
+    ) async -> IPCReply {
         await playlistsStore.ensureLoaded()
+        guard isRequestActive(generation: generation) else {
+            return Self.makeTerminationRejection(requestID: request.id)
+        }
         guard let playlistID = resolvePlaylistID(arguments: request.arguments, allowSelected: false) else {
             return IPCReply(id: request.id, ok: false, message: "missing/invalid playlistID")
         }
@@ -1256,9 +1411,22 @@ final class IPCServer {
             return IPCReply(id: request.id, ok: false, message: "playlist not found")
         }
 
+        let resolvedTracks = await playlistManager.resolvePlaylistTrackLocations(
+            playlist.tracks
+        )
+        guard isRequestActive(generation: generation) else {
+            return Self.makeTerminationRejection(requestID: request.id)
+        }
+        guard resolvedTracks.count == playlist.tracks.count else {
+            return IPCReply(id: request.id, ok: false, message: "playlist resolution cancelled")
+        }
         let fm = FileManager.default
-        let playableTracks = playlist.tracks.filter { fm.fileExists(atPath: $0.path) }
-        let urlsInOrder = playableTracks.map { URL(fileURLWithPath: $0.path) }
+        let playableIndices = playlist.tracks.indices.filter {
+            resolvedTracks[$0].offlineReason == nil
+                && fm.fileExists(atPath: resolvedTracks[$0].url.path)
+        }
+        let playableTracks = playableIndices.map { playlist.tracks[$0] }
+        let urlsInOrder = playableIndices.map { resolvedTracks[$0].url }
         guard !urlsInOrder.isEmpty else {
             return IPCReply(id: request.id, ok: false, message: "playlist has no playable tracks")
         }
@@ -1290,7 +1458,7 @@ final class IPCServer {
             }
         }
 
-        let playableFiles: [AudioFile] = urlsInOrder.map { url in
+        let playableFiles: [AudioFile] = urlsInOrder.enumerated().map { position, url in
             if let existing = PathKey.lookupKeys(for: url).compactMap({ queueMap[$0] }).first {
                 return existing
             }
@@ -1303,17 +1471,30 @@ final class IPCServer {
                 genre: nil,
                 artwork: nil
             )
-            return AudioFile(url: url, metadata: metadata, duration: nil)
+            return AudioFile(
+                id: playableTracks[position].id.uuidString,
+                url: url,
+                metadata: metadata,
+                duration: nil
+            )
         }
 
         var signatures: [String: FileSignature] = [:]
-        for track in playlist.tracks {
+        var storedTracksByResolvedPath: [String: UserPlaylist.Track] = [:]
+        for (position, track) in playableTracks.enumerated() {
+            let path = urlsInOrder[position].path
+            storedTracksByResolvedPath[path] = track
             if let sig = track.signature {
-                signatures[track.path] = sig
+                signatures[path] = sig
             }
         }
 
-        guard let selectedIndex = playlistManager.ensureInQueue(playableFiles, focusURL: targetURL, signatures: signatures),
+        guard let selectedIndex = playlistManager.ensureInQueue(
+            playableFiles,
+            focusURL: targetURL,
+            signatures: signatures,
+            storedTracksByResolvedPath: storedTracksByResolvedPath
+        ),
               let selected = playlistManager.selectFile(at: selectedIndex) else {
             return IPCReply(id: request.id, ok: false, message: "failed to queue playlist track")
         }
@@ -1341,7 +1522,10 @@ final class IPCServer {
     }
 
     @MainActor
-    private func handleSetPlaybackScope(_ request: IPCRequest) async -> IPCReply {
+    private func handleSetPlaybackScope(
+        _ request: IPCRequest,
+        generation: UInt64
+    ) async -> IPCReply {
         let mode = request.arguments?["scope"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "queue"
         switch mode {
         case "queue":
@@ -1349,14 +1533,27 @@ final class IPCServer {
             return IPCReply(id: request.id, ok: true, message: "scope=queue")
         case "playlist":
             await playlistsStore.ensureLoaded()
+            guard isRequestActive(generation: generation) else {
+                return Self.makeTerminationRejection(requestID: request.id)
+            }
             guard let playlistID = resolvePlaylistID(arguments: request.arguments, allowSelected: true) else {
                 return IPCReply(id: request.id, ok: false, message: "missing/invalid playlistID")
             }
             guard let playlist = playlistsStore.playlist(for: playlistID) else {
                 return IPCReply(id: request.id, ok: false, message: "playlist not found")
             }
-            let tracks = compactPlayableTracks(from: playlist)
-            let urls = tracks.map { URL(fileURLWithPath: $0.path) }
+            let resolved = await playlistManager.resolvePlaylistTrackLocations(playlist.tracks)
+            guard isRequestActive(generation: generation) else {
+                return Self.makeTerminationRejection(requestID: request.id)
+            }
+            guard resolved.count == playlist.tracks.count else {
+                return IPCReply(id: request.id, ok: false, message: "playlist resolution cancelled")
+            }
+            let indices = playlist.tracks.indices.filter {
+                resolved[$0].offlineReason == nil
+                    && FileManager.default.fileExists(atPath: resolved[$0].url.path)
+            }
+            let urls = indices.map { resolved[$0].url }
             guard !urls.isEmpty else {
                 return IPCReply(id: request.id, ok: false, message: "playlist has no playable tracks")
             }
@@ -1364,7 +1561,7 @@ final class IPCServer {
             playlistManager.setPlaybackScopePlaylist(
                 playlistID,
                 trackURLsInOrder: urls,
-                trackIDsInOrder: tracks.map { $0.id.uuidString }
+                trackIDsInOrder: indices.map { playlist.tracks[$0].id.uuidString }
             )
             return IPCReply(id: request.id, ok: true, message: "scope=playlist", data: ["playlistID": playlistID.uuidString])
         default:
@@ -1401,7 +1598,7 @@ final class IPCServer {
             return IPCReply(id: request.id, ok: false, message: "missing target track (path/index/query/current)")
         }
 
-        let result = PlaybackWeights.shared.setLevel(level, for: url, scope: scope)
+        let result = playbackWeights.setLevel(level, for: url, scope: scope)
         return await makeDurableWeightMutationReply(
             requestID: request.id,
             successMessage: nil,
@@ -1424,7 +1621,7 @@ final class IPCServer {
         guard let url = resolveTrackURL(arguments: request.arguments) else {
             return IPCReply(id: request.id, ok: false, message: "missing target track (path/index/query/current)")
         }
-        let level = PlaybackWeights.shared.level(for: url, scope: scope)
+        let level = playbackWeights.level(for: url, scope: scope)
         return IPCReply(
             id: request.id,
             ok: true,
@@ -1441,7 +1638,7 @@ final class IPCServer {
     private func handleClearWeights(_ request: IPCRequest) async -> IPCReply {
         let scopeRaw = request.arguments?["scope"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if scopeRaw == "all" || (parseBool(request.arguments?["all"]) ?? false) {
-            let result = PlaybackWeights.shared.clearAll()
+            let result = playbackWeights.clearAll()
             return await makeDurableWeightMutationReply(
                 requestID: request.id,
                 successMessage: "cleared all weight overrides",
@@ -1453,7 +1650,7 @@ final class IPCServer {
         guard let scope = parseWeightScope(arguments: request.arguments) else {
             return IPCReply(id: request.id, ok: false, message: "invalid scope/playlistID")
         }
-        let result = PlaybackWeights.shared.clear(scope: scope)
+        let result = playbackWeights.clear(scope: scope)
         return await makeDurableWeightMutationReply(
             requestID: request.id,
             successMessage: "weights cleared",
@@ -1464,8 +1661,14 @@ final class IPCServer {
     }
 
     @MainActor
-    private func handleSyncPlaylistWeightsToQueue(_ request: IPCRequest) async -> IPCReply {
+    private func handleSyncPlaylistWeightsToQueue(
+        _ request: IPCRequest,
+        generation: UInt64
+    ) async -> IPCReply {
         await playlistsStore.ensureLoaded()
+        guard isRequestActive(generation: generation) else {
+            return Self.makeTerminationRejection(requestID: request.id)
+        }
         guard let playlistID = resolvePlaylistID(arguments: request.arguments, allowSelected: true) else {
             return IPCReply(id: request.id, ok: false, message: "missing/invalid playlistID")
         }
@@ -1473,7 +1676,7 @@ final class IPCServer {
             return IPCReply(id: request.id, ok: false, message: "playlist not found")
         }
 
-        let result = PlaybackWeights.shared.syncPlaylistOverridesToQueue(from: playlistID)
+        let result = playbackWeights.syncPlaylistOverridesToQueue(from: playlistID)
         return await makeDurableWeightMutationReply(
             requestID: request.id,
             successMessage: nil,
@@ -1503,8 +1706,9 @@ final class IPCServer {
                 message: "\(rejectedPrefix): \(reason.diagnosticMessage)"
             )
         case .applied, .unchanged:
+            let weights = playbackWeights
             let flushResult = await Task.detached(priority: .utility) {
-                PlaybackWeights.shared.flushPersistence()
+                weights.flushPersistence()
             }.value
             return Self.makeWeightPersistenceReply(
                 requestID: requestID,
@@ -1568,7 +1772,10 @@ final class IPCServer {
     }
 
     @MainActor
-    private func handleVolumePreanalysis(_ request: IPCRequest) async -> IPCReply {
+    private func handleVolumePreanalysis(
+        _ request: IPCRequest,
+        generation: UInt64
+    ) async -> IPCReply {
         let action = request.arguments?["action"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "status"
         switch action {
         case "status":
@@ -1581,6 +1788,9 @@ final class IPCServer {
             let scope = request.arguments?["scope"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "queue"
             if scope == "playlist" {
                 await playlistsStore.ensureLoaded()
+                guard isRequestActive(generation: generation) else {
+                    return Self.makeTerminationRejection(requestID: request.id)
+                }
                 guard let playlistID = resolvePlaylistID(arguments: request.arguments, allowSelected: true),
                       let playlist = playlistsStore.playlist(for: playlistID) else {
                     return IPCReply(id: request.id, ok: false, message: "playlist not found")
@@ -1664,11 +1874,23 @@ final class IPCServer {
             return IPCReply(id: request.id, ok: false, message: "missing/invalid enabled")
         }
         playlistManager.scanSubfolders = enabled
-        return IPCReply(id: request.id, ok: true, data: ["scanSubfolders": boolString(enabled)])
+        let storedValue = playlistManager.scanSubfolders
+        return IPCReply(
+            id: request.id,
+            ok: storedValue == enabled,
+            message: storedValue == enabled ? nil : "scanSubfolders preference is read-only",
+            data: ["scanSubfolders": boolString(storedValue)]
+        )
     }
 
     @MainActor
-    private func handleRefreshMetadata(_ request: IPCRequest) async -> IPCReply {
+    private func handleRefreshMetadata(
+        _ request: IPCRequest,
+        generation: UInt64
+    ) async -> IPCReply {
+        guard isRequestActive(generation: generation) else {
+            return Self.makeTerminationRejection(requestID: request.id)
+        }
         let mode = request.arguments?["mode"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "all"
         switch mode {
         case "all", "queue":
@@ -1705,7 +1927,7 @@ final class IPCServer {
                 duration: file.duration,
                 isCurrent: !currentLookup.isDisjoint(with: lookup),
                 isInFiltered: filteredIDSet.contains(file.id),
-                queueWeight: PlaybackWeights.shared.level(for: file.url, scope: .queue).rawValue
+                queueWeight: playbackWeights.level(for: file.url, scope: .queue).rawValue
             )
         }
         return QueueSnapshotPayload(
@@ -1734,23 +1956,28 @@ final class IPCServer {
     }
 
     @MainActor
-    private func refreshPlaybackScopePlaylistTracks(_ playlistID: UserPlaylist.ID) {
+    private func refreshPlaybackScopePlaylistTracks(
+        _ playlistID: UserPlaylist.ID,
+        generation: UInt64
+    ) async {
+        guard isRequestActive(generation: generation) else { return }
         guard playlistManager.playbackScope == .playlist(playlistID) else { return }
         guard let playlist = playlistsStore.playlist(for: playlistID) else {
             playlistManager.setPlaybackScopeQueue()
             return
         }
-        let tracks = compactPlayableTracks(from: playlist)
-        let urls = tracks.map { URL(fileURLWithPath: $0.path) }
-        if urls.isEmpty {
-            playlistManager.setPlaybackScopeQueue()
-        } else {
-            playlistManager.setPlaybackScopePlaylist(
-                playlistID,
-                trackURLsInOrder: urls,
-                trackIDsInOrder: tracks.map { $0.id.uuidString }
-            )
+        let resolved = await playlistManager.resolvePlaylistTrackLocations(playlist.tracks)
+        guard isRequestActive(generation: generation) else { return }
+        guard resolved.count == playlist.tracks.count else { return }
+        let indices = playlist.tracks.indices.filter {
+            resolved[$0].offlineReason == nil
+                && FileManager.default.fileExists(atPath: resolved[$0].url.path)
         }
+        playlistManager.setPlaybackScopePlaylist(
+            playlistID,
+            trackURLsInOrder: indices.map { resolved[$0].url },
+            trackIDsInOrder: indices.map { playlist.tracks[$0].id.uuidString }
+        )
     }
 
     private func compactPlayableTracks(from playlist: UserPlaylist) -> [UserPlaylist.Track] {
@@ -1932,7 +2159,8 @@ final class IPCServer {
         return IPCDebugSettings.isEnabled()
     }
 
-    private func postReply(_ reply: IPCReply) {
+    private func postReply(_ reply: IPCReply, generation: UInt64) {
+        guard isRequestActive(generation: generation) else { return }
         guard let data = try? MusicPlayerIPC.encodePayload(reply) else { return }
         center.postNotificationName(
             replyNotificationName,

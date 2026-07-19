@@ -2,6 +2,68 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+struct PlaylistM3U8ExportPlan: Equatable, Sendable {
+  let playlistName: String
+  let trackPaths: [String]
+  let offlineFallbackCount: Int
+}
+
+enum PlaylistM3U8ExportPlanner {
+  static func make(
+    playlist: UserPlaylist,
+    resolvedTracks: [PlaylistManager.ResolvedPlaylistTrack]
+  ) -> PlaylistM3U8ExportPlan? {
+    guard playlist.tracks.count == resolvedTracks.count else { return nil }
+
+    var trackPaths: [String] = []
+    trackPaths.reserveCapacity(playlist.tracks.count)
+    var offlineFallbackCount = 0
+    for (storedTrack, resolvedTrack) in zip(playlist.tracks, resolvedTracks) {
+      if resolvedTrack.offlineReason == nil {
+        trackPaths.append(resolvedTrack.url.standardizedFileURL.path)
+      } else {
+        trackPaths.append(storedTrack.path)
+        offlineFallbackCount += 1
+      }
+    }
+    return PlaylistM3U8ExportPlan(
+      playlistName: playlist.name,
+      trackPaths: trackPaths,
+      offlineFallbackCount: offlineFallbackCount
+    )
+  }
+}
+
+struct PlaylistQueueReferencePlan {
+  let signatures: [String: FileSignature]
+  let storedTracksByResolvedPath: [String: UserPlaylist.Track]
+}
+
+enum PlaylistQueueReferencePlanner {
+  static func make(
+    playableFiles: [AudioFile],
+    playlist: UserPlaylist
+  ) -> PlaylistQueueReferencePlan {
+    let storedTracksByID = Dictionary(
+      playlist.tracks.map { ($0.id.uuidString, $0) },
+      uniquingKeysWith: { first, _ in first }
+    )
+    var signatures: [String: FileSignature] = [:]
+    var storedTracksByResolvedPath: [String: UserPlaylist.Track] = [:]
+    for loadedTrack in playableFiles {
+      guard let storedTrack = storedTracksByID[loadedTrack.id] else { continue }
+      storedTracksByResolvedPath[loadedTrack.url.path] = storedTrack
+      if let signature = storedTrack.signature {
+        signatures[loadedTrack.url.path] = signature
+      }
+    }
+    return PlaylistQueueReferencePlan(
+      signatures: signatures,
+      storedTracksByResolvedPath: storedTracksByResolvedPath
+    )
+  }
+}
+
 struct PlaylistsPanel: View {
   @ObservedObject var audioPlayer: AudioPlayer
   @ObservedObject var playlistManager: PlaylistManager
@@ -11,7 +73,7 @@ struct PlaylistsPanel: View {
   let isCompactRoot: Bool
   let onRequestEditMetadata: (AudioFile) -> Void
 
-  @ObservedObject private var weights = PlaybackWeights.shared
+  @ObservedObject private var weights: PlaybackWeights
   @ObservedObject private var sortState = SearchSortState.shared
 
   @State private var trackSearchText: String = ""
@@ -37,6 +99,23 @@ struct PlaylistsPanel: View {
   @Environment(\.colorScheme) private var colorScheme
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
+
+  init(
+    audioPlayer: AudioPlayer,
+    playlistManager: PlaylistManager,
+    playlistsStore: PlaylistsStore,
+    locateNowPlayingRequestID: Int,
+    isCompactRoot: Bool,
+    onRequestEditMetadata: @escaping (AudioFile) -> Void
+  ) {
+    self.audioPlayer = audioPlayer
+    self.playlistManager = playlistManager
+    self.playlistsStore = playlistsStore
+    self.locateNowPlayingRequestID = locateNowPlayingRequestID
+    self.isCompactRoot = isCompactRoot
+    self.onRequestEditMetadata = onRequestEditMetadata
+    _weights = ObservedObject(wrappedValue: playlistManager.playbackWeights)
+  }
 
   private var selectedPlaylist: UserPlaylist? {
     playlistsStore.playlist(for: playlistsStore.selectedPlaylistID)
@@ -129,6 +208,9 @@ struct PlaylistsPanel: View {
     .onReceive(NotificationCenter.default.publisher(for: .requestLocateNowPlayingInPlaylist)) { _ in
       guard let playlist = selectedPlaylist else { return }
       requestScrollToNowPlayingInPlaylist(playlist)
+    }
+    .onReceive(NotificationCenter.default.publisher(for: .externalMediaTopologyDidChange)) { _ in
+      reloadSelectedPlaylist()
     }
     .onChange(of: locateNowPlayingRequestID) { _ in
       handlePendingLocateNowPlayingRequest()
@@ -568,9 +650,10 @@ struct PlaylistsPanel: View {
     TrackRowView(
       trackNumber: number,
       file: file,
-      isCurrentTrack: currentHighlightedURL == file.url,
+      isCurrentTrack: playlistManager.currentPlaybackPlaylistTrackID == file.id
+        || currentHighlightedURL == file.url,
       isVolumeAnalyzed: audioPlayer.hasVolumeNormalizationCache(for: file.url),
-      unplayableReason: trackUnplayableReasons[pathKey(file.url)],
+      unplayableReason: trackUnplayableReasons[file.id],
       searchText: trackSearchText,
       playAction: { selectedFile in
         NotificationCenter.default.post(name: .blurSearchField, object: nil)
@@ -601,7 +684,7 @@ struct PlaylistsPanel: View {
       },
       editAction: { fileToEdit in
         NotificationCenter.default.post(name: .blurSearchField, object: nil)
-        if trackUnplayableReasons[pathKey(fileToEdit.url)] != nil {
+        if trackUnplayableReasons[fileToEdit.id] != nil {
           postToast(
             title: "文件不存在，无法编辑",
             subtitle: fileToEdit.url.lastPathComponent,
@@ -733,7 +816,7 @@ struct PlaylistsPanel: View {
       Button {
         guard
           let firstPlayable = loadedTracks.first(where: {
-            trackUnplayableReasons[pathKey($0.url)] == nil
+            trackUnplayableReasons[$0.id] == nil
           })
         else { return }
         playTrackInPlaylist(firstPlayable, playlist: playlist)
@@ -828,12 +911,13 @@ struct PlaylistsPanel: View {
   }
 
   private func addCurrentTrack(to playlist: UserPlaylist) {
-    guard let url = audioPlayer.currentFile?.url else {
+    guard let currentFile = audioPlayer.currentFile else {
       postToast(title: "没有正在播放的歌曲", subtitle: nil, kind: "info")
       return
     }
     Task { @MainActor in
-      let mutation = await playlistsStore.addTracksResult([url], to: playlist.id)
+      let tracks = playlistManager.makePlaylistTracks(from: [currentFile])
+      let mutation = await playlistsStore.addTracksResult(tracks, to: playlist.id)
       let outcome = await playlistsStore.awaitDurability(of: mutation)
       switch outcome {
       case .committed(let summary), .unchanged(let summary):
@@ -878,15 +962,18 @@ struct PlaylistsPanel: View {
   }
 
   private func nowPlayingIDInPlaylist(_ playlist: UserPlaylist) -> String? {
+    if case .playlist(let activeID) = playlistManager.playbackScope,
+      activeID == playlist.id,
+      let trackID = playlistManager.currentPlaybackPlaylistTrackID,
+      playlist.tracks.contains(where: { $0.id.uuidString == trackID })
+    {
+      return trackID
+    }
     guard let url = currentHighlightedURL else { return nil }
-    let id = pathKey(url)
     let idLookup = Set(pathLookupKeys(url))
-    guard
-      playlist.tracks.contains(where: {
+    return playlist.tracks.first(where: {
         !idLookup.isDisjoint(with: Set(pathLookupKeys(URL(fileURLWithPath: $0.path))))
-      })
-    else { return nil }
-    return id
+      })?.id.uuidString
   }
 
   @MainActor
@@ -1099,25 +1186,27 @@ struct PlaylistsPanel: View {
 
   @MainActor
   private func playTrackInPlaylist(_ file: AudioFile, playlist: UserPlaylist) {
-    if let reason = trackUnplayableReasons[pathKey(file.url)] {
+    if let reason = trackUnplayableReasons[file.id] {
       postToast(title: "无法播放：\(reason)", subtitle: file.url.lastPathComponent, kind: "warning")
       return
     }
-    let playable = loadedTracks.filter { trackUnplayableReasons[pathKey($0.url)] == nil }
+    let playable = loadedTracks.filter { trackUnplayableReasons[$0.id] == nil }
     guard !playable.isEmpty else {
       postToast(title: "歌单里没有可播放的歌曲", subtitle: nil, kind: "warning")
       return
     }
 
-    // Extract signatures from playlist tracks
-    var signatures: [String: FileSignature] = [:]
-    for track in playlist.tracks {
-      if let sig = track.signature {
-        signatures[track.path] = sig
-      }
-    }
+    let referencePlan = PlaylistQueueReferencePlanner.make(
+      playableFiles: playable,
+      playlist: playlist
+    )
 
-    guard let idx = playlistManager.ensureInQueue(playable, focusURL: file.url, signatures: signatures),
+    guard let idx = playlistManager.ensureInQueue(
+      playable,
+      focusURL: file.url,
+      signatures: referencePlan.signatures,
+      storedTracksByResolvedPath: referencePlan.storedTracksByResolvedPath
+    ),
       let selected = playlistManager.selectFile(at: idx)
     else {
       postToast(title: "未能加入播放列表", subtitle: file.url.lastPathComponent, kind: "warning")
@@ -1148,8 +1237,7 @@ struct PlaylistsPanel: View {
     guard let playlist = selectedPlaylist else { return }
     let playlistID = playlist.id
     let storedTracks = playlist.tracks
-    let paths = storedTracks.map(\.path)
-    guard !paths.isEmpty else {
+    guard !storedTracks.isEmpty else {
       playlistManager.updatePlaybackScopePlaylistTracksIfActive(
         playlistID, trackURLsInOrder: [])
       return
@@ -1159,12 +1247,11 @@ struct PlaylistsPanel: View {
 
     let playlistManager = self.playlistManager
     loadTask = Task.detached(priority: .background) {
-      [paths, storedTracks, playlistManager, playlistID] in
+      [storedTracks, playlistManager, playlistID] in
       let fm = FileManager.default
-      func key(for url: URL) -> String {
-        url.standardizedFileURL.path
-          .precomposedStringWithCanonicalMapping
-      }
+      let resolvedTracks = await playlistManager.resolvePlaylistTrackLocations(storedTracks)
+      guard resolvedTracks.count == storedTracks.count else { return }
+      let paths = resolvedTracks.map { $0.url.path }
       var results: [AudioFile?] = Array(repeating: nil, count: paths.count)
       var missingFileIndices = Set<Int>()
       var reasons: [String: String] = [:]
@@ -1182,6 +1269,27 @@ struct PlaylistsPanel: View {
               guard !Task.isCancelled else { break }
 
               let url = URL(fileURLWithPath: paths[idx])
+              if resolvedTracks[idx].offlineReason != nil {
+                let title = url.deletingPathExtension().lastPathComponent
+                workerResults.append((
+                  idx,
+                  AudioFile(
+                    id: storedTracks[idx].id.uuidString,
+                    url: url,
+                    metadata: AudioMetadata(
+                      title: title,
+                      artist: "离线媒体",
+                      album: "等待磁盘重新连接",
+                      year: nil,
+                      genre: nil,
+                      artwork: nil
+                    ),
+                    duration: nil
+                  ),
+                  true
+                ))
+                continue
+              }
               let snapshot = FileValidationSnapshot.load(for: url, fileManager: fm)
               if !snapshot.exists {
                 let title = url.deletingPathExtension().lastPathComponent
@@ -1245,7 +1353,8 @@ struct PlaylistsPanel: View {
         guard !Task.isCancelled else { return }
         let url = URL(fileURLWithPath: path)
         if missingFileIndices.contains(idx) {
-          reasons[key(for: url)] = "文件不存在"
+          reasons[storedTracks[idx].id.uuidString] =
+            resolvedTracks[idx].offlineReason ?? "文件不存在"
         }
         if results[idx] == nil {
           let title = url.deletingPathExtension().lastPathComponent
@@ -1266,7 +1375,8 @@ struct PlaylistsPanel: View {
       let knownDurations = finalTracks.compactMap(\.duration).filter { $0.isFinite && $0 > 0 }
       let finalDuration = knownDurations.isEmpty ? nil : knownDurations.reduce(0, +)
       await MainActor.run {
-        guard self.selectedPlaylist?.id == playlistID else { return }
+        guard self.selectedPlaylist?.id == playlistID,
+          self.selectedPlaylist?.tracks == storedTracks else { return }
         if Task.isCancelled { return }
         self.loadedTracks = finalTracks
         self.trackUnplayableReasons = finalReasons
@@ -1274,7 +1384,7 @@ struct PlaylistsPanel: View {
         self.isLoadingTracks = false
 
         let playableTracks = finalTracks.filter {
-          finalReasons[self.pathKey($0.url)] == nil
+          finalReasons[$0.id] == nil
         }
         self.playlistManager.updatePlaybackScopePlaylistTracksIfActive(
           playlistID,
@@ -1320,7 +1430,10 @@ struct PlaylistsPanel: View {
       return
     }
     visibleTracks = sortState.option(for: .playlists).applying(
-      to: base, weightScope: .playlist(playlist.id))
+      to: base,
+      weightScope: .playlist(playlist.id),
+      weights: weights
+    )
     visibleTracksRevision &+= 1
   }
 
@@ -1348,7 +1461,11 @@ struct PlaylistsPanel: View {
       }
     }
 
-    return sortState.option(for: .addFromQueue).applying(to: all, weightScope: .queue)
+    return sortState.option(for: .addFromQueue).applying(
+      to: all,
+      weightScope: .queue,
+      weights: weights
+    )
   }
 
   private func makeAddFromQueueSelectedFiles() -> [AudioFile] {
@@ -1516,9 +1633,9 @@ struct PlaylistsPanel: View {
             showAddFromQueueSheet = false
             return
           }
-          let urls = selectedFiles.map(\.url)
           Task { @MainActor in
-            let mutation = await playlistsStore.addTracksResult(urls, to: targetID)
+            let tracks = playlistManager.makePlaylistTracks(from: selectedFiles)
+            let mutation = await playlistsStore.addTracksResult(tracks, to: targetID)
             let outcome = await playlistsStore.awaitDurability(of: mutation)
             switch outcome {
             case .committed(let summary), .unchanged(let summary):
@@ -1684,34 +1801,50 @@ struct PlaylistsPanel: View {
     panel.begin { response in
       guard response == .OK, let fileURL = panel.url else { return }
 
-      // Create sendable snapshot
-      let playlistName = playlist.name
-      let trackPaths = playlist.tracks.map(\.path)
-      let trackCount = playlist.tracks.count
-
-      Task.detached {
-        do {
-          // Reconstruct playlist in detached context
-          let tracks = trackPaths.map { UserPlaylist.Track(path: $0) }
-          let temporaryPlaylist = UserPlaylist(name: playlistName, tracks: tracks)
-
-          try M3U8ExportService.exportPlaylist(temporaryPlaylist, to: fileURL)
-
-          await MainActor.run {
-            self.postToast(
-              title: "已导出歌单",
-              subtitle: "\(trackCount) 首歌曲",
-              kind: "success"
-            )
-          }
-        } catch {
-          await MainActor.run {
-            self.postToast(
+      let playlistSnapshot = playlist
+      Task { @MainActor in
+        let resolvedTracks = await playlistManager.resolvePlaylistTrackLocations(
+          playlistSnapshot.tracks
+        )
+        guard !Task.isCancelled,
+          let exportPlan = PlaylistM3U8ExportPlanner.make(
+            playlist: playlistSnapshot,
+            resolvedTracks: resolvedTracks
+          )
+        else {
+          if !Task.isCancelled {
+            postToast(
               title: "导出失败",
-              subtitle: fileURL.lastPathComponent,
+              subtitle: "歌曲位置解析不完整，请重试",
               kind: "error"
             )
           }
+          return
+        }
+
+        do {
+          try await Task.detached(priority: .utility) {
+            let tracks = exportPlan.trackPaths.map { UserPlaylist.Track(path: $0) }
+            let temporaryPlaylist = UserPlaylist(
+              name: exportPlan.playlistName,
+              tracks: tracks
+            )
+            try M3U8ExportService.exportPlaylist(temporaryPlaylist, to: fileURL)
+          }.value
+
+          let subtitle: String
+          if exportPlan.offlineFallbackCount > 0 {
+            subtitle = "\(exportPlan.trackPaths.count) 首，其中 \(exportPlan.offlineFallbackCount) 首离线，已保留保存路径"
+          } else {
+            subtitle = "\(exportPlan.trackPaths.count) 首歌曲"
+          }
+          postToast(title: "已导出歌单", subtitle: subtitle, kind: "success")
+        } catch {
+          postToast(
+            title: "导出失败",
+            subtitle: fileURL.lastPathComponent,
+            kind: "error"
+          )
         }
       }
     }

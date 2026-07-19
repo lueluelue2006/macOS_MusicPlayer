@@ -14,8 +14,11 @@ struct MusicPlayerApp: App {
 	    private let playlistsStore: PlaylistsStore?
 	    private let playbackCoordinator: PlaybackCoordinator?
 	    private let audioRouteMonitor: AudioRouteMonitor?
+	    private let externalVolumeCoordinator: ExternalVolumeCoordinator?
 	    private let ipcServer: IPCServer?
 	    private let singleInstanceCoordinator: SingleInstanceCoordinator?
+	    private let startupFailureMessage: String?
+	    private let startupRecovery: (() -> Bool)?
 	    private let notificationDelegate = NotificationCenterDelegate()
     
     init() {
@@ -34,49 +37,169 @@ struct MusicPlayerApp: App {
             self.playlistsStore = nil
             self.playbackCoordinator = nil
             self.audioRouteMonitor = nil
+            self.externalVolumeCoordinator = nil
             self.ipcServer = nil
+            self.startupFailureMessage = nil
+            self.startupRecovery = nil
             Self.scheduleSecondaryTermination()
             return
         }
 
         self.singleInstanceCoordinator = coordinator
-        guard acquisition == .primary else {
+        var promotedPrimaryOpenURLs: [URL] = []
+        if acquisition == .secondary {
             let launchURLs = SingleInstanceCoordinator.commandLineOpenURLs(
                 arguments: ProcessInfo.processInfo.arguments
             )
-            coordinator.forwardOpenRequest(launchURLs)
+            let resolution: SingleInstanceCoordinator.SecondaryLaunchResolution
+            do {
+                resolution = try coordinator.resolveSecondaryLaunch(openURLs: launchURLs)
+            } catch {
+                PersistenceLogger.log(
+                    "单实例接管判定失败，当前进程将安全退出：\(error.localizedDescription)"
+                )
+                self.audioPlayer = nil
+                self.playlistManager = nil
+                self.playlistsStore = nil
+                self.playbackCoordinator = nil
+                self.audioRouteMonitor = nil
+                self.externalVolumeCoordinator = nil
+                self.ipcServer = nil
+                self.startupFailureMessage = nil
+                self.startupRecovery = nil
+                appDelegate.configureSecondary(singleInstanceCoordinator: coordinator)
+                Self.scheduleSecondaryTermination()
+                return
+            }
+
+            switch resolution {
+            case .forwardedToPrimary:
+                self.audioPlayer = nil
+                self.playlistManager = nil
+                self.playlistsStore = nil
+                self.playbackCoordinator = nil
+                self.audioRouteMonitor = nil
+                self.externalVolumeCoordinator = nil
+                self.ipcServer = nil
+                self.startupFailureMessage = nil
+                self.startupRecovery = nil
+                appDelegate.configureSecondary(singleInstanceCoordinator: coordinator)
+                Self.scheduleSecondaryTermination()
+                return
+            case .becamePrimary(let openURLs):
+                // `resolveSecondaryLaunch` retained this same request in the
+                // coordinator. Keep its canonical result through composition;
+                // AppDelegate.configure installs the handler that drains it.
+                promotedPrimaryOpenURLs = openURLs
+            }
+        }
+
+        let environment: PersistenceEnvironment
+        do {
+            environment = try PersistenceEnvironment.production()
+            try environment.prepareDirectories()
+        } catch {
             self.audioPlayer = nil
             self.playlistManager = nil
             self.playlistsStore = nil
             self.playbackCoordinator = nil
             self.audioRouteMonitor = nil
+            self.externalVolumeCoordinator = nil
             self.ipcServer = nil
-            appDelegate.configureSecondary(singleInstanceCoordinator: coordinator)
-            Self.scheduleSecondaryTermination()
+            self.startupFailureMessage = "无法准备音乐库目录：\(error.localizedDescription)"
+            self.startupRecovery = nil
+            appDelegate.configureFailedPrimary(singleInstanceCoordinator: coordinator)
             return
         }
 
-        // Bundle identifier change migration:
-        // - avoids conflicting defaults when other apps use the old id
-        // - preserves existing user settings on upgrade
-        UserDefaultsMigrator.migrateFromLegacyBundleIdentifierIfNeeded(currentBundleIdentifier: Bundle.main.bundleIdentifier)
-        PathKeyDiskMigrator.migrateLegacyLowercasedKeysIfNeeded()
+        // The legacy entry points below resolve fixed production paths and the
+        // standard defaults domain. Never let an XCTest/regression composition
+        // escape its isolated PersistenceEnvironment.
+        if !environment.isTesting {
+            UserDefaultsMigrator.migrateFromLegacyBundleIdentifierIfNeeded(
+                currentBundleIdentifier: Bundle.main.bundleIdentifier,
+                currentDefaults: environment.userDefaults
+            )
+            PathKeyDiskMigrator.migrateLegacyLowercasedKeysIfNeeded()
+        }
+        _ = LegacyPersistenceGovernor(
+            baseDirectory: environment.applicationSupportURL
+        ).run()
 
-	        let audioPlayer = AudioPlayer()
-            _ = LegacyPersistenceGovernor.runDefault()
+        let bootstrap = LibraryBootstrap.open(environment: environment)
+        guard let libraryDatabase = bootstrap.database else {
+            self.audioPlayer = nil
+            self.playlistManager = nil
+            self.playlistsStore = nil
+            self.playbackCoordinator = nil
+            self.audioRouteMonitor = nil
+            self.externalVolumeCoordinator = nil
+            self.ipcServer = nil
+            self.startupFailureMessage = bootstrap.legacyFallbackIssue?.localizedDescription
+                ?? "音乐库数据库无法安全打开"
+            let finalURL = environment.applicationSupportURL.appendingPathComponent(
+                LibraryBootstrap.databaseFileName
+            )
+            self.startupRecovery = FileManager.default.fileExists(atPath: finalURL.path)
+                ? {
+                    do {
+                        _ = try LibraryBootstrap.recoverCorruptAuthorityStartingEmpty(
+                            environment: environment
+                        )
+                        return true
+                    } catch {
+                        PersistenceLogger.log(
+                            "显式重建音乐库失败：\(error.localizedDescription)"
+                        )
+                        return false
+                    }
+                }
+                : nil
+            appDelegate.configureFailedPrimary(singleInstanceCoordinator: coordinator)
+            return
+        }
+
+        let appPreferencesStore = AppPreferencesStore(userDefaults: environment.userDefaults)
+        IPCDebugSettings.setEnabled(appPreferencesStore.load().ipcDebugEnabled)
+        let playbackWeights = PlaybackWeights(libraryDatabase: libraryDatabase)
+        let playbackSessionStore = PlaybackSessionStore(libraryDatabase: libraryDatabase)
+        let signatureCaptureService = SignatureCaptureService()
+	    let libraryLocationResolver = LibraryLocationResolver()
+	    let audioPlayer = AudioPlayer(
+            environment: environment,
+            appPreferencesStore: appPreferencesStore
+        )
 	        let playlistManager = PlaylistManager(
+                libraryDatabase: libraryDatabase,
+                libraryLocationResolver: libraryLocationResolver,
+                signatureCaptureService: signatureCaptureService,
+                appPreferencesStore: appPreferencesStore,
+                legacyUserDefaults: environment.userDefaults,
+                playbackSessionStore: playbackSessionStore,
+                playbackWeights: playbackWeights,
                 playbackStateRekeyHandler: { [weak audioPlayer] oldURL, newURL in
                     audioPlayer?.rekeyPersistedPlaybackState(from: oldURL, to: newURL)
                         ?? .unchanged
                 }
             )
-	        let playlistsStore = PlaylistsStore()
+	    audioPlayer.configurePlaybackAccessLeaseProvider(playlistManager)
+	        let playlistsStore = PlaylistsStore(
+                libraryDatabase: libraryDatabase,
+                signatureCaptureService: signatureCaptureService,
+                playbackWeights: playbackWeights
+            )
 	        let playbackCoordinator = PlaybackCoordinator(
                 audioPlayer: audioPlayer,
                 playlistManager: playlistManager,
-                playlistsStore: playlistsStore
+                playlistsStore: playlistsStore,
+                playbackSessionStore: playbackSessionStore
             )
-	        let ipcServer = IPCServer(audioPlayer: audioPlayer, playlistManager: playlistManager, playlistsStore: playlistsStore)
+	        let ipcServer = IPCServer(
+                audioPlayer: audioPlayer,
+                playlistManager: playlistManager,
+                playlistsStore: playlistsStore,
+                playbackWeights: playbackWeights
+            )
 
         let audioRouteMonitor = AudioRouteMonitor(
             onHeadphonesDisconnected: { [weak audioPlayer] in
@@ -147,19 +270,89 @@ struct MusicPlayerApp: App {
             }
         )
 
+        let externalVolumeCoordinator = ExternalVolumeCoordinator()
+        externalVolumeCoordinator.onEvent = {
+            [weak playlistManager, weak audioPlayer, weak playlistsStore] event in
+            switch event {
+            case .willUnmount(let volume):
+                guard let volume else { return }
+                if let audioPlayer,
+                   audioPlayer.playbackTargetIsAffected(by: volume) {
+                    if audioPlayer.persistPlaybackState,
+                       let playlistManager,
+                       let targetURL = audioPlayer.playbackTargetURL {
+                        _ = playbackSessionStore.mergeInstalledTrack(
+                            playlistManager.playbackSessionTrackIdentity(for: targetURL)
+                        )
+                        let seconds = audioPlayer.captureInstalledPlaybackTime()
+                        let milliseconds = seconds.isFinite && seconds > 0
+                            ? Int64(min(Double(Int64.max), seconds * 1_000).rounded())
+                            : 0
+                        _ = playbackSessionStore.mergePosition(milliseconds: milliseconds)
+                    }
+                }
+                _ = audioPlayer?.detachPlaybackResourceForUnmount(
+                    volumeURL: volume.url
+                )
+                Task {
+                    _ = await playlistManager?.handleExternalVolumeWillUnmount(volume)
+                }
+            case .topologyChanged(let diff):
+                Task {
+                    await playlistManager?.refreshExternalMediaAvailability(
+                        playlistsStore: playlistsStore,
+                        topologyGeneration: diff.snapshot.generation
+                    )
+                }
+            case .refreshFailed(_, let message):
+                PersistenceLogger.log("刷新外接磁盘状态失败：\(message)")
+            }
+        }
+        externalVolumeCoordinator.start()
+
 	        self.audioPlayer = audioPlayer
 	        self.playlistManager = playlistManager
 	        self.playlistsStore = playlistsStore
 	        self.playbackCoordinator = playbackCoordinator
 	        self.ipcServer = ipcServer
 	        self.audioRouteMonitor = audioRouteMonitor
+	        self.externalVolumeCoordinator = externalVolumeCoordinator
+	        self.startupFailureMessage = nil
+	        self.startupRecovery = nil
 
         // 连接 AppDelegate，使其可以接管 Finder/Dock 打开的临时文件
         appDelegate.configure(
             audioPlayer: audioPlayer,
             playlistManager: playlistManager,
             playlistsStore: playlistsStore,
-            singleInstanceCoordinator: coordinator
+            singleInstanceCoordinator: coordinator,
+            playbackWeights: playbackWeights,
+            playbackSessionStore: playbackSessionStore
+        )
+        if !promotedPrimaryOpenURLs.isEmpty {
+            PersistenceLogger.log(
+                "单实例接管完成，已向主进程打开管线交付 \(promotedPrimaryOpenURLs.count) 个路径"
+            )
+        }
+        _ = appDelegate.registerTerminationLifecycleHook(
+            .init {
+                [weak ipcServer,
+                 weak audioRouteMonitor,
+                 weak externalVolumeCoordinator,
+                 weak playbackCoordinator,
+                 weak audioPlayer] context in
+                ipcServer?.stopForTermination(generation: context.generation)
+                audioRouteMonitor?.stopForTermination(generation: context.generation)
+                MainActor.assumeIsolated {
+                    externalVolumeCoordinator?.stopForTermination(
+                        generation: context.generation
+                    )
+                    playbackCoordinator?.stopForTermination(
+                        generation: context.generation
+                    )
+                    audioPlayer?.stopForTermination(generation: context.generation)
+                }
+            }
         )
 
         // Run format detection tests in background to avoid blocking app startup/IPC.
@@ -192,6 +385,11 @@ struct MusicPlayerApp: App {
                         playlistManager: playlistManager,
                         playlistsStore: playlistsStore
                     )
+                } else if let startupFailureMessage {
+                    StartupPersistenceFailureView(
+                        message: startupFailureMessage,
+                        recoverStartingEmpty: startupRecovery
+                    )
                 } else {
                     EmptyView()
                 }
@@ -212,6 +410,61 @@ struct MusicPlayerApp: App {
         // retry can bridge the primary process' observer-installation window.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
             NSApplication.shared.terminate(nil)
+        }
+    }
+}
+
+private struct StartupPersistenceFailureView: View {
+    let message: String
+    let recoverStartingEmpty: (() -> Bool)?
+    @State private var showsRecoveryConfirmation = false
+    @State private var recoverySucceeded = false
+    @State private var recoveryFailed = false
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "externaldrive.badge.exclamationmark")
+                .font(.system(size: 34, weight: .medium))
+                .foregroundStyle(.orange)
+            Text("音乐库处于保护模式")
+                .font(.title2.weight(.semibold))
+            Text(message)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 440)
+            Text(recoverySucceeded
+                ? "已建立新的空音乐库，损坏数据库仍保留为诊断副本。请退出后重新打开。"
+                : "原始数据没有被覆盖。你可以保留数据库供诊断，或明确重建一个空音乐库。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 480)
+            HStack(spacing: 10) {
+                if recoverStartingEmpty != nil, !recoverySucceeded {
+                    Button("保留诊断并重建空音乐库") {
+                        showsRecoveryConfirmation = true
+                    }
+                }
+                Button(recoverySucceeded ? "退出后重新打开" : "退出 MusicPlayer") {
+                    AppTerminator.requestQuit()
+                }
+                .keyboardShortcut("q", modifiers: [.command])
+            }
+            if recoveryFailed {
+                Text("重建失败，原数据库仍保持不变。")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+        .padding(40)
+        .alert("重建空音乐库？", isPresented: $showsRecoveryConfirmation) {
+            Button("取消", role: .cancel) { }
+            Button("保留诊断并重建", role: .destructive) {
+                recoverySucceeded = recoverStartingEmpty?() == true
+                recoveryFailed = !recoverySucceeded
+            }
+        } message: {
+            Text("当前损坏数据库会被归档，不会删除；随后创建一个经过完整性校验的空音乐库。")
         }
     }
 }

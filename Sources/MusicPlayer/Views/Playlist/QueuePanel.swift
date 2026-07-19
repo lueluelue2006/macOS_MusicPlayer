@@ -9,6 +9,12 @@ struct QueuePanel: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
+      if let protection = viewModel.playlistManager.queuePersistenceProtection {
+        queueProtectionBanner(protection)
+          .padding(.horizontal, 24)
+          .padding(.bottom, 12)
+      }
+
       SearchBarView(
         searchText: viewModel.queueSearchTextBinding,
         focusTarget: .queue
@@ -36,6 +42,42 @@ struct QueuePanel: View {
       .onTapGesture {
         NotificationCenter.default.post(name: .blurSearchField, object: nil)
       }
+    }
+  }
+
+  private func queueProtectionBanner(
+    _ protection: PlaylistManager.QueuePersistenceProtection
+  ) -> some View {
+    HStack(spacing: 12) {
+      Image(systemName: "externaldrive.badge.exclamationmark")
+        .foregroundStyle(.orange)
+      VStack(alignment: .leading, spacing: 2) {
+        Text("队列处于只读保护模式")
+          .font(.callout.weight(.semibold))
+        Text(protection.diagnosticMessage)
+          .font(.caption)
+          .foregroundStyle(theme.stageSecondaryText)
+      }
+      Spacer(minLength: 12)
+      if protection.canResetQueue {
+        Button("保留诊断并重建空队列") {
+          let confirmed = DestructiveConfirmation.confirm(
+            title: "重建空队列？",
+            message: "损坏内容已经保留为诊断副本；当前队列将从空状态重新开始。",
+            confirmTitle: "重建",
+            cancelTitle: "取消"
+          )
+          guard confirmed else { return }
+          _ = viewModel.playlistManager.recoverCorruptQueueStartingEmpty()
+        }
+        .buttonStyle(.bordered)
+      }
+    }
+    .padding(12)
+    .background(theme.panelBackground, in: RoundedRectangle(cornerRadius: 12))
+    .overlay {
+      RoundedRectangle(cornerRadius: 12)
+        .stroke(theme.stroke, lineWidth: 1)
     }
   }
 

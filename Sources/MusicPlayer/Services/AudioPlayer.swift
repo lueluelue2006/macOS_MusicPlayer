@@ -17,6 +17,30 @@ private struct WeakAVAudioPlayerBox: @unchecked Sendable {
     weak var player: AVAudioPlayer?
 }
 
+private final class AudioPlaybackAccessLeaseTransfer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lease: (any AudioPlaybackAccessLease)?
+
+    init(_ lease: (any AudioPlaybackAccessLease)?) {
+        self.lease = lease
+    }
+
+    func take() -> (any AudioPlaybackAccessLease)? {
+        lock.lock()
+        defer { lock.unlock() }
+        defer { lease = nil }
+        return lease
+    }
+
+    deinit {
+        lock.lock()
+        let lease = lease
+        self.lease = nil
+        lock.unlock()
+        lease?.releasePlaybackAccess()
+    }
+}
+
 final class AudioPlayer: NSObject, ObservableObject {
     enum PlaybackMode: String, CaseIterable, Sendable {
         case shuffle
@@ -52,10 +76,8 @@ final class AudioPlayer: NSObject, ObservableObject {
     var hasInitializedOutputDeviceName: Bool = false
     // 是否在设备切换时发送系统通知（用户可在菜单开关）
     @Published var notifyOnDeviceSwitch: Bool = true
-    private let userNotifyOnDeviceSwitchKey = "userNotifyOnDeviceSwitch"
     // 设备切换通知是否静音（默认静音）
     @Published var notifyDeviceSwitchSilent: Bool = true
-    private let userNotifyDeviceSwitchSilentKey = "userNotifyDeviceSwitchSilent"
     // 当前是否为耳机类输出（用于判定是否需要扬声器确认）
     @Published var isHeadphoneOutput: Bool = false
     // 从耳机切到扬声器后，显式开始播放需要一次确认
@@ -76,11 +98,11 @@ final class AudioPlayer: NSObject, ObservableObject {
     private let immersivePlaybackAnalyzer: ImmersivePlaybackAnalyzer
     private var immersiveAnalysisTask: Task<Void, Never>?
     private var immersiveEndTask: Task<Void, Never>?
+    private var lyricsLoadTask: Task<Void, Never>?
     private var pendingLateImmersiveBounds: (url: URL, bounds: PlaybackBounds)?
     private var unexpectedStopReconciliationTask: Task<Void, Never>?
     @Published private(set) var activePlaybackBounds: PlaybackBounds?
     private var completedLoadGeneration: UInt64?
-    private let userImmersivePlaybackEnabledKey = "userImmersivePlaybackEnabled"
     var playbackFinishedHandler: ((UInt64, UInt64, URL?, Bool) -> Void)?
     var playbackFailedHandler: ((URL, String, Bool) -> Void)?
     var playbackLoadedHandler: ((URL, Bool) -> Void)?
@@ -119,15 +141,12 @@ final class AudioPlayer: NSObject, ObservableObject {
     private let normalizationQueue = DispatchQueue(label: "audio.normalization", qos: .utility)
     private let volumeAnalysisLock = NSLock()
     private var normalizationInFlight: Set<String> = []      // 避免同一文件重复分析
-    private let volumeCacheKey = "volumeNormalizationCache"  // 旧版 UserDefaults 增益缓存迁移键
     private let playbackStateStore: PlaybackStateStore
     private let appPreferencesStore: AppPreferencesStore
     private let shouldPersistUserPreferences: Bool
     private var didNotifyProtectedCoherentPreferences = false
     @Published var analyzeVolumesDuringPlayback: Bool = false
-    private let userAnalyzeVolumesDuringPlaybackKey = "userAnalyzeVolumesDuringPlayback"
     @Published var autoPreanalyzeVolumesWhenIdle: Bool = true
-    private let userAutoPreanalyzeVolumesWhenIdleKey = "userAutoPreanalyzeVolumesWhenIdle"
     @Published private(set) var isVolumePreanalysisRunning: Bool = false
     @Published private(set) var volumePreanalysisTotal: Int = 0
     @Published private(set) var volumePreanalysisCompleted: Int = 0
@@ -153,7 +172,6 @@ final class AudioPlayer: NSObject, ObservableObject {
     var isAutoIdleVolumePreanalysisActive: Bool {
         volumePreanalysisStartReason == .autoIdle && volumePreanalysisTask != nil
     }
-    private let userNormalizationKey = "userNormalizationEnabled" // 音量均衡开关
     private let normalizationTargetLock = NSLock()
     private var normalizationTargetSnapshot: Float = LoudnessNormalizationPolicy.defaultTargetLUFS
     @Published var normalizationTargetLUFS: Float = LoudnessNormalizationPolicy.defaultTargetLUFS {
@@ -163,16 +181,13 @@ final class AudioPlayer: NSObject, ObservableObject {
             normalizationTargetLock.unlock()
         }
     }
-    private let userNormalizationTargetLUFSKey = "userNormalizationTargetLUFS"
     // IPC compatibility while clients migrate from the historical RMS name.
     var normalizationTargetLevelDb: Float {
         get { normalizationTargetLUFS }
         set { normalizationTargetLUFS = newValue }
     }
     @Published var normalizationFadeDuration: Double = 0.6 // 应用均衡增益时的淡入时长（秒）
-    private let userNormalizationFadeDurationKey = "userNormalizationFadeDuration"
     @Published var requireVolumeAnalysisBeforePlayback: Bool = false // 无缓存时先分析再播放
-    private let userRequireVolumeAnalysisBeforePlaybackKey = "userRequireVolumeAnalysisBeforePlayback"
     private var wasPlayingBeforeInterruption = false
     // 在耳机/路由变化导致的自动暂停后，记录是否应在耳机恢复时自动续播
     var shouldAutoResumeAfterRoute: Bool = false
@@ -197,6 +212,10 @@ final class AudioPlayer: NSObject, ObservableObject {
     private var loadGeneration: UInt64 = 0
     private var activePlayerGeneration: UInt64 = 0
     private var completionEventSequence: UInt64 = 0
+    private(set) var terminationStopGeneration: UInt64?
+    private var isStoppedForTermination: Bool {
+        terminationStopGeneration != nil
+    }
     private func nextLoadGeneration() -> UInt64 {
         loadGeneration &+= 1
         return loadGeneration
@@ -373,19 +392,35 @@ final class AudioPlayer: NSObject, ObservableObject {
     }
 
     private static func makeDefaultVolumeAnalysisStore() -> VolumeAnalysisStore? {
-        let fileManager = FileManager.default
-        guard let base = fileManager.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first else { return nil }
-        let directory = base.appendingPathComponent("MusicPlayer", isDirectory: true)
-        let databaseURL = directory.appendingPathComponent(
-            "volume-analysis.sqlite3",
-            isDirectory: false
-        )
-        let legacyURL = directory.appendingPathComponent("volume-cache.json", isDirectory: false)
         do {
-            return try VolumeAnalysisStore(databaseURL: databaseURL, legacyJSONURL: legacyURL)
+            return makeVolumeAnalysisStore(environment: try PersistenceEnvironment.production())
+        } catch {
+            PersistenceLogger.log("解析音量分析存储环境失败：\(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Rebuildable loudness analysis belongs in Caches. The old JSON remains
+    /// in Application Support solely as a one-time migration source.
+    private static func makeVolumeAnalysisStore(
+        environment: PersistenceEnvironment
+    ) -> VolumeAnalysisStore? {
+        let legacyURL: URL?
+        do {
+            legacyURL = try environment.prepareApplicationSupportDirectory()
+                .appendingPathComponent("volume-cache.json", isDirectory: false)
+        } catch {
+            legacyURL = nil
+            PersistenceLogger.log("准备旧版音量缓存迁移目录失败：\(error.localizedDescription)")
+        }
+
+        do {
+            let databaseURL = try environment.prepareCachesDirectory()
+                .appendingPathComponent("volume-analysis.sqlite3", isDirectory: false)
+            return try VolumeAnalysisStore(
+                databaseURL: databaseURL,
+                legacyJSONURL: legacyURL
+            )
         } catch {
             PersistenceLogger.log("初始化音量分析数据库失败：\(error.localizedDescription)")
             return nil
@@ -430,6 +465,27 @@ final class AudioPlayer: NSObject, ObservableObject {
         finishInitialization(loadUserPreferences: !isTesting)
     }
 
+    /// Production composition root. Persistent locations and the preferences
+    /// domain are explicit so tests and alternate app containers cannot leak
+    /// state into the user's standard domain.
+    init(
+        environment: PersistenceEnvironment,
+        appPreferencesStore: AppPreferencesStore
+    ) {
+        // The default analyzer already uses the shared DerivedCacheStore SQLite
+        // production backend; its legacy JSON is migration-only.
+        immersivePlaybackAnalyzer = ImmersivePlaybackAnalyzer()
+        let volumeStore = Self.makeVolumeAnalysisStore(environment: environment)
+        volumeAnalysisStore = volumeStore
+        volumeAnalysisPersistenceAvailable = volumeStore != nil
+        playbackStateStore = PlaybackStateStore(userDefaults: environment.userDefaults)
+        self.appPreferencesStore = appPreferencesStore
+        shouldPersistUserPreferences = true
+        super.init()
+        testModeSilent = environment.isTesting || Self.isRunningUnderXCTest
+        finishInitialization(loadUserPreferences: true)
+    }
+
     init(
         volumeCacheFileURLOverride: URL,
         immersiveCacheFileURLOverride: URL? = nil,
@@ -458,6 +514,23 @@ final class AudioPlayer: NSObject, ObservableObject {
         testModeSilent = Self.isRunningUnderXCTest
         isImmersivePlaybackEnabled = initialImmersivePlaybackEnabled
         finishInitialization(loadUserPreferences: loadUserPreferences)
+    }
+
+    deinit {
+        pendingLoadTask?.cancel()
+        nextPreloadTask?.cancel()
+        pendingResumeTask?.cancel()
+        immersiveAnalysisTask?.cancel()
+        immersiveEndTask?.cancel()
+        unexpectedStopReconciliationTask?.cancel()
+        deferredTerminalReplayFallbackTask?.cancel()
+        lyricsLoadTask?.cancel()
+        artworkLoadTask?.cancel()
+        volumeRampTask?.cancel()
+        volumePreanalysisTask?.cancel()
+        pendingPlaybackAccessLease?.releasePlaybackAccess()
+        installedPlaybackAccessLease?.releasePlaybackAccess()
+        preloadedNext?.accessLease?.releasePlaybackAccess()
     }
 
     private func finishInitialization(loadUserPreferences: Bool) {
@@ -492,66 +565,76 @@ final class AudioPlayer: NSObject, ObservableObject {
     }
 
     private func loadVolumeAnalysisPreferences() {
-        let d = UserDefaults.standard
-        if d.object(forKey: userAnalyzeVolumesDuringPlaybackKey) != nil {
-            analyzeVolumesDuringPlayback = d.bool(forKey: userAnalyzeVolumesDuringPlaybackKey)
-        }
-        if d.object(forKey: userAutoPreanalyzeVolumesWhenIdleKey) != nil {
-            autoPreanalyzeVolumesWhenIdle = d.bool(forKey: userAutoPreanalyzeVolumesWhenIdleKey)
-        }
+        let preferences = appPreferencesStore.load()
+        analyzeVolumesDuringPlayback = preferences.analyzeDuringPlayback
+        autoPreanalyzeVolumesWhenIdle = preferences.autoPreanalyze
     }
 
     func saveAnalyzeVolumesDuringPlaybackPreference() {
         if !analyzeVolumesDuringPlayback {
             _ = bumpPlaybackAnalysisGeneration()
         }
-        let d = UserDefaults.standard
-        d.set(analyzeVolumesDuringPlayback, forKey: userAnalyzeVolumesDuringPlaybackKey)
+        persistUserPreference(
+            update: { $0.analyzeDuringPlayback = analyzeVolumesDuringPlayback },
+            restore: { analyzeVolumesDuringPlayback = $0.analyzeDuringPlayback }
+        )
     }
 
     func saveAutoPreanalyzeVolumesWhenIdlePreference() {
-        let d = UserDefaults.standard
-        d.set(autoPreanalyzeVolumesWhenIdle, forKey: userAutoPreanalyzeVolumesWhenIdleKey)
+        persistUserPreference(
+            update: { $0.autoPreanalyze = autoPreanalyzeVolumesWhenIdle },
+            restore: { autoPreanalyzeVolumesWhenIdle = $0.autoPreanalyze }
+        )
     }
 
     private func loadNormalizationTargetLevelPreference() {
-        let d = UserDefaults.standard
-        if d.object(forKey: userNormalizationTargetLUFSKey) != nil {
-            let v = d.float(forKey: userNormalizationTargetLUFSKey)
-            normalizationTargetLUFS = clamp(v, min: -30.0, max: -8.0)
-        }
+        normalizationTargetLUFS = clamp(
+            appPreferencesStore.load().targetLUFS,
+            min: -30.0,
+            max: -8.0
+        )
     }
 
     func saveNormalizationTargetLevelPreference() {
         normalizationTargetLUFS = clamp(normalizationTargetLUFS, min: -30.0, max: -8.0)
-        let d = UserDefaults.standard
-        d.set(normalizationTargetLUFS, forKey: userNormalizationTargetLUFSKey)
+        persistUserPreference(
+            deferred: true,
+            update: { $0.targetLUFS = normalizationTargetLUFS },
+            restore: { normalizationTargetLUFS = $0.targetLUFS }
+        )
     }
 
     private func loadNormalizationFadeDurationPreference() {
-        let d = UserDefaults.standard
-        if d.object(forKey: userNormalizationFadeDurationKey) != nil {
-            let v = d.double(forKey: userNormalizationFadeDurationKey)
-            normalizationFadeDuration = clamp(v, min: 0.0, max: 1.5)
-        }
+        normalizationFadeDuration = clamp(
+            appPreferencesStore.load().immersiveFadeDuration,
+            min: 0.0,
+            max: 1.5
+        )
     }
 
     func saveNormalizationFadeDurationPreference() {
         normalizationFadeDuration = clamp(normalizationFadeDuration, min: 0.0, max: 1.5)
-        let d = UserDefaults.standard
-        d.set(normalizationFadeDuration, forKey: userNormalizationFadeDurationKey)
+        persistUserPreference(
+            deferred: true,
+            update: { $0.immersiveFadeDuration = normalizationFadeDuration },
+            restore: { normalizationFadeDuration = $0.immersiveFadeDuration }
+        )
     }
 
     private func loadRequireVolumeAnalysisBeforePlaybackPreference() {
-        let d = UserDefaults.standard
-        if d.object(forKey: userRequireVolumeAnalysisBeforePlaybackKey) != nil {
-            requireVolumeAnalysisBeforePlayback = d.bool(forKey: userRequireVolumeAnalysisBeforePlaybackKey)
-        }
+        requireVolumeAnalysisBeforePlayback = appPreferencesStore.load()
+            .requireAnalysisBeforeTransition
     }
 
     func saveRequireVolumeAnalysisBeforePlaybackPreference() {
-        let d = UserDefaults.standard
-        d.set(requireVolumeAnalysisBeforePlayback, forKey: userRequireVolumeAnalysisBeforePlaybackKey)
+        persistUserPreference(
+            update: {
+                $0.requireAnalysisBeforeTransition = requireVolumeAnalysisBeforePlayback
+            },
+            restore: {
+                requireVolumeAnalysisBeforePlayback = $0.requireAnalysisBeforeTransition
+            }
+        )
     }
     
     // macOS 不需要 AVAudioSession 配置，保留空实现避免 iOS API 在 macOS 上的不可用错误
@@ -567,6 +650,10 @@ final class AudioPlayer: NSObject, ObservableObject {
     private var pendingLoadTask: Task<Void, Never>?
     private var pendingLoadGeneration: UInt64?
     private var pendingPlaybackPersistsState: Bool?
+    private var pendingPlaybackAccessLease: (any AudioPlaybackAccessLease)?
+    private var pendingPlaybackAccessLeaseGeneration: UInt64?
+    private var installedPlaybackAccessLease: (any AudioPlaybackAccessLease)?
+    private weak var playbackAccessLeaseProvider: (any AudioPlaybackAccessLeaseProviding)?
     private var pendingResumeTask: Task<Void, Never>?
     private var resumeRequestGeneration: UInt64 = 0
     private var playbackIntentGeneration: UInt64 = 0
@@ -591,12 +678,98 @@ final class AudioPlayer: NSObject, ObservableObject {
         playbackTargetURL != nil
     }
 
-    private func clearPendingLoadTask(ifCurrent generation: UInt64) {
-        guard pendingLoadGeneration == generation else { return }
+    func configurePlaybackAccessLeaseProvider(
+        _ provider: any AudioPlaybackAccessLeaseProviding
+    ) {
+        playbackAccessLeaseProvider = provider
+    }
+
+    func playbackTargetIsAffected(by volume: MountedLibraryVolume) -> Bool {
+        let candidateURLs = [
+            playbackTargetURL,
+            currentFile?.url,
+            pendingPlaybackAccessLease?.url,
+            installedPlaybackAccessLease?.url
+        ]
+        return candidateURLs.compactMap { $0?.standardizedFileURL }.contains { url in
+            Self.isPlaybackResourceURL(url, containedIn: volume.url)
+        }
+    }
+
+    static func isPlaybackResourceURL(_ resourceURL: URL, containedIn volumeURL: URL) -> Bool {
+        let volumeComponents = volumeURL.standardizedFileURL.pathComponents
+        let resourceComponents = resourceURL.standardizedFileURL.pathComponents
+        guard resourceComponents.count >= volumeComponents.count else { return false }
+        return Array(resourceComponents.prefix(volumeComponents.count)) == volumeComponents
+    }
+
+    @discardableResult
+    private func clearPendingLoadTask(
+        ifCurrent generation: UInt64
+    ) -> (any AudioPlaybackAccessLease)? {
+        guard pendingLoadGeneration == generation else { return nil }
+        let accessLease: (any AudioPlaybackAccessLease)?
+        if pendingPlaybackAccessLeaseGeneration == generation {
+            accessLease = pendingPlaybackAccessLease
+        } else {
+            accessLease = nil
+        }
         pendingLoadTask = nil
         pendingLoadGeneration = nil
         pendingPlaybackURL = nil
         pendingPlaybackPersistsState = nil
+        pendingPlaybackAccessLease = nil
+        pendingPlaybackAccessLeaseGeneration = nil
+        return accessLease
+    }
+
+    private func cancelPendingLoadAndReleaseAccessLease() {
+        pendingLoadTask?.cancel()
+        pendingLoadTask = nil
+        pendingLoadGeneration = nil
+        pendingPlaybackURL = nil
+        pendingPlaybackPersistsState = nil
+        let accessLease = pendingPlaybackAccessLease
+        pendingPlaybackAccessLease = nil
+        pendingPlaybackAccessLeaseGeneration = nil
+        accessLease?.releasePlaybackAccess()
+    }
+
+    private func acceptedPlaybackAccessLease(
+        _ accessLease: (any AudioPlaybackAccessLease)?,
+        for url: URL
+    ) -> (any AudioPlaybackAccessLease)? {
+        guard let accessLease else { return nil }
+        guard accessLease.url.standardizedFileURL == url.standardizedFileURL else {
+            accessLease.releasePlaybackAccess()
+            return nil
+        }
+        return accessLease
+    }
+
+    private func replaceInstalledPlaybackAccessLease(
+        with accessLease: (any AudioPlaybackAccessLease)?
+    ) {
+        let previous = installedPlaybackAccessLease
+        if let previous, let accessLease,
+           (previous as AnyObject) === (accessLease as AnyObject) {
+            return
+        }
+        installedPlaybackAccessLease = accessLease
+        previous?.releasePlaybackAccess()
+    }
+
+    private func replacePendingPlaybackAccessLease(
+        with accessLease: any AudioPlaybackAccessLease,
+        generation: UInt64
+    ) {
+        let previous = pendingPlaybackAccessLease
+        if let previous, (previous as AnyObject) === (accessLease as AnyObject) {
+            return
+        }
+        pendingPlaybackAccessLease = accessLease
+        pendingPlaybackAccessLeaseGeneration = generation
+        previous?.releasePlaybackAccess()
     }
 
     /// Rebinds the installed AVAudioPlayer after a replacement request is
@@ -637,10 +810,8 @@ final class AudioPlayer: NSObject, ObservableObject {
         guard pendingLoadGeneration == generation else { return }
         let failedURL = pendingPlaybackURL
         let activePlayerHadCompleted = completedLoadGeneration == activePlayerGeneration
-        pendingLoadTask = nil
-        pendingLoadGeneration = nil
-        pendingPlaybackURL = nil
-        pendingPlaybackPersistsState = nil
+        let accessLease = clearPendingLoadTask(ifCurrent: generation)
+        accessLease?.releasePlaybackAccess()
         if pendingSeekRequest?.url == failedURL {
             pendingSeekRequest = nil
         }
@@ -680,11 +851,7 @@ final class AudioPlayer: NSObject, ObservableObject {
         guard pendingLoadGeneration != nil else { return false }
         let cancelledURL = pendingPlaybackURL
         let activePlayerHadCompleted = completedLoadGeneration == activePlayerGeneration
-        pendingLoadTask?.cancel()
-        pendingLoadTask = nil
-        pendingLoadGeneration = nil
-        pendingPlaybackURL = nil
-        pendingPlaybackPersistsState = nil
+        cancelPendingLoadAndReleaseAccessLease()
         if pendingSeekRequest?.url == cancelledURL {
             pendingSeekRequest = nil
         }
@@ -843,6 +1010,7 @@ final class AudioPlayer: NSObject, ObservableObject {
         let player: AVAudioPlayer
         let playbackBounds: PlaybackBounds?
         let generation: UInt64
+        let accessLease: (any AudioPlaybackAccessLease)?
     }
     private let preloadLock = NSLock()
     private var nextPreloadTask: Task<Void, Never>?
@@ -878,10 +1046,12 @@ final class AudioPlayer: NSObject, ObservableObject {
     private func resetPreloadedNext() -> UInt64 {
         preloadLock.lock()
         preloadGeneration &+= 1
+        let accessLease = preloadedNext?.accessLease
         preloadedNext = nil
         preloadTargetURL = nil
         let generation = preloadGeneration
         preloadLock.unlock()
+        accessLease?.releasePlaybackAccess()
         return generation
     }
 
@@ -889,17 +1059,20 @@ final class AudioPlayer: NSObject, ObservableObject {
         url: URL,
         player: AVAudioPlayer,
         playbackBounds: PlaybackBounds?,
-        generation: UInt64
-    ) {
+        generation: UInt64,
+        accessLease: (any AudioPlaybackAccessLease)?
+    ) -> Bool {
         preloadLock.lock()
         defer { preloadLock.unlock() }
-        guard generation == preloadGeneration else { return }
+        guard generation == preloadGeneration else { return false }
         preloadedNext = PreloadedNext(
             url: url,
             player: player,
             playbackBounds: playbackBounds,
-            generation: generation
+            generation: generation,
+            accessLease: accessLease
         )
+        return true
     }
 
     private func updatePreloadedBoundsIfMatching(
@@ -919,17 +1092,20 @@ final class AudioPlayer: NSObject, ObservableObject {
             url: entry.url,
             player: entry.player,
             playbackBounds: bounds,
-            generation: entry.generation
+            generation: entry.generation,
+            accessLease: entry.accessLease
         )
     }
 
     private func beginPreload(for url: URL) -> UInt64 {
         preloadLock.lock()
         preloadGeneration &+= 1
+        let accessLease = preloadedNext?.accessLease
         preloadedNext = nil
         preloadTargetURL = url
         let generation = preloadGeneration
         preloadLock.unlock()
+        accessLease?.releasePlaybackAccess()
         return generation
     }
 
@@ -956,7 +1132,10 @@ final class AudioPlayer: NSObject, ObservableObject {
     /// 预加载“下一首”的 AVAudioPlayer（并按需提前写入音量均衡缓存）。
     /// - 目标：减少曲目切换时的空隙；尽量不增加常驻内存（仅保留 1 个预加载播放器）。
     func preloadNextTrack(_ file: AudioFile) {
+        guard !isStoppedForTermination else { return }
         let url = file.url
+        let leaseProvider = playbackAccessLeaseProvider
+        let accessRequest = leaseProvider?.playbackAccessRequest(for: file)
 
         // 已预加载同一首：不重复
         if preloadedEntryIfMatching(url: url) != nil { return }
@@ -976,6 +1155,22 @@ final class AudioPlayer: NSObject, ObservableObject {
             guard let self else { return }
             if Task.isCancelled { return }
 
+            var accessLease: (any AudioPlaybackAccessLease)?
+            if let accessRequest, let leaseProvider {
+                do {
+                    accessLease = try await leaseProvider.acquirePlaybackAccessLease(
+                        for: accessRequest
+                    )
+                } catch {
+                    self.markPreloadFailed(generation: generation)
+                    return
+                }
+                if Task.isCancelled {
+                    accessLease?.releasePlaybackAccess()
+                    return
+                }
+            }
+
             // 1) Prepare AVAudioPlayer
             do {
                 let p: AVAudioPlayer
@@ -993,7 +1188,10 @@ final class AudioPlayer: NSObject, ObservableObject {
                 p.rate = self.clampPlaybackRate(capturedRate)
                 p.prepareToPlay()
 
-                if Task.isCancelled { return }
+                if Task.isCancelled {
+                    accessLease?.releasePlaybackAccess()
+                    return
+                }
                 let playbackBounds: PlaybackBounds?
                 if capturedImmersivePlaybackEnabled {
                     playbackBounds = await self.immersivePlaybackAnalyzer.bounds(
@@ -1016,14 +1214,24 @@ final class AudioPlayer: NSObject, ObservableObject {
                 } else {
                     playbackBounds = nil
                 }
-                if Task.isCancelled { return }
-                self.storePreloadedNext(
+                if Task.isCancelled {
+                    accessLease?.releasePlaybackAccess()
+                    return
+                }
+                let didStore = self.storePreloadedNext(
                     url: url,
                     player: p,
                     playbackBounds: playbackBounds,
-                    generation: generation
+                    generation: generation,
+                    accessLease: accessLease
                 )
+                if !didStore {
+                    accessLease?.releasePlaybackAccess()
+                    return
+                }
+                accessLease = nil
             } catch {
+                accessLease?.releasePlaybackAccess()
                 self.markPreloadFailed(generation: generation)
                 return
             }
@@ -1127,6 +1335,7 @@ final class AudioPlayer: NSObject, ObservableObject {
         let playerBox = WeakAVAudioPlayerBox(player: capturedPlayer)
         Task { @MainActor in
             guard let self = owner.player else { return }
+            guard !self.isStoppedForTermination else { return }
             guard self.isImmersivePlaybackEnabled else { return }
 
             guard let currentPlayer = playerBox.player,
@@ -1156,7 +1365,8 @@ final class AudioPlayer: NSObject, ObservableObject {
     private func analyzeBoundsForCurrentTrack() {
         immersiveAnalysisTask?.cancel()
         immersiveAnalysisTask = nil
-        guard isImmersivePlaybackEnabled,
+        guard !isStoppedForTermination,
+              isImmersivePlaybackEnabled,
               let url = currentFile?.url,
               let capturedPlayer = player
         else { return }
@@ -1201,7 +1411,8 @@ final class AudioPlayer: NSObject, ObservableObject {
     private func scheduleImmersiveEndIfNeeded() {
         immersiveEndTask?.cancel()
         immersiveEndTask = nil
-        guard isImmersivePlaybackEnabled,
+        guard !isStoppedForTermination,
+              isImmersivePlaybackEnabled,
               isPlaying,
               completedLoadGeneration != activePlayerGeneration,
               let bounds = activePlaybackBounds,
@@ -1337,9 +1548,20 @@ final class AudioPlayer: NSObject, ObservableObject {
         )
     }
 
-    func play(_ file: AudioFile, persist: Bool = true, bypassConfirm: Bool = false) {
+    func play(
+        _ file: AudioFile,
+        persist: Bool = true,
+        bypassConfirm: Bool = false,
+        accessLease: (any AudioPlaybackAccessLease)? = nil
+    ) {
         // 兼容旧签名：默认自动开始播放
-        play(file, autostart: true, persist: persist, bypassConfirm: bypassConfirm)
+        play(
+            file,
+            autostart: true,
+            persist: persist,
+            bypassConfirm: bypassConfirm,
+            accessLease: accessLease
+        )
     }
 
     /// Handles an explicit track selection without restarting the same request.
@@ -1348,10 +1570,22 @@ final class AudioPlayer: NSObject, ObservableObject {
     func selectOrResume(
         _ file: AudioFile,
         persist: Bool = true,
-        bypassConfirm: Bool = false
+        bypassConfirm: Bool = false,
+        accessLease: (any AudioPlaybackAccessLease)? = nil
     ) {
+        guard !isStoppedForTermination else {
+            accessLease?.releasePlaybackAccess()
+            return
+        }
+        let accessLease = acceptedPlaybackAccessLease(accessLease, for: file.url)
         if pendingPlaybackURL == file.url,
            pendingPlaybackPersistsState == persist {
+            if let accessLease, let generation = pendingLoadGeneration {
+                replacePendingPlaybackAccessLease(
+                    with: accessLease,
+                    generation: generation
+                )
+            }
             if !isPlaybackRequested {
                 resume(bypassConfirm: bypassConfirm)
             }
@@ -1359,6 +1593,9 @@ final class AudioPlayer: NSObject, ObservableObject {
         }
 
         if currentFile?.url == file.url {
+            if let accessLease {
+                replaceInstalledPlaybackAccessLease(with: accessLease)
+            }
             let wasAwaitingTerminalCallback = isPlaying && player?.isPlaying == false
             let cancelledDifferentSelection = cancelPendingLoadPreservingCurrentPlayer()
             if persistPlaybackState != persist {
@@ -1382,16 +1619,39 @@ final class AudioPlayer: NSObject, ObservableObject {
             return
         }
 
-        play(file, persist: persist, bypassConfirm: bypassConfirm)
+        play(
+            file,
+            persist: persist,
+            bypassConfirm: bypassConfirm,
+            accessLease: accessLease
+        )
     }
 
     /// 加载并可选是否自动开始播放
-    func play(_ file: AudioFile, autostart: Bool, persist: Bool = true, bypassConfirm: Bool = false) {
+    func play(
+        _ file: AudioFile,
+        autostart: Bool,
+        persist: Bool = true,
+        bypassConfirm: Bool = false,
+        accessLease: (any AudioPlaybackAccessLease)? = nil
+    ) {
+        guard !isStoppedForTermination else {
+            accessLease?.releasePlaybackAccess()
+            return
+        }
+        let accessLease = acceptedPlaybackAccessLease(accessLease, for: file.url)
         // 若当前为扬声器且来自“耳机→扬声器”的切换，仅对用户显式开始播放做一次确认
         if !bypassConfirm, !isHeadphoneOutput, shouldConfirmSpeakerPlayback {
+            let leaseTransfer = AudioPlaybackAccessLeaseTransfer(accessLease)
             requestSpeakerConfirm { [weak self] in
                 self?.shouldConfirmSpeakerPlayback = false
-                self?.play(file, autostart: autostart, persist: persist, bypassConfirm: true)
+                self?.play(
+                    file,
+                    autostart: autostart,
+                    persist: persist,
+                    bypassConfirm: true,
+                    accessLease: leaseTransfer.take()
+                )
             }
             return
         }
@@ -1401,11 +1661,7 @@ final class AudioPlayer: NSObject, ObservableObject {
         deferredTerminalReplayFallbackTask = nil
         cancelUnexpectedStopReconciliation()
         _ = bumpPlaybackAnalysisGeneration()
-        pendingLoadTask?.cancel()
-        pendingLoadTask = nil
-        pendingLoadGeneration = nil
-        pendingPlaybackURL = nil
-        pendingPlaybackPersistsState = nil
+        cancelPendingLoadAndReleaseAccessLease()
         invalidateResumeRequest()
         setPlaybackIntent(autostart)
         immersiveAnalysisTask?.cancel()
@@ -1434,10 +1690,18 @@ final class AudioPlayer: NSObject, ObservableObject {
             && requireVolumeAnalysisBeforePlayback
             && !hasVolumeNormalizationCache(for: url)
         let preloadedEntry = preloadedEntryIfMatching(url: url)
+        let leaseProvider = playbackAccessLeaseProvider
+        let automaticAccessRequest = accessLease == nil
+            ? leaseProvider?.playbackAccessRequest(for: file)
+            : nil
         let hasRequiredImmersiveBounds = !isImmersivePlaybackEnabled || preloadedEntry?.playbackBounds != nil
+        let hasRequiredPlaybackAccess = automaticAccessRequest == nil
+            || accessLease != nil
+            || preloadedEntry?.accessLease != nil
         if autostart,
            !needsBlockingAnalysis,
            hasRequiredImmersiveBounds,
+           hasRequiredPlaybackAccess,
            let entry = consumePreloadedEntryIfMatching(url: url) {
             // 到这里说明下一首已就绪：直接切换并开播（避免再走异步初始化）
             let previousPlayer = self.retireCurrentPlayerForReplacement()
@@ -1450,6 +1714,13 @@ final class AudioPlayer: NSObject, ObservableObject {
             prepared.rate = self.clampPlaybackRate(self.playbackRate)
             self.persistPlaybackState = persist
             self.currentFile = file
+            if let accessLease, let preloadedLease = entry.accessLease,
+               (accessLease as AnyObject) !== (preloadedLease as AnyObject) {
+                preloadedLease.releasePlaybackAccess()
+            }
+            self.replaceInstalledPlaybackAccessLease(
+                with: accessLease ?? entry.accessLease
+            )
             self.playbackClock.duration = prepared.duration
             self.lastSavedTime = 0
             self.applyLoadedPlaybackBounds(entry.playbackBounds, to: prepared, url: url)
@@ -1498,8 +1769,61 @@ final class AudioPlayer: NSObject, ObservableObject {
         pendingPlaybackURL = url
         pendingPlaybackPersistsState = persist
         pendingLoadGeneration = generation
+        pendingPlaybackAccessLease = accessLease
+        pendingPlaybackAccessLeaseGeneration = accessLease == nil ? nil : generation
         pendingLoadTask = Task { [weak self] in
             guard let self = self else { return }
+            let preparedEntry = self.consumePreloadedEntryIfMatching(url: url)
+            if let preloadedLease = preparedEntry?.accessLease {
+                if accessLease == nil {
+                    let adopted = await MainActor.run { () -> Bool in
+                        guard generation == self.loadGeneration,
+                              self.pendingLoadGeneration == generation else { return false }
+                        self.replacePendingPlaybackAccessLease(
+                            with: preloadedLease,
+                            generation: generation
+                        )
+                        return true
+                    }
+                    if !adopted {
+                        preloadedLease.releasePlaybackAccess()
+                        return
+                    }
+                } else if (preloadedLease as AnyObject) !== (accessLease as AnyObject) {
+                    preloadedLease.releasePlaybackAccess()
+                }
+            } else if let automaticAccessRequest, let leaseProvider {
+                do {
+                    let acquiredLease = try await leaseProvider.acquirePlaybackAccessLease(
+                        for: automaticAccessRequest
+                    )
+                    let adopted = await MainActor.run { () -> Bool in
+                        guard generation == self.loadGeneration,
+                              self.pendingLoadGeneration == generation else { return false }
+                        self.replacePendingPlaybackAccessLease(
+                            with: acquiredLease,
+                            generation: generation
+                        )
+                        return true
+                    }
+                    if !adopted {
+                        acquiredLease.releasePlaybackAccess()
+                        return
+                    }
+                } catch {
+                    await MainActor.run {
+                        guard generation == self.loadGeneration else { return }
+                        self.finishPendingLoadFailure(ifCurrent: generation)
+                        self.postPlaybackFailure(
+                            url: url,
+                            message: "音乐位置当前不可用：\(url.lastPathComponent)",
+                            persist: persist
+                        )
+                        self.setPlaybackIntent(false)
+                    }
+                    return
+                }
+            }
             if let reason = AudioFileSniffer.nonAudioReasonIfClearlyText(at: url) {
                 await MainActor.run {
                     guard generation == self.loadGeneration else { return }
@@ -1518,7 +1842,7 @@ final class AudioPlayer: NSObject, ObservableObject {
             do {
                 let newPlayer: AVAudioPlayer
                 var preloadedBounds: PlaybackBounds?
-                if let entry = self.consumePreloadedEntryIfMatching(url: url) {
+                if let entry = preparedEntry {
                     let prepared = entry.player
                     preloadedBounds = entry.playbackBounds
                     prepared.numberOfLoops = 0
@@ -1589,7 +1913,7 @@ final class AudioPlayer: NSObject, ObservableObject {
 
                 await MainActor.run {
                     guard generation == self.loadGeneration else { return }
-                    self.clearPendingLoadTask(ifCurrent: generation)
+                    let accessLease = self.clearPendingLoadTask(ifCurrent: generation)
                     // 到这里说明新曲目可被 AVAudioPlayer 正常初始化，才切换并停止旧播放器
                     let previousPlayer = self.retireCurrentPlayerForReplacement()
                     self.player = newPlayer
@@ -1600,6 +1924,7 @@ final class AudioPlayer: NSObject, ObservableObject {
                     newPlayer.rate = self.clampPlaybackRate(self.playbackRate)
                     self.persistPlaybackState = persist
                     self.currentFile = file
+                    self.replaceInstalledPlaybackAccessLease(with: accessLease)
                     self.playbackClock.duration = newPlayer.duration
                     self.lastSavedTime = 0
                     let lateBounds: PlaybackBounds?
@@ -1812,8 +2137,72 @@ final class AudioPlayer: NSObject, ObservableObject {
         stopTimer()
         saveCurrentProgress() // 暂停时保存进度
     }
+
+    /// Publishes a terminal playback fence and synchronously initiates every
+    /// cancellation owned by the player. The method never waits for decoder or
+    /// persistence work; generation checks prevent cancelled work from installing
+    /// a player or restarting playback after this call returns.
+    func stopForTermination(generation: UInt64) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        if let stoppedGeneration = terminationStopGeneration,
+           generation <= stoppedGeneration {
+            return
+        }
+        terminationStopGeneration = generation
+
+        deferredTerminalReplay = nil
+        deferredTerminalReplayFallbackTask?.cancel()
+        deferredTerminalReplayFallbackTask = nil
+        cancelUnexpectedStopReconciliation()
+        setPlaybackIntent(false)
+        invalidateResumeRequest()
+
+        // Invalidate before cancellation so any completion already queued on the
+        // main actor observes a stale generation and cannot commit a late load.
+        _ = nextLoadGeneration()
+        cancelPendingLoadAndReleaseAccessLease()
+        pendingSeekRequest = nil
+        pendingLateImmersiveBounds = nil
+
+        cancelNextPreload()
+        immersiveAnalysisTask?.cancel()
+        immersiveAnalysisTask = nil
+        immersiveEndTask?.cancel()
+        immersiveEndTask = nil
+        lyricsLoadTask?.cancel()
+        lyricsLoadTask = nil
+        artworkLoadTask?.cancel()
+        artworkLoadTask = nil
+        volumeRampTask?.cancel()
+        volumeRampTask = nil
+        _ = bumpPlaybackAnalysisGeneration()
+
+        _ = bumpVolumePreanalysisGeneration()
+        volumePreanalysisTask?.cancel()
+        volumePreanalysisTask = nil
+        volumePreanalysisStartReason = .manual
+        isVolumePreanalysisRunning = false
+        volumePreanalysisCurrentFileName = ""
+
+        speakerConfirmProceed = nil
+        showSpeakerConfirm = false
+        shouldAutoResumeAfterRoute = false
+        wasPlayingBeforeInterruption = false
+        playbackFinishedHandler = nil
+        playbackFailedHandler = nil
+        playbackLoadedHandler = nil
+
+        player?.pause()
+        player?.delegate = nil
+        if let installedTime = player?.currentTime, installedTime.isFinite {
+            playbackClock.currentTime = max(0, installedTime)
+        }
+        isPlaying = false
+        stopTimer()
+    }
     
     func resume(bypassConfirm: Bool = false) {
+        guard !isStoppedForTermination else { return }
         guard deferredTerminalReplay == nil else { return }
         guard pendingLoadGeneration != nil || player != nil else { return }
         // 若当前为扬声器且来自“耳机→扬声器”的切换，仅对用户显式开始播放做一次确认
@@ -1899,6 +2288,7 @@ final class AudioPlayer: NSObject, ObservableObject {
 
     /// 切换播放/暂停（用于快捷键/菜单）
     func togglePlayPause() {
+        guard !isStoppedForTermination else { return }
         if isPlaybackRequested || isPlaying {
             pause()
         } else if canTogglePlayback {
@@ -1907,6 +2297,7 @@ final class AudioPlayer: NSObject, ObservableObject {
     }
     
     private func requestSpeakerConfirm(proceed: @escaping () -> Void) {
+        guard !isStoppedForTermination else { return }
         speakerConfirmProceed = proceed
         showSpeakerConfirm = true
     }
@@ -1920,8 +2311,46 @@ final class AudioPlayer: NSObject, ObservableObject {
         // Keep legacy cache fully cleared as well (even if UI no longer uses it).
         ArtworkCache.shared.clear()
     }
+
+    /// Releases every AVAudioPlayer and security-scope lease touching a volume
+    /// before unmount. Persisted queue/session identity remains authoritative;
+    /// reconnect only restores availability and never auto-starts playback.
+    @discardableResult
+    func detachPlaybackResourceForUnmount(volumeURL: URL) -> Bool {
+        guard !isStoppedForTermination else { return false }
+        preloadLock.lock()
+        let preloadURLs = [
+            preloadTargetURL,
+            preloadedNext?.url,
+            preloadedNext?.accessLease?.url
+        ].compactMap { $0 }
+        preloadLock.unlock()
+        let preloadIsAffected = preloadURLs.contains {
+            Self.isPlaybackResourceURL($0, containedIn: volumeURL)
+        }
+        if preloadIsAffected {
+            cancelNextPreload()
+        }
+
+        let activeURLs = [
+            playbackTargetURL,
+            currentFile?.url,
+            pendingPlaybackAccessLease?.url,
+            installedPlaybackAccessLease?.url
+        ].compactMap { $0 }
+        let activeIsAffected = activeURLs.contains {
+            Self.isPlaybackResourceURL($0, containedIn: volumeURL)
+        }
+        guard activeIsAffected else { return false }
+
+        shouldAutoResumeAfterRoute = false
+        saveCurrentProgress()
+        stopAndClearCurrent(clearLastPlayed: false)
+        return true
+    }
     
 	    func stop() {
+	        guard !isStoppedForTermination else { return }
 	        deferredTerminalReplay = nil
 	        deferredTerminalReplayFallbackTask?.cancel()
 	        deferredTerminalReplayFallbackTask = nil
@@ -1929,11 +2358,7 @@ final class AudioPlayer: NSObject, ObservableObject {
 	        _ = bumpPlaybackAnalysisGeneration()
 	        setPlaybackIntent(false)
 	        invalidateResumeRequest()
-	        pendingLoadTask?.cancel()
-	        pendingLoadTask = nil
-	        pendingLoadGeneration = nil
-	        pendingPlaybackURL = nil
-	        pendingPlaybackPersistsState = nil
+	        cancelPendingLoadAndReleaseAccessLease()
 	        pendingSeekRequest = nil
 	        immersiveAnalysisTask?.cancel()
 	        immersiveAnalysisTask = nil
@@ -1954,6 +2379,7 @@ final class AudioPlayer: NSObject, ObservableObject {
     
     /// 停止并清空当前曲目信息（用于“清空播放列表”等需要完全复位的场景）
 	    func stopAndClearCurrent(clearLastPlayed: Bool = true) {
+	        guard !isStoppedForTermination else { return }
 	        deferredTerminalReplay = nil
 	        deferredTerminalReplayFallbackTask?.cancel()
 	        deferredTerminalReplayFallbackTask = nil
@@ -1961,11 +2387,7 @@ final class AudioPlayer: NSObject, ObservableObject {
 	        _ = bumpPlaybackAnalysisGeneration()
 	        setPlaybackIntent(false)
 	        invalidateResumeRequest()
-	        pendingLoadTask?.cancel()
-	        pendingLoadTask = nil
-	        pendingLoadGeneration = nil
-	        pendingPlaybackURL = nil
-	        pendingPlaybackPersistsState = nil
+	        cancelPendingLoadAndReleaseAccessLease()
 	        pendingSeekRequest = nil
 	        immersiveAnalysisTask?.cancel()
 	        immersiveAnalysisTask = nil
@@ -1984,6 +2406,7 @@ final class AudioPlayer: NSObject, ObservableObject {
 	        stopTimer()
         // 释放播放器实例，避免后续误用
         player = nil
+        replaceInstalledPlaybackAccessLease(with: nil)
         // 清空与当前曲目相关的状态
 	        currentFile = nil
 	        activePlaybackBounds = nil
@@ -2002,6 +2425,7 @@ final class AudioPlayer: NSObject, ObservableObject {
     }
     
     func seek(to time: TimeInterval) {
+        guard !isStoppedForTermination else { return }
         let requestedTime = time.isFinite ? max(0, time) : 0
 
         // While a replacement is loading, the installed player and its bounds still
@@ -2049,6 +2473,7 @@ final class AudioPlayer: NSObject, ObservableObject {
 
     /// 重新载入当前曲目的底层播放器，尽量保留播放/进度状态（用于完全刷新、外部文件被覆盖的情况）
 	    func reloadCurrentPreservingState() {
+	        guard !isStoppedForTermination else { return }
 	        guard let file = currentFile else { return }
 	        guard pendingPlaybackURL == nil || pendingPlaybackURL == file.url else { return }
 	        deferredTerminalReplay = nil
@@ -2059,11 +2484,7 @@ final class AudioPlayer: NSObject, ObservableObject {
 	        let immersiveEnabled = isImmersivePlaybackEnabled
 	        let url = file.url
 
-        pendingLoadTask?.cancel()
-        pendingLoadTask = nil
-        pendingLoadGeneration = nil
-        pendingPlaybackURL = nil
-        pendingPlaybackPersistsState = nil
+        cancelPendingLoadAndReleaseAccessLease()
         invalidateResumeRequest()
 	        let generation = nextLoadGeneration()
         pendingPlaybackURL = url
@@ -2247,6 +2668,18 @@ final class AudioPlayer: NSObject, ObservableObject {
 
     var playbackRequestGeneration: UInt64 { loadGeneration }
 
+    /// Captures the installed AVAudioPlayer directly instead of relying on the
+    /// periodically published playback clock. Callers use this on MainActor while
+    /// preparing the final session snapshot.
+    @MainActor
+    func captureInstalledPlaybackTime() -> TimeInterval {
+        if let installedTime = player?.currentTime, installedTime.isFinite {
+            return max(0, installedTime)
+        }
+        let fallback = playbackClock.currentTime
+        return fallback.isFinite ? max(0, fallback) : 0
+    }
+
     func toggleImmersivePlayback() {
         setImmersivePlaybackEnabled(!isImmersivePlaybackEnabled)
     }
@@ -2255,18 +2688,19 @@ final class AudioPlayer: NSObject, ObservableObject {
         guard enabled != isImmersivePlaybackEnabled else { return }
         isImmersivePlaybackEnabled = enabled
         saveImmersivePlaybackPreference()
+        let effectiveEnabled = isImmersivePlaybackEnabled
         completedLoadGeneration = nil
         immersiveEndTask?.cancel()
         immersiveEndTask = nil
         immersiveAnalysisTask?.cancel()
         immersiveAnalysisTask = nil
         cancelNextPreload()
-        if enabled, let player, player.duration.isFinite, player.duration > 0 {
+        if effectiveEnabled, let player, player.duration.isFinite, player.duration > 0 {
             activePlaybackBounds = .fullRange(duration: player.duration)
         }
         updateLoopSetting()
 
-        if enabled {
+        if effectiveEnabled {
             scheduleImmersiveEndIfNeeded()
             analyzeBoundsForCurrentTrack()
         } else {
@@ -2335,6 +2769,7 @@ final class AudioPlayer: NSObject, ObservableObject {
     }
     
     private func startTimer() {
+        guard !isStoppedForTermination else { return }
         // 确保只存在一个计时器，并使用 .common 模式防止 UI 交互导致暂停
         cancelUnexpectedStopReconciliation()
         stopTimer()
@@ -2391,13 +2826,14 @@ final class AudioPlayer: NSObject, ObservableObject {
     ///   - removedURL: 被删除曲目的 URL
     ///   - remainingFiles: 删除后当前播放列表剩余的文件（用于随机/顺序继续播放）
     ///   - playNext: 可选的“获取下一首”的闭包（若上层有顺序管理器可传入），未提供时将不处理顺序下一首
-    func handleRemovedTrack(
+	    func handleRemovedTrack(
         _ removedURL: URL,
         remainingFiles: [AudioFile],
         playNext: (() -> AudioFile?)? = nil,
         playRandom: (() -> AudioFile?)? = nil,
         restoreInstalledSelection: (() -> Void)? = nil
     ) {
+        guard !isStoppedForTermination else { return }
         let removesPendingTarget = pendingPlaybackURL == removedURL
         let removesInstalledTrack = currentFile?.url == removedURL
         guard removesPendingTarget || removesInstalledTrack else { return }
@@ -2433,6 +2869,7 @@ final class AudioPlayer: NSObject, ObservableObject {
             removedPlayer?.delegate = nil
             removedPlayer?.stop()
             player = nil
+            replaceInstalledPlaybackAccessLease(with: nil)
             currentFile = nil
             activePlaybackBounds = nil
             completedLoadGeneration = nil
@@ -2533,8 +2970,22 @@ final class AudioPlayer: NSObject, ObservableObject {
 	            debugLog("文件不存在: \(state.filePath)")
 	        }
 	    }
+
+    func loadPlaybackSession(fileURL: URL, time: TimeInterval) {
+        guard fileURL.isFileURL,
+              FileManager.default.fileExists(atPath: fileURL.path) else { return }
+        let safeTime = time.isFinite ? max(0, time) : 0
+        NotificationCenter.default.post(
+            name: .loadLastPlayedFile,
+            object: nil,
+            userInfo: ["url": fileURL, "time": safeTime]
+        )
+    }
     // MARK: - 歌词加载
     private func loadLyricsIfNeeded(for file: AudioFile) {
+        guard !isStoppedForTermination else { return }
+        lyricsLoadTask?.cancel()
+        lyricsLoadTask = nil
         // 优先使用 AudioFile 自带缓存
         if let cached = file.lyricsTimeline {
             if self.currentFile?.url == file.url {
@@ -2543,9 +2994,12 @@ final class AudioPlayer: NSObject, ObservableObject {
             return
         }
         let url = file.url
-        Task {
+        lyricsLoadTask = Task { [weak self] in
+            guard let self else { return }
             let result = await LyricsService.shared.loadLyrics(for: url)
+            guard !Task.isCancelled else { return }
             await MainActor.run {
+                guard !self.isStoppedForTermination else { return }
                 // 仅当当前仍为该文件时才回写 UI，避免“切歌后歌词串台/被清空”
                 guard self.currentFile?.url == url else { return }
                 switch result {
@@ -2564,6 +3018,7 @@ final class AudioPlayer: NSObject, ObservableObject {
 
     // MARK: - Artwork loading（低内存：只生成缩略图，不保留原始 Data / 不做跨曲目缓存）
     private func loadArtworkIfNeeded(for url: URL) {
+        guard !isStoppedForTermination else { return }
         guard let current = currentFile, current.url == url else { return }
 
         let key = url.path
@@ -2583,6 +3038,7 @@ final class AudioPlayer: NSObject, ObservableObject {
             if Task.isCancelled { return }
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                guard !self.isStoppedForTermination else { return }
                 guard self.currentFile?.url == url else { return }
                 self.artworkImage = NSImage(cgImage: cgImage, size: NSSize(width: 300, height: 300))
             }
@@ -2641,6 +3097,7 @@ extension AudioPlayer: AVAudioPlayerDelegate {
 
     private func handlePlayerFinishedOnMain(_ player: AVAudioPlayer, successfully flag: Bool) {
         dispatchPrecondition(condition: .onQueue(.main))
+        guard !isStoppedForTermination else { return }
         // 仅处理来自“当前”播放器实例的回调，忽略已被切换掉的旧实例，避免误将新歌置为暂停
         guard player === self.player else { return }
         cancelUnexpectedStopReconciliation()
@@ -2754,6 +3211,7 @@ extension AudioPlayer: AVAudioPlayerDelegate {
 
     private func handleDecodeErrorOnMain(_ player: AVAudioPlayer, error: Error?) {
         dispatchPrecondition(condition: .onQueue(.main))
+        guard !isStoppedForTermination else { return }
         guard player === self.player else { return }
         let generation = activePlayerGeneration
         if consumeDeferredTerminalReplayIfNeeded(
@@ -2882,6 +3340,7 @@ extension AudioPlayer {
 	    
 	    /// 应用音量均衡（异步）
 	    private func applyVolumeNormalization(for url: URL, mode: VolumeApplyMode = .immediate, allowBackgroundAnalysis: Bool = true) {
+            guard !isStoppedForTermination else { return }
             let fileKey = volumeCacheKey(for: url)
 
             // 先立即/平滑应用当前可得的结果（有缓存则命中，否则保持用户音量）
@@ -3103,6 +3562,7 @@ extension AudioPlayer {
         urls: URLs,
         reason: VolumePreanalysisStartReason = .manual
     ) where URLs.Element == URL {
+        guard !isStoppedForTermination else { return }
         let generation = bumpVolumePreanalysisGeneration()
         volumePreanalysisStartReason = reason
         volumePreanalysisTask?.cancel()
@@ -3251,19 +3711,17 @@ extension AudioPlayer {
 
     /// 加载用户的播放控制开关
     private func loadUserPlaybackSwitches() {
-        let d = UserDefaults.standard
-        if d.object(forKey: userNormalizationKey) != nil {
-            isNormalizationEnabled = d.bool(forKey: userNormalizationKey)
-        }
-        if d.object(forKey: userImmersivePlaybackEnabledKey) != nil {
-            isImmersivePlaybackEnabled = d.bool(forKey: userImmersivePlaybackEnabledKey)
-        }
+        let preferences = appPreferencesStore.load()
+        isNormalizationEnabled = preferences.normalizationEnabled
+        isImmersivePlaybackEnabled = preferences.immersiveEnabled
         updateLoopSetting()
     }
 
     private func saveNormalizationPreference() {
-        let d = UserDefaults.standard
-        d.set(isNormalizationEnabled, forKey: userNormalizationKey)
+        persistUserPreference(
+            update: { $0.normalizationEnabled = isNormalizationEnabled },
+            restore: { isNormalizationEnabled = $0.normalizationEnabled }
+        )
     }
 
     private func savePlaybackModePreference() {
@@ -3288,6 +3746,31 @@ extension AudioPlayer {
         )
     }
 
+    /// Keeps every player-owned preference inside the injected coherent
+    /// envelope. Continuous controls are debounced; switches cross a write
+    /// boundary immediately. Protected envelopes restore the durable value.
+    private func persistUserPreference(
+        deferred: Bool = false,
+        update: (inout AppPreferencesStore.Preferences) -> Void,
+        restore: (AppPreferencesStore.Preferences) -> Void
+    ) {
+        guard shouldPersistUserPreferences else { return }
+        guard appPreferencesStore.persistenceState == .writable else {
+            restore(appPreferencesStore.load())
+            notifyProtectedCoherentPreferencesIfNeeded()
+            return
+        }
+
+        _ = appPreferencesStore.update(update)
+        if deferred {
+            appPreferencesStore.schedulePersistence()
+            return
+        }
+        if case .failure(let error) = appPreferencesStore.persist() {
+            PersistenceLogger.log("保存播放器偏好失败：\(String(describing: error))")
+        }
+    }
+
     @discardableResult
     func flushUserPreferencesPersistence() -> Result<Void, AppPreferencesStore.PersistenceError> {
         guard shouldPersistUserPreferences else { return .success(()) }
@@ -3295,33 +3778,31 @@ extension AudioPlayer {
     }
 
     private func saveImmersivePlaybackPreference() {
-        UserDefaults.standard.set(
-            isImmersivePlaybackEnabled,
-            forKey: userImmersivePlaybackEnabledKey
+        persistUserPreference(
+            update: { $0.immersiveEnabled = isImmersivePlaybackEnabled },
+            restore: { isImmersivePlaybackEnabled = $0.immersiveEnabled }
         )
     }
 
     // MARK: - 通知开关持久化
     private func loadNotifyOnDeviceSwitchPreference() {
-        let d = UserDefaults.standard
-        if d.object(forKey: userNotifyOnDeviceSwitchKey) != nil {
-            notifyOnDeviceSwitch = d.bool(forKey: userNotifyOnDeviceSwitchKey)
-        }
+        notifyOnDeviceSwitch = appPreferencesStore.load().notifyOnDeviceSwitch
     }
     func saveNotifyOnDeviceSwitchPreference() {
-        let d = UserDefaults.standard
-        d.set(notifyOnDeviceSwitch, forKey: userNotifyOnDeviceSwitchKey)
+        persistUserPreference(
+            update: { $0.notifyOnDeviceSwitch = notifyOnDeviceSwitch },
+            restore: { notifyOnDeviceSwitch = $0.notifyOnDeviceSwitch }
+        )
     }
 
     private func loadNotifyDeviceSwitchSilentPreference() {
-        let d = UserDefaults.standard
-        if d.object(forKey: userNotifyDeviceSwitchSilentKey) != nil {
-            notifyDeviceSwitchSilent = d.bool(forKey: userNotifyDeviceSwitchSilentKey)
-        }
+        notifyDeviceSwitchSilent = appPreferencesStore.load().notifyDeviceSwitchSilent
     }
     func saveNotifyDeviceSwitchSilentPreference() {
-        let d = UserDefaults.standard
-        d.set(notifyDeviceSwitchSilent, forKey: userNotifyDeviceSwitchSilentKey)
+        persistUserPreference(
+            update: { $0.notifyDeviceSwitchSilent = notifyDeviceSwitchSilent },
+            restore: { notifyDeviceSwitchSilent = $0.notifyDeviceSwitchSilent }
+        )
     }
 
 }

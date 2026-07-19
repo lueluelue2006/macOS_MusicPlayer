@@ -5,6 +5,50 @@ final class M3U8CodecTests: XCTestCase {
 
     // MARK: - Export Tests
 
+    func testExportPlanUsesResolvedPathsAndExplicitOfflineFallbacks() throws {
+        let online = UserPlaylist.Track(path: "/Volumes/Old/online.mp3")
+        let offline = UserPlaylist.Track(path: "/Volumes/Old/offline.mp3")
+        let playlist = UserPlaylist(name: "External", tracks: [online, offline])
+
+        let plan = try XCTUnwrap(PlaylistM3U8ExportPlanner.make(
+            playlist: playlist,
+            resolvedTracks: [
+                .init(
+                    url: URL(fileURLWithPath: "/Volumes/Current/online.mp3"),
+                    offlineReason: nil
+                ),
+                .init(
+                    url: URL(fileURLWithPath: "/Volumes/Unavailable/offline.mp3"),
+                    offlineReason: "磁盘离线"
+                )
+            ]
+        ))
+
+        XCTAssertEqual(plan.playlistName, "External")
+        XCTAssertEqual(plan.trackPaths, [
+            "/Volumes/Current/online.mp3",
+            "/Volumes/Old/offline.mp3"
+        ])
+        XCTAssertEqual(plan.offlineFallbackCount, 1)
+    }
+
+    func testExportPlanRejectsPartialResolution() {
+        let playlist = UserPlaylist(
+            name: "Incomplete",
+            tracks: [
+                UserPlaylist.Track(path: "/Music/one.mp3"),
+                UserPlaylist.Track(path: "/Music/two.mp3")
+            ]
+        )
+
+        XCTAssertNil(PlaylistM3U8ExportPlanner.make(
+            playlist: playlist,
+            resolvedTracks: [
+                .init(url: URL(fileURLWithPath: "/Music/one.mp3"), offlineReason: nil)
+            ]
+        ))
+    }
+
     func testExportEmptyPlaylist() throws {
         let playlist = UserPlaylist(name: "Empty", tracks: [])
         let m3u8 = try XCTUnwrap(M3U8Codec.export(playlist: playlist, baseURL: nil))

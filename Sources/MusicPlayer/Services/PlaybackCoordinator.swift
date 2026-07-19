@@ -1,6 +1,152 @@
 import Foundation
 import Combine
-import CoreGraphics
+
+protocol AutomaticVolumePreanalysisClient: Sendable {
+    func eligibleCandidates(in urls: [URL], limit: Int) async -> [URL]
+    func nextRetryDate() -> Date?
+    func runAutomaticPreanalysis(for url: URL) async throws
+    func cancelAutomaticPreanalysis()
+}
+
+final class AutomaticVolumePreanalysisSnapshot: @unchecked Sendable {
+    let audioFiles: [AudioFile]
+
+    init(audioFiles: [AudioFile]) {
+        // Array assignment keeps the publisher's copy-on-write storage. URL
+        // extraction happens later on a detached utility task.
+        self.audioFiles = audioFiles
+    }
+}
+
+enum AutomaticVolumePreanalysisCandidateBuilder {
+    static let maximumPageSize = 256
+    static let maximumCandidatesPerRound = 2
+
+    static func start(
+        snapshot: AutomaticVolumePreanalysisSnapshot,
+        client: AutomaticVolumePreanalysisClient,
+        pageSize requestedPageSize: Int = maximumPageSize,
+        candidateLimit requestedCandidateLimit: Int = maximumCandidatesPerRound
+    ) -> Task<[URL], Never> {
+        let pageSize = min(max(1, requestedPageSize), maximumPageSize)
+        let candidateLimit = min(
+            max(0, requestedCandidateLimit),
+            maximumCandidatesPerRound
+        )
+        return Task.detached(priority: .utility) {
+            guard candidateLimit > 0 else { return [] }
+            var candidates: [URL] = []
+            candidates.reserveCapacity(candidateLimit)
+            var candidateKeys = Set<String>()
+            candidateKeys.reserveCapacity(candidateLimit)
+
+            var startIndex = 0
+            while startIndex < snapshot.audioFiles.count {
+                guard !Task.isCancelled else { return [] }
+                let endIndex = min(startIndex + pageSize, snapshot.audioFiles.count)
+                let page = Array(
+                    snapshot.audioFiles[startIndex..<endIndex].lazy.map(\.url)
+                )
+                let remaining = candidateLimit - candidates.count
+                let eligible = await client.eligibleCandidates(in: page, limit: remaining)
+                for url in eligible {
+                    guard !Task.isCancelled else { return [] }
+                    let key = PathKey.canonical(for: url)
+                    guard candidateKeys.insert(key).inserted else { continue }
+                    candidates.append(url)
+                    if candidates.count == candidateLimit { return candidates }
+                }
+                startIndex = endIndex
+            }
+            return candidates
+        }
+    }
+}
+
+enum AutomaticVolumePreanalysisJobs {
+    static let deduplicationNamespace = "automatic-volume-preanalysis"
+
+    static func submit(
+        url: URL,
+        client: AutomaticVolumePreanalysisClient,
+        scheduler: BackgroundJobScheduler,
+        requirements: AutomaticJobRequirements = .backgroundAnalysis
+    ) async -> BackgroundJobSubmission {
+        await scheduler.submit(
+            lane: .audioDecode,
+            priority: .background,
+            mode: .automatic(requirements),
+            deduplicationKey: BackgroundJobDeduplicationKey(
+                namespace: deduplicationNamespace,
+                value: PathKey.canonical(for: url)
+            )
+        ) {
+            try await client.runAutomaticPreanalysis(for: url)
+        }
+    }
+}
+
+private final class AudioPlayerAutomaticVolumePreanalysisClient:
+    AutomaticVolumePreanalysisClient,
+    @unchecked Sendable
+{
+    private weak var audioPlayer: AudioPlayer?
+
+    init(audioPlayer: AudioPlayer) {
+        self.audioPlayer = audioPlayer
+    }
+
+    func eligibleCandidates(in urls: [URL], limit: Int) async -> [URL] {
+        guard let audioPlayer, limit > 0 else { return [] }
+        let validKeys = await audioPlayer.volumeNormalizationValidCacheKeysAsync(for: urls)
+        var result: [URL] = []
+        result.reserveCapacity(limit)
+        for url in urls {
+            guard !Task.isCancelled else { return [] }
+            guard !validKeys.contains(PathKey.canonical(for: url)) else { continue }
+            if audioPlayer.hasMissingVolumeNormalizationCache(in: CollectionOfOne(url)) {
+                result.append(url)
+                if result.count == limit { break }
+            }
+        }
+        return result
+    }
+
+    func nextRetryDate() -> Date? {
+        audioPlayer?.nextVolumeNormalizationRetryDate
+    }
+
+    func runAutomaticPreanalysis(for url: URL) async throws {
+        guard let audioPlayer else { throw CancellationError() }
+        let didStart = await MainActor.run { () -> Bool in
+            guard !audioPlayer.isVolumePreanalysisRunning else { return false }
+            audioPlayer.startVolumeNormalizationPreanalysis(
+                urls: CollectionOfOne(url),
+                reason: .autoIdle
+            )
+            return audioPlayer.isAutoIdleVolumePreanalysisActive
+        }
+        guard didStart else { return }
+
+        do {
+            while await MainActor.run(body: {
+                audioPlayer.isAutoIdleVolumePreanalysisActive
+            }) {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            try Task.checkCancellation()
+        } catch {
+            await MainActor.run {
+                audioPlayer.cancelVolumeNormalizationPreanalysisIfAutoIdle()
+            }
+            throw error
+        }
+    }
+
+    func cancelAutomaticPreanalysis() {
+        audioPlayer?.cancelVolumeNormalizationPreanalysisIfAutoIdle()
+    }
+}
 
 /// 常驻于应用生命周期内的协调器：
 /// - 负责在曲目播放完成后，自动切到下一首（不依赖任何视图是否在前台）
@@ -8,24 +154,49 @@ import CoreGraphics
 final class PlaybackCoordinator {
     private let audioPlayer: AudioPlayer
     private let playlistManager: PlaylistManager
+    private let playbackSessionStore: PlaybackSessionStore?
     private weak var playlistsStore: PlaylistsStore?
     private var cancellables: Set<AnyCancellable> = []
     private var idleVolumePreanalysisTask: Task<Void, Never>?
-    private var automaticAnalysisActivityMonitorTask: Task<Void, Never>?
-    private let idlePreanalysisDelaySeconds: TimeInterval = 60
+    private var automaticAnalysisResourceMonitorTask: Task<Void, Never>?
+    private let idlePreanalysisDelaySeconds: TimeInterval
+    private let backgroundJobScheduler: BackgroundJobScheduler
+    private let automaticVolumeClient: AutomaticVolumePreanalysisClient
+    private var automaticVolumeSnapshot = AutomaticVolumePreanalysisSnapshot(audioFiles: [])
+    private var automaticVolumeSnapshotGeneration: UInt64 = 0
+    private var automaticAnalysisGeneration: UInt64 = 0
+    private var automaticCandidateScanExhausted = false
+    private var automaticJobHandles: [UUID: BackgroundJobHandle] = [:]
+    private var automaticJobWaiters: [UUID: Task<Void, Never>] = [:]
     private var nextPreloadCandidatePathKey: String? = nil
     private var nextPreloadRetryCount = 0
     private var lastHandledCompletionEventID: UInt64?
     private var playlistRelocationTask: Task<Void, Never>?
+    private(set) var terminationStopGeneration: UInt64?
+    private var isStoppedForTermination: Bool {
+        terminationStopGeneration != nil
+    }
 
     init(
         audioPlayer: AudioPlayer,
         playlistManager: PlaylistManager,
-        playlistsStore: PlaylistsStore? = nil
+        playlistsStore: PlaylistsStore? = nil,
+        playbackSessionStore: PlaybackSessionStore? = nil,
+        backgroundJobScheduler: BackgroundJobScheduler = .shared,
+        idlePreanalysisDelaySeconds: TimeInterval = 60
     ) {
         self.audioPlayer = audioPlayer
         self.playlistManager = playlistManager
         self.playlistsStore = playlistsStore
+        self.playbackSessionStore = playbackSessionStore
+        self.backgroundJobScheduler = backgroundJobScheduler
+        automaticVolumeClient = AudioPlayerAutomaticVolumePreanalysisClient(
+            audioPlayer: audioPlayer
+        )
+        self.idlePreanalysisDelaySeconds = max(0.01, idlePreanalysisDelaySeconds)
+        SystemResourceActivityState.shared.recordApplicationInteraction(
+            at: audioPlayer.lastUserInteractionAt
+        )
         audioPlayer.playbackFinishedHandler = { [weak self] generation, eventID, url, persist in
             self?.handlePlaybackFinished(
                 generation: generation,
@@ -51,12 +222,39 @@ final class PlaybackCoordinator {
         observeNextTrackPreloading()
     }
 
+    /// Disconnects every event source first, then publishes cancellation to all
+    /// background work owned by this coordinator. Cancellation of scheduler jobs
+    /// is fire-and-forget because the termination hook must never await an actor.
+    func stopForTermination(generation: UInt64) {
+        if let stoppedGeneration = terminationStopGeneration,
+           generation <= stoppedGeneration {
+            return
+        }
+        terminationStopGeneration = generation
+
+        audioPlayer.playbackFinishedHandler = nil
+        audioPlayer.playbackFailedHandler = nil
+        audioPlayer.playbackLoadedHandler = nil
+        for cancellable in cancellables {
+            cancellable.cancel()
+        }
+        cancellables.removeAll(keepingCapacity: false)
+
+        playlistRelocationTask?.cancel()
+        playlistRelocationTask = nil
+        cancelAutomaticVolumeAnalysisWork()
+        invalidateNextPreload()
+        automaticVolumeSnapshot = AutomaticVolumePreanalysisSnapshot(audioFiles: [])
+        automaticVolumeSnapshotGeneration &+= 1
+        automaticCandidateScanExhausted = true
+    }
+
     private func observeNotifications() {
         // 首次添加歌曲 → 自动开始播放
         NotificationCenter.default.publisher(for: .playlistDidAddFirstFiles)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                guard let self = self else { return }
+                guard let self = self, !self.isStoppedForTermination else { return }
                 if self.audioPlayer.isShuffling {
                     if let randomFile = self.playlistManager.getRandomFile() {
                         self.audioPlayer.play(randomFile)
@@ -72,6 +270,7 @@ final class PlaybackCoordinator {
 
     @MainActor
     private func handlePlaybackFailed(url: URL, message: String, persist: Bool) {
+        guard !isStoppedForTermination else { return }
         guard persist else { return }
         let raw = message.trimmingCharacters(in: .whitespacesAndNewlines)
         let reason = raw
@@ -83,8 +282,18 @@ final class PlaybackCoordinator {
 
     @MainActor
     private func handlePlaybackLoaded(url: URL, persist: Bool) {
+        guard !isStoppedForTermination else { return }
         if persist {
             playlistManager.clearUnplayable(url)
+            if let playbackSessionStore {
+                _ = playbackSessionStore.mergeInstalledTrack(
+                    playlistManager.playbackSessionTrackIdentity(for: url)
+                )
+                let milliseconds = Self.positionMilliseconds(
+                    audioPlayer.playbackClock.currentTime
+                )
+                _ = playbackSessionStore.mergePosition(milliseconds: milliseconds)
+            }
         }
         // A successful install starts a fresh playback cycle even when the URL is
         // unchanged (for example, a one-track queue). Reset the bounded retry state
@@ -99,6 +308,7 @@ final class PlaybackCoordinator {
         persist: Bool
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
+        guard !isStoppedForTermination else { return }
         guard generation == audioPlayer.playbackRequestGeneration else { return }
         guard completionEventID != lastHandledCompletionEventID else { return }
         lastHandledCompletionEventID = completionEventID
@@ -114,9 +324,7 @@ final class PlaybackCoordinator {
             .sink { [weak self] enabled in
                 guard let self = self else { return }
                 if !enabled {
-                    self.idleVolumePreanalysisTask?.cancel()
-                    self.idleVolumePreanalysisTask = nil
-                    self.audioPlayer.cancelVolumeNormalizationPreanalysisIfAutoIdle()
+                    self.cancelAutomaticVolumeAnalysisWork()
                 }
                 self.scheduleIdleVolumePreanalysisIfNeeded()
             }
@@ -125,11 +333,13 @@ final class PlaybackCoordinator {
         audioPlayer.$lastUserInteractionAt
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                guard let self = self else { return }
-                // 用户有操作：取消“空闲等待计时”，并停止自动空闲预分析（手动预分析不受影响）
-                self.idleVolumePreanalysisTask?.cancel()
-                self.idleVolumePreanalysisTask = nil
-                self.audioPlayer.cancelVolumeNormalizationPreanalysisIfAutoIdle()
+                guard let self = self, !self.isStoppedForTermination else { return }
+                SystemResourceActivityState.shared.recordApplicationInteraction(
+                    at: self.audioPlayer.lastUserInteractionAt
+                )
+                // User activity invalidates rebuildable automatic work. Manual
+                // analysis remains owned exclusively by AudioPlayer.
+                self.cancelAutomaticVolumeAnalysisWork()
                 self.scheduleIdleVolumePreanalysisIfNeeded()
             }
             .store(in: &cancellables)
@@ -139,9 +349,7 @@ final class PlaybackCoordinator {
             .sink { [weak self] enabled in
                 guard let self else { return }
                 if !enabled {
-                    self.idleVolumePreanalysisTask?.cancel()
-                    self.idleVolumePreanalysisTask = nil
-                    self.audioPlayer.cancelVolumeNormalizationPreanalysisIfAutoIdle()
+                    self.cancelAutomaticVolumeAnalysisWork()
                 }
                 self.scheduleIdleVolumePreanalysisIfNeeded()
             }
@@ -163,14 +371,15 @@ final class PlaybackCoordinator {
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] isRunning in
-                guard let self else { return }
-                if isRunning, self.audioPlayer.isAutoIdleVolumePreanalysisActive {
-                    self.startAutomaticAnalysisActivityMonitor()
-                } else {
-                    self.automaticAnalysisActivityMonitorTask?.cancel()
-                    self.automaticAnalysisActivityMonitorTask = nil
+                guard let self, !self.isStoppedForTermination else { return }
+                if isRunning {
+                    if self.audioPlayer.isAutoIdleVolumePreanalysisActive {
+                        self.startAutomaticAnalysisResourceMonitorIfNeeded()
+                    } else {
+                        self.cancelAutomaticVolumeAnalysisWork()
+                    }
                 }
-                if !isRunning {
+                if !isRunning, self.automaticJobHandles.isEmpty {
                     self.scheduleIdleVolumePreanalysisIfNeeded()
                 }
             }
@@ -178,9 +387,21 @@ final class PlaybackCoordinator {
 
         playlistManager.$audioFiles
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
+            .sink { [weak self] audioFiles in
+                self?.replaceAutomaticVolumeSnapshot(with: audioFiles)
                 self?.scheduleIdleVolumePreanalysisIfNeeded()
                 self?.schedulePlaylistRelocationIfNeeded()
+            }
+            .store(in: &cancellables)
+
+        audioPlayer.$volumeNormalizationCacheCount
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] count in
+                guard let self, !self.isStoppedForTermination, count == 0,
+                      self.automaticJobHandles.isEmpty else { return }
+                self.automaticCandidateScanExhausted = false
+                self.scheduleIdleVolumePreanalysisIfNeeded()
             }
             .store(in: &cancellables)
 
@@ -196,7 +417,8 @@ final class PlaybackCoordinator {
     }
 
     private func schedulePlaylistRelocationIfNeeded() {
-        guard playlistsStore != nil else { return }
+        guard !isStoppedForTermination, playlistsStore != nil else { return }
+        let lifecycleGeneration = terminationStopGeneration
         playlistRelocationTask?.cancel()
         playlistRelocationTask = Task { @MainActor [weak self] in
             guard let self, let playlistsStore = self.playlistsStore else { return }
@@ -205,8 +427,11 @@ final class PlaybackCoordinator {
             } catch {
                 return
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  self.terminationStopGeneration == lifecycleGeneration else { return }
             await playlistsStore.ensureLoaded()
+            guard !Task.isCancelled,
+                  self.terminationStopGeneration == lifecycleGeneration else { return }
             let candidates = self.playlistManager.fileRelocationCandidatesSnapshot()
             guard !candidates.isEmpty, !Task.isCancelled else { return }
             let mutation = playlistsStore.relocateMissingTracksResult(using: candidates)
@@ -226,131 +451,223 @@ final class PlaybackCoordinator {
     }
 
     private func handlePlaybackActivityChanged() {
-        idleVolumePreanalysisTask?.cancel()
-        idleVolumePreanalysisTask = nil
+        guard !isStoppedForTermination else { return }
         if audioPlayer.isPlaying || audioPlayer.isPlaybackRequested {
-            audioPlayer.cancelVolumeNormalizationPreanalysisIfAutoIdle()
+            cancelAutomaticVolumeAnalysisWork()
         }
         scheduleIdleVolumePreanalysisIfNeeded()
     }
 
     private func handleSystemResourceStateChanged() {
-        idleVolumePreanalysisTask?.cancel()
-        idleVolumePreanalysisTask = nil
-        if !systemAllowsAutomaticAnalysis() {
-            audioPlayer.cancelVolumeNormalizationPreanalysisIfAutoIdle()
+        guard !isStoppedForTermination else { return }
+        let scheduler = backgroundJobScheduler
+        Task {
+            await scheduler.resourcesDidChange()
         }
         scheduleIdleVolumePreanalysisIfNeeded()
     }
 
-    private func startAutomaticAnalysisActivityMonitor() {
-        automaticAnalysisActivityMonitorTask?.cancel()
-        automaticAnalysisActivityMonitorTask = Task { @MainActor [weak self] in
+    private func startAutomaticAnalysisResourceMonitorIfNeeded() {
+        guard !isStoppedForTermination,
+              automaticAnalysisResourceMonitorTask == nil,
+              !automaticJobHandles.isEmpty else { return }
+        let generation = automaticAnalysisGeneration
+        automaticAnalysisResourceMonitorTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            while self.audioPlayer.isAutoIdleVolumePreanalysisActive {
+            while generation == self.automaticAnalysisGeneration,
+                  !self.automaticJobHandles.isEmpty {
                 do {
                     try await Task.sleep(nanoseconds: 1_000_000_000)
                 } catch {
                     return
                 }
                 guard !Task.isCancelled else { return }
-                guard self.audioPlayer.isAutoIdleVolumePreanalysisActive else { return }
-                if self.systemIdleDuration() < 1.5 {
-                    self.audioPlayer.cancelVolumeNormalizationPreanalysisIfAutoIdle()
-                    return
-                }
+                await self.backgroundJobScheduler.resourcesDidChange()
+            }
+            if generation == self.automaticAnalysisGeneration {
+                self.automaticAnalysisResourceMonitorTask = nil
             }
         }
     }
 
     private func systemIdleDuration() -> TimeInterval {
-        let eventTypes: [CGEventType] = [
-            .keyDown,
-            .flagsChanged,
-            .mouseMoved,
-            .leftMouseDown,
-            .rightMouseDown,
-            .otherMouseDown,
-            .scrollWheel,
-            .leftMouseDragged,
-            .rightMouseDragged,
-            .otherMouseDragged
-        ]
-        return eventTypes
-            .map {
-                CGEventSource.secondsSinceLastEventType(
-                    .combinedSessionState,
-                    eventType: $0
-                )
-            }
-            .min() ?? 0
+        SystemResourceSnapshotProvider.liveSystemIdleDuration()
     }
 
-    private func systemAllowsAutomaticAnalysis() -> Bool {
-        let processInfo = ProcessInfo.processInfo
-        guard !processInfo.isLowPowerModeEnabled else { return false }
-        switch processInfo.thermalState {
-        case .nominal:
-            return true
-        case .fair, .serious, .critical:
-            return false
-        @unknown default:
-            return false
+    private func replaceAutomaticVolumeSnapshot(with audioFiles: [AudioFile]) {
+        guard !isStoppedForTermination else { return }
+        cancelAutomaticVolumeAnalysisWork()
+        automaticVolumeSnapshot = AutomaticVolumePreanalysisSnapshot(audioFiles: audioFiles)
+        automaticVolumeSnapshotGeneration &+= 1
+        automaticCandidateScanExhausted = false
+    }
+
+    private func cancelAutomaticVolumeAnalysisWork() {
+        automaticAnalysisGeneration &+= 1
+        idleVolumePreanalysisTask?.cancel()
+        idleVolumePreanalysisTask = nil
+        automaticAnalysisResourceMonitorTask?.cancel()
+        automaticAnalysisResourceMonitorTask = nil
+
+        let handles = Array(automaticJobHandles.values)
+        automaticJobHandles.removeAll(keepingCapacity: false)
+        let waiters = Array(automaticJobWaiters.values)
+        automaticJobWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.cancel() }
+
+        automaticVolumeClient.cancelAutomaticPreanalysis()
+        guard !handles.isEmpty else { return }
+        Task {
+            for handle in handles {
+                await handle.cancel()
+            }
         }
     }
 
+    private func automaticAnalysisStateAllowsScheduling() -> Bool {
+        !isStoppedForTermination
+            && audioPlayer.autoPreanalyzeVolumesWhenIdle
+            && audioPlayer.isNormalizationEnabled
+            && !audioPlayer.isPlaying
+            && !audioPlayer.isPlaybackRequested
+            && !audioPlayer.isVolumePreanalysisRunning
+            && !automaticVolumeSnapshot.audioFiles.isEmpty
+    }
+
     private func scheduleIdleVolumePreanalysisIfNeeded() {
-        guard audioPlayer.autoPreanalyzeVolumesWhenIdle else { return }
-        guard audioPlayer.isNormalizationEnabled else { return }
-        guard !audioPlayer.isPlaying, !audioPlayer.isPlaybackRequested else { return }
-        guard !audioPlayer.isVolumePreanalysisRunning else { return }
-        guard systemAllowsAutomaticAnalysis() else { return }
-        guard !playlistManager.audioFiles.isEmpty else { return }
-        let urls = playlistManager.audioFiles.lazy.map(\.url)
-        let hasEligibleWork = audioPlayer.hasMissingVolumeNormalizationCache(in: urls)
+        guard !isStoppedForTermination else { return }
+        guard automaticAnalysisStateAllowsScheduling() else { return }
+        guard automaticJobHandles.isEmpty,
+              idleVolumePreanalysisTask == nil else { return }
+
         let waitSeconds: TimeInterval
-        if hasEligibleWork {
-            waitSeconds = idlePreanalysisDelaySeconds
-        } else if let retryDate = audioPlayer.nextVolumeNormalizationRetryDate {
+        if automaticCandidateScanExhausted {
+            guard let retryDate = automaticVolumeClient.nextRetryDate() else { return }
             waitSeconds = max(
                 idlePreanalysisDelaySeconds,
                 retryDate.timeIntervalSinceNow
             )
         } else {
-            return
+            waitSeconds = idlePreanalysisDelaySeconds
         }
 
-        idleVolumePreanalysisTask?.cancel()
+        let snapshot = automaticVolumeSnapshot
+        let snapshotGeneration = automaticVolumeSnapshotGeneration
+        let analysisGeneration = automaticAnalysisGeneration
+        let sleepNanoseconds = UInt64(
+            min(waitSeconds, 24 * 60 * 60) * 1_000_000_000
+        )
         idleVolumePreanalysisTask = Task { @MainActor [weak self] in
             guard let self = self else { return }
             do {
-                try await Task.sleep(nanoseconds: UInt64(waitSeconds * 1_000_000_000))
+                try await Task.sleep(nanoseconds: sleepNanoseconds)
             } catch {
                 return
             }
-            if Task.isCancelled { return }
-            self.idleVolumePreanalysisTask = nil
-            let applicationIdleFor = Date().timeIntervalSince(self.audioPlayer.lastUserInteractionAt)
+            guard !Task.isCancelled,
+                  snapshotGeneration == self.automaticVolumeSnapshotGeneration,
+                  analysisGeneration == self.automaticAnalysisGeneration,
+                  self.automaticAnalysisStateAllowsScheduling() else { return }
+
+            let applicationIdleFor = SystemResourceActivityState.shared
+                .applicationIdleDuration()
             let systemIdleFor = self.systemIdleDuration()
             if min(applicationIdleFor, systemIdleFor) < self.idlePreanalysisDelaySeconds {
-                // Global activity may happen outside this app, so no local event will
-                // reschedule us. Poll once per cooldown until the whole system is idle.
+                self.idleVolumePreanalysisTask = nil
                 self.scheduleIdleVolumePreanalysisIfNeeded()
                 return
             }
-            if !self.audioPlayer.autoPreanalyzeVolumesWhenIdle { return }
-            if !self.audioPlayer.isNormalizationEnabled { return }
-            if self.audioPlayer.isPlaying || self.audioPlayer.isPlaybackRequested { return }
-            if !self.systemAllowsAutomaticAnalysis() { return }
-            if self.audioPlayer.isVolumePreanalysisRunning { return }
 
-            let urls = self.playlistManager.audioFiles.lazy.map(\.url)
-            if !self.audioPlayer.hasMissingVolumeNormalizationCache(in: urls) {
+            let builder = AutomaticVolumePreanalysisCandidateBuilder.start(
+                snapshot: snapshot,
+                client: self.automaticVolumeClient
+            )
+            let candidates = await withTaskCancellationHandler(operation: {
+                await builder.value
+            }, onCancel: {
+                builder.cancel()
+            })
+            guard !Task.isCancelled,
+                  snapshotGeneration == self.automaticVolumeSnapshotGeneration,
+                  analysisGeneration == self.automaticAnalysisGeneration,
+                  self.automaticAnalysisStateAllowsScheduling() else { return }
+
+            guard !candidates.isEmpty else {
+                self.automaticCandidateScanExhausted = true
+                self.idleVolumePreanalysisTask = nil
                 self.scheduleIdleVolumePreanalysisIfNeeded()
                 return
             }
-            self.audioPlayer.startVolumeNormalizationPreanalysis(urls: urls, reason: .autoIdle)
+            self.automaticCandidateScanExhausted = false
+            await self.submitAutomaticVolumeCandidates(
+                candidates,
+                analysisGeneration: analysisGeneration,
+                snapshotGeneration: snapshotGeneration
+            )
+            guard analysisGeneration == self.automaticAnalysisGeneration,
+                  snapshotGeneration == self.automaticVolumeSnapshotGeneration else {
+                return
+            }
+            self.idleVolumePreanalysisTask = nil
+            if self.automaticJobHandles.isEmpty {
+                self.scheduleIdleVolumePreanalysisIfNeeded()
+            }
         }
+    }
+
+    @MainActor
+    private func submitAutomaticVolumeCandidates(
+        _ candidates: [URL],
+        analysisGeneration: UInt64,
+        snapshotGeneration: UInt64
+    ) async {
+        for url in candidates.prefix(
+            AutomaticVolumePreanalysisCandidateBuilder.maximumCandidatesPerRound
+        ) {
+            guard !isStoppedForTermination,
+                  analysisGeneration == automaticAnalysisGeneration,
+                  snapshotGeneration == automaticVolumeSnapshotGeneration,
+                  automaticAnalysisStateAllowsScheduling() else { return }
+            let submission = await AutomaticVolumePreanalysisJobs.submit(
+                url: url,
+                client: automaticVolumeClient,
+                scheduler: backgroundJobScheduler
+            )
+            guard !isStoppedForTermination,
+                  analysisGeneration == automaticAnalysisGeneration,
+                  snapshotGeneration == automaticVolumeSnapshotGeneration else {
+                if let handle = submission.handle { await handle.cancel() }
+                return
+            }
+            guard let handle = submission.handle,
+                  automaticJobHandles[handle.id] == nil else { continue }
+            automaticJobHandles[handle.id] = handle
+            automaticJobWaiters[handle.id] = Task { @MainActor [weak self] in
+                let outcome = await handle.value()
+                guard !Task.isCancelled else { return }
+                self?.automaticVolumeJobFinished(
+                    handleID: handle.id,
+                    generation: analysisGeneration,
+                    outcome: outcome
+                )
+            }
+        }
+        startAutomaticAnalysisResourceMonitorIfNeeded()
+    }
+
+    private func automaticVolumeJobFinished(
+        handleID: UUID,
+        generation: UInt64,
+        outcome _: BackgroundJobOutcome
+    ) {
+        guard !isStoppedForTermination,
+              generation == automaticAnalysisGeneration else { return }
+        automaticJobHandles.removeValue(forKey: handleID)
+        automaticJobWaiters.removeValue(forKey: handleID)
+        guard automaticJobHandles.isEmpty else { return }
+        automaticAnalysisResourceMonitorTask?.cancel()
+        automaticAnalysisResourceMonitorTask = nil
+        scheduleIdleVolumePreanalysisIfNeeded()
     }
 
     private func observeNextTrackPreloading() {
@@ -360,44 +677,61 @@ final class PlaybackCoordinator {
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                self?.invalidateNextPreload()
+                guard let self, !self.isStoppedForTermination else { return }
+                self.invalidateNextPreload()
             }
             .store(in: &cancellables)
 
         playlistManager.$audioFiles
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                self?.invalidateNextPreload()
+                guard let self, !self.isStoppedForTermination else { return }
+                self.invalidateNextPreload()
             }
             .store(in: &cancellables)
 
         audioPlayer.$playbackMode
             .dropFirst()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.invalidateNextPreload() }
+            .sink { [weak self] _ in
+                guard let self, !self.isStoppedForTermination else { return }
+                self.invalidateNextPreload()
+            }
             .store(in: &cancellables)
 
         audioPlayer.$isImmersivePlaybackEnabled
             .dropFirst()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.invalidateNextPreload() }
+            .sink { [weak self] _ in
+                guard let self, !self.isStoppedForTermination else { return }
+                self.invalidateNextPreload()
+            }
             .store(in: &cancellables)
 
         playlistManager.$playbackScope
             .dropFirst()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.invalidateNextPreload() }
+            .sink { [weak self] _ in
+                guard let self, !self.isStoppedForTermination else { return }
+                self.invalidateNextPreload()
+            }
             .store(in: &cancellables)
 
         playlistManager.$unplayableReasons
             .dropFirst()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.invalidateNextPreload() }
+            .sink { [weak self] _ in
+                guard let self, !self.isStoppedForTermination else { return }
+                self.invalidateNextPreload()
+            }
             .store(in: &cancellables)
 
         NotificationCenter.default.publisher(for: .playbackWeightsDidChange)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.invalidateNextPreload() }
+            .sink { [weak self] _ in
+                guard let self, !self.isStoppedForTermination else { return }
+                self.invalidateNextPreload()
+            }
             .store(in: &cancellables)
 
         // 播放接近结束时：预加载下一首
@@ -408,6 +742,25 @@ final class PlaybackCoordinator {
                 self.maybePreloadNextTrack(currentTime: currentTime)
             }
             .store(in: &cancellables)
+
+        audioPlayer.playbackClock.$currentTime
+            .throttle(for: .seconds(10), scheduler: DispatchQueue.main, latest: true)
+            .sink { [weak self] currentTime in
+                guard let self,
+                      !self.isStoppedForTermination,
+                      self.audioPlayer.persistPlaybackState,
+                      self.audioPlayer.currentFile != nil,
+                      let playbackSessionStore = self.playbackSessionStore else { return }
+                _ = playbackSessionStore.mergePosition(
+                    milliseconds: Self.positionMilliseconds(currentTime)
+                )
+            }
+            .store(in: &cancellables)
+    }
+
+    private static func positionMilliseconds(_ seconds: TimeInterval) -> Int64 {
+        guard seconds.isFinite, seconds > 0 else { return 0 }
+        return Int64(min(Double(Int64.max), seconds * 1_000).rounded())
     }
 
     private func invalidateNextPreload() {
@@ -417,7 +770,7 @@ final class PlaybackCoordinator {
     }
 
     private func maybePreloadNextTrack(currentTime: TimeInterval) {
-        guard audioPlayer.isPlaying else { return }
+        guard !isStoppedForTermination, audioPlayer.isPlaying else { return }
         // A replacement load already holds the old installed player plus the new
         // target being constructed. Do not allocate a third AVAudioPlayer for a
         // speculative next track that will be invalidated as soon as the target

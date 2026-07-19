@@ -2,6 +2,72 @@ import XCTest
 @testable import MusicPlayer
 
 final class UserDefaultsMigratorTests: XCTestCase {
+    func testV1AppPreferencesEnvelopeCrossesBundleMigrationAndUpgradesInStore() throws {
+        let source = makeDefaults(prefix: "defaults-migration-v1-envelope-source")
+        let target = makeDefaults(prefix: "defaults-migration-v1-envelope-target")
+        let v1 = try JSONSerialization.data(withJSONObject: [
+            "version": 1,
+            "preferences": [
+                "volume": 0.72,
+                "playbackRate": 1.25,
+                "playbackMode": "repeatOne",
+                "playbackScope": ["kind": "queue"],
+            ],
+        ])
+        source.set(v1, forKey: AppPreferencesStore.envelopeKey)
+
+        let result = UserDefaultsMigrator.migrateFromLegacyBundleIdentifierIfNeeded(
+            currentBundleIdentifier: "current.bundle",
+            currentDefaults: target,
+            legacyDefaults: source
+        )
+
+        guard case .migrated(let keys) = result else {
+            return XCTFail("Expected v1 envelope migration, got \(result)")
+        }
+        XCTAssertEqual(keys, [AppPreferencesStore.envelopeKey])
+        XCTAssertEqual(target.data(forKey: AppPreferencesStore.envelopeKey), v1)
+
+        let preferences = AppPreferencesStore(userDefaults: target).load()
+        XCTAssertEqual(preferences.volume, 0.72, accuracy: 0.0001)
+        XCTAssertEqual(preferences.playbackRate, 1.25, accuracy: 0.0001)
+        XCTAssertEqual(preferences.playbackMode, .repeatOne)
+        let upgraded = try XCTUnwrap(target.data(forKey: AppPreferencesStore.envelopeKey))
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: upgraded) as? [String: Any])
+        XCTAssertEqual(root["version"] as? Int, AppPreferencesStore.formatVersion)
+    }
+
+    func testMalformedV1PreferencesEnvelopeDoesNotCompleteBundleMigration() throws {
+        let source = makeDefaults(prefix: "defaults-migration-malformed-v1-source")
+        let target = makeDefaults(prefix: "defaults-migration-malformed-v1-target")
+        let malformedV1 = try JSONSerialization.data(withJSONObject: [
+            "version": 1,
+            "preferences": [
+                "volume": 0.72,
+                "playbackRate": 1.25,
+                "playbackMode": "repeatOne",
+                // Required v1 playbackScope intentionally missing.
+            ],
+        ])
+        source.set(malformedV1, forKey: AppPreferencesStore.envelopeKey)
+
+        let result = UserDefaultsMigrator.migrateFromLegacyBundleIdentifierIfNeeded(
+            currentBundleIdentifier: "current.bundle",
+            currentDefaults: target,
+            legacyDefaults: source
+        )
+
+        XCTAssertEqual(
+            result,
+            .retryRequired(
+                invalidKeys: [AppPreferencesStore.envelopeKey],
+                failedKeys: []
+            )
+        )
+        XCTAssertNil(target.data(forKey: AppPreferencesStore.envelopeKey))
+        XCTAssertNil(target.object(forKey: UserDefaultsMigrator.migrationFlagKey()))
+    }
+
     func testCopiesOnlyValidatedAllowlistAndMarksCompletion() {
         let source = makeDefaults(prefix: "defaults-migration-source")
         let target = makeDefaults(prefix: "defaults-migration-target")
@@ -125,6 +191,39 @@ final class UserDefaultsMigratorTests: XCTestCase {
             )
         )
         XCTAssertEqual(target.data(forKey: AppPreferencesStore.envelopeKey), futureEnvelope)
+        XCTAssertNil(target.object(forKey: UserDefaultsMigrator.migrationFlagKey()))
+    }
+
+    func testFutureTargetIsNotReplacedByValidV1SourceEnvelope() throws {
+        let source = makeDefaults(prefix: "defaults-migration-v1-source-future-target")
+        let target = makeDefaults(prefix: "defaults-migration-v1-source-future-target-result")
+        let v1 = try JSONSerialization.data(withJSONObject: [
+            "version": 1,
+            "preferences": [
+                "volume": 0.5,
+                "playbackRate": 1.0,
+                "playbackMode": "shuffle",
+                "playbackScope": ["kind": "queue"],
+            ],
+        ])
+        let future = Data(#"{"version":999,"preferences":{"keep":true}}"#.utf8)
+        source.set(v1, forKey: AppPreferencesStore.envelopeKey)
+        target.set(future, forKey: AppPreferencesStore.envelopeKey)
+
+        let result = UserDefaultsMigrator.migrateFromLegacyBundleIdentifierIfNeeded(
+            currentBundleIdentifier: "current.bundle",
+            currentDefaults: target,
+            legacyDefaults: source
+        )
+
+        XCTAssertEqual(
+            result,
+            .retryRequired(
+                invalidKeys: [AppPreferencesStore.envelopeKey],
+                failedKeys: []
+            )
+        )
+        XCTAssertEqual(target.data(forKey: AppPreferencesStore.envelopeKey), future)
         XCTAssertNil(target.object(forKey: UserDefaultsMigrator.migrationFlagKey()))
     }
 

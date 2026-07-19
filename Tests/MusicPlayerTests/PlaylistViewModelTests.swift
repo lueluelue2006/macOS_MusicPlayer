@@ -23,6 +23,23 @@ final class PlaylistViewModelTests: XCTestCase {
         }
     }
 
+    private actor MetadataRefreshGate {
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+        private var isOpen = false
+
+        func wait() async {
+            guard !isOpen else { return }
+            await withCheckedContinuation { waiters.append($0) }
+        }
+
+        func open() {
+            isOpen = true
+            let continuations = waiters
+            waiters.removeAll()
+            continuations.forEach { $0.resume() }
+        }
+    }
+
     private func makeAudioFile(at url: URL) -> AudioFile {
         AudioFile(
             url: url,
@@ -35,6 +52,40 @@ final class PlaylistViewModelTests: XCTestCase {
                 artwork: nil
             )
         )
+    }
+
+    func testProtectedFuturePreferencesRestorePanelAndScanUIState() throws {
+        let suite = "playlist-view-model-future-preferences-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let future = try JSONSerialization.data(withJSONObject: [
+            "version": 99,
+            "preferences": [
+                "playlistPanelMode": 1,
+                "scanSubfolders": false,
+            ],
+        ])
+        defaults.set(future, forKey: AppPreferencesStore.envelopeKey)
+        let preferences = AppPreferencesStore(userDefaults: defaults)
+        let manager = PlaylistManager(
+            playlistFileURLOverride: FileManager.default.temporaryDirectory
+                .appendingPathComponent("protected-panel-\(UUID().uuidString).json"),
+            appPreferencesStore: preferences
+        )
+        let viewModel = PlaylistViewModel(
+            audioPlayer: AudioPlayer(),
+            playlistManager: manager,
+            playlistsStore: PlaylistsStore()
+        )
+
+        XCTAssertTrue(manager.scanSubfolders)
+        manager.scanSubfolders = false
+        XCTAssertTrue(manager.scanSubfolders)
+
+        XCTAssertTrue(viewModel.isQueueSelected)
+        viewModel.switchToPlaylists()
+        XCTAssertTrue(viewModel.isQueueSelected)
+        XCTAssertEqual(defaults.data(forKey: AppPreferencesStore.envelopeKey), future)
     }
 
     func testRejectedClearDoesNotStopPlaybackOrHideQueue() {
@@ -127,5 +178,44 @@ final class PlaylistViewModelTests: XCTestCase {
             manager.audioFiles.map(\.metadata.title),
             (0..<40).map { "metadata-refresh-\($0)" }
         )
+    }
+
+    func testRefreshAllMetadataMergesWithoutRestoringRemovedOrDroppingAddedEntries() async {
+        let gate = MetadataRefreshGate()
+        let started = expectation(description: "metadata refresh started")
+        started.expectedFulfillmentCount = 2
+        let manager = PlaylistManager(
+            disablePersistence: true,
+            freshMetadataLoaderOverride: { url in
+                started.fulfill()
+                await gate.wait()
+                return AudioMetadata(
+                    title: "refreshed-\(url.deletingPathExtension().lastPathComponent)",
+                    artist: "refreshed",
+                    album: "refreshed",
+                    year: nil,
+                    genre: nil,
+                    artwork: nil
+                )
+            }
+        )
+        let firstURL = URL(fileURLWithPath: "/tmp/merge-first.mp3")
+        let secondURL = URL(fileURLWithPath: "/tmp/merge-second.mp3")
+        let addedURL = URL(fileURLWithPath: "/tmp/merge-added.mp3")
+        manager.audioFiles = [
+            makeAudioFile(at: firstURL),
+            makeAudioFile(at: secondURL)
+        ]
+
+        let refreshTask = Task { await manager.refreshAllMetadata() }
+        await fulfillment(of: [started], timeout: 1)
+        XCTAssertNotNil(manager.removeFile(at: 0))
+        XCTAssertNotNil(manager.ensureInQueue([makeAudioFile(at: addedURL)], focusURL: addedURL))
+        await gate.open()
+        await refreshTask.value
+
+        XCTAssertEqual(manager.audioFiles.map(\.url), [secondURL, addedURL])
+        XCTAssertEqual(manager.audioFiles[0].metadata.title, "refreshed-merge-second")
+        XCTAssertEqual(manager.audioFiles[1].metadata.title, "fixture")
     }
 }

@@ -413,6 +413,201 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
         XCTAssertEqual(returnedBounds, bounds)
     }
 
+    func testDerivedStorePersistsBoundsIncrementallyAndSeparatesConfigurationVariants() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent("derived-source.bin")
+        let databaseURL = directory.appendingPathComponent("derived.sqlite3")
+        try Data("fixture".utf8).write(to: audioURL)
+        let firstConfiguration = ImmersivePlaybackAnalyzer.Configuration(analysisTimeout: 0.5)
+        let firstBounds = PlaybackBounds(audibleStart: 0.4, audibleEnd: 3.6, physicalDuration: 4)
+        let counter = ImmersiveThreadSafeCounter()
+
+        do {
+            let store = try DerivedCacheStore(databaseURL: databaseURL)
+            let analyzer = ImmersivePlaybackAnalyzer(
+                derivedCacheStore: store,
+                legacyCacheFileURL: nil,
+                configuration: firstConfiguration,
+                analysisOperation: { _, _ in
+                    counter.increment()
+                    return .init(bounds: firstBounds, isCacheable: true)
+                }
+            )
+            let analyzedBounds = await analyzer.bounds(for: audioURL)
+            XCTAssertEqual(analyzedBounds, firstBounds)
+            guard case .success = await analyzer.flushPersistence() else {
+                return XCTFail("Derived bounds should flush")
+            }
+            XCTAssertEqual(store.persistedEntryCount(for: .immersive), 1)
+        }
+
+        let store = try DerivedCacheStore(databaseURL: databaseURL)
+        let reloaded = ImmersivePlaybackAnalyzer(
+            derivedCacheStore: store,
+            legacyCacheFileURL: nil,
+            configuration: firstConfiguration,
+            analysisOperation: { _, _ in
+                counter.increment()
+                return .init(bounds: .fullRange(duration: 9), isCacheable: true)
+            }
+        )
+        let reloadedBounds = await reloaded.cachedBoundsIfValid(for: audioURL)
+        XCTAssertEqual(reloadedBounds, firstBounds)
+        XCTAssertEqual(counter.value, 1)
+
+        let secondBounds = PlaybackBounds(audibleStart: 0.8, audibleEnd: 3.2, physicalDuration: 4)
+        let variantAnalyzer = ImmersivePlaybackAnalyzer(
+            derivedCacheStore: store,
+            legacyCacheFileURL: nil,
+            configuration: .init(leadingSafetyPadding: 0.2, analysisTimeout: 0.5),
+            analysisOperation: { _, _ in
+                counter.increment()
+                return .init(bounds: secondBounds, isCacheable: true)
+            }
+        )
+        let cachedVariantBounds = await variantAnalyzer.cachedBoundsIfValid(for: audioURL)
+        XCTAssertNil(cachedVariantBounds)
+        let analyzedVariantBounds = await variantAnalyzer.bounds(for: audioURL)
+        XCTAssertEqual(analyzedVariantBounds, secondBounds)
+        _ = await variantAnalyzer.flushPersistence()
+        XCTAssertEqual(counter.value, 2)
+        XCTAssertEqual(store.persistedEntryCount(for: .immersive), 2)
+    }
+
+    func testDerivedFailurePayloadSurvivesReloadAndFileReplacementClearsCooldown() async throws {
+        struct SyntheticFailure: Error {}
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent("derived-failure.bin")
+        let databaseURL = directory.appendingPathComponent("derived.sqlite3")
+        try Data("fixture".utf8).write(to: audioURL)
+        let counter = ImmersiveThreadSafeCounter()
+        let configuration = ImmersivePlaybackAnalyzer.Configuration(analysisTimeout: 0.5)
+
+        do {
+            let store = try DerivedCacheStore(databaseURL: databaseURL)
+            let analyzer = ImmersivePlaybackAnalyzer(
+                derivedCacheStore: store,
+                legacyCacheFileURL: nil,
+                configuration: configuration,
+                analysisOperation: { _, _ in
+                    counter.increment()
+                    throw SyntheticFailure()
+                }
+            )
+            _ = await analyzer.bounds(for: audioURL)
+            _ = await analyzer.flushPersistence()
+        }
+
+        let store = try DerivedCacheStore(databaseURL: databaseURL)
+        let analyzer = ImmersivePlaybackAnalyzer(
+            derivedCacheStore: store,
+            legacyCacheFileURL: nil,
+            configuration: configuration,
+            analysisOperation: { _, _ in
+                counter.increment()
+                throw SyntheticFailure()
+            }
+        )
+        _ = await analyzer.bounds(for: audioURL)
+        XCTAssertEqual(counter.value, 1, "Persisted failure payload should suppress a retry")
+
+        try Data("replacement-with-new-identity".utf8).write(to: audioURL, options: .atomic)
+        _ = await analyzer.bounds(for: audioURL)
+        XCTAssertEqual(counter.value, 2, "A replacement identity must invalidate the failure row")
+    }
+
+    func testDerivedClearRejectsLateDecodeFromOlderGeneration() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent("late-after-clear.bin")
+        try Data("fixture".utf8).write(to: audioURL)
+        let store = try DerivedCacheStore(
+            databaseURL: directory.appendingPathComponent("derived.sqlite3")
+        )
+        let expected = PlaybackBounds(audibleStart: 0.5, audibleEnd: 3.5, physicalDuration: 4)
+        let analyzer = ImmersivePlaybackAnalyzer(
+            derivedCacheStore: store,
+            legacyCacheFileURL: nil,
+            configuration: .init(analysisTimeout: 0.02),
+            analysisOperation: { _, _ in
+                Thread.sleep(forTimeInterval: 0.12)
+                return .init(bounds: expected, isCacheable: true)
+            }
+        )
+
+        let timedOutBounds = await analyzer.bounds(for: audioURL)
+        XCTAssertEqual(timedOutBounds, .fullRange(duration: 0))
+        guard case .success = await analyzer.removeAll() else {
+            return XCTFail("Derived cache clear should succeed")
+        }
+        try await Task.sleep(nanoseconds: 220_000_000)
+        let cachedBounds = await analyzer.cachedBoundsIfValid(for: audioURL)
+        XCTAssertNil(cachedBounds)
+        _ = await analyzer.flushPersistence()
+        XCTAssertEqual(store.persistedEntryCount(for: .immersive), 0)
+    }
+
+    func testLegacyApplicationSupportJSONMigratesOnceWithDurableMarker() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent("legacy-source.bin")
+        let legacyURL = directory.appendingPathComponent("immersive-boundaries.json")
+        try Data("fixture".utf8).write(to: audioURL)
+        let snapshot = FileValidationSnapshot.load(for: audioURL)
+        let configuration = ImmersivePlaybackAnalyzer.Configuration(analysisTimeout: 0.5)
+        let migratedBounds = PlaybackBounds(audibleStart: 0.4, audibleEnd: 3.6, physicalDuration: 4)
+        let legacyBytes = try makeLegacyCacheBytes(
+            path: audioURL.path,
+            snapshot: snapshot,
+            bounds: migratedBounds,
+            configuration: configuration
+        )
+        try legacyBytes.write(to: legacyURL)
+        let store = try DerivedCacheStore(
+            databaseURL: directory.appendingPathComponent("derived.sqlite3")
+        )
+        let counter = ImmersiveThreadSafeCounter()
+        let analyzer = ImmersivePlaybackAnalyzer(
+            derivedCacheStore: store,
+            legacyCacheFileURL: legacyURL,
+            configuration: configuration,
+            analysisOperation: { _, _ in
+                counter.increment()
+                return .init(bounds: .fullRange(duration: 8), isCacheable: true)
+            }
+        )
+
+        let migratedCachedBounds = await analyzer.cachedBoundsIfValid(for: audioURL)
+        XCTAssertEqual(migratedCachedBounds, migratedBounds)
+        XCTAssertEqual(counter.value, 0)
+        XCTAssertNotNil(
+            store.migrationMarker(for: ImmersivePlaybackAnalyzer.legacyMigrationMarkerKey)
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path))
+
+        let replacementBounds = PlaybackBounds(audibleStart: 1, audibleEnd: 3, physicalDuration: 4)
+        try makeLegacyCacheBytes(
+            path: audioURL.path,
+            snapshot: snapshot,
+            bounds: replacementBounds,
+            configuration: configuration
+        ).write(to: legacyURL)
+        let secondAnalyzer = ImmersivePlaybackAnalyzer(
+            derivedCacheStore: store,
+            legacyCacheFileURL: legacyURL,
+            configuration: configuration,
+            analysisOperation: { _, _ in
+                counter.increment()
+                return .init(bounds: replacementBounds, isCacheable: true)
+            }
+        )
+        let secondCachedBounds = await secondAnalyzer.cachedBoundsIfValid(for: audioURL)
+        XCTAssertEqual(secondCachedBounds, migratedBounds)
+        XCTAssertEqual(counter.value, 0, "A durable marker must prevent a second JSON import")
+    }
+
     func testAggressiveLeadingPaddingWithGeneratedAudio() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -822,6 +1017,36 @@ final class ImmersivePlaybackAnalyzerTests: XCTestCase {
         )
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    private func makeLegacyCacheBytes(
+        path: String,
+        snapshot: FileValidationSnapshot,
+        bounds: PlaybackBounds,
+        configuration: ImmersivePlaybackAnalyzer.Configuration
+    ) throws -> Data {
+        let signature: [String: Any] = [
+            "fileSize": snapshot.fileSize,
+            "mtimeNs": snapshot.mtimeNs,
+            "inode": snapshot.inode.map { NSNumber(value: $0) } ?? NSNull(),
+        ]
+        let encodedBounds: [String: Any] = [
+            "audibleStart": bounds.audibleStart,
+            "audibleEnd": bounds.audibleEnd,
+            "physicalDuration": bounds.physicalDuration,
+        ]
+        let entry: [String: Any] = [
+            "signature": signature,
+            "bounds": encodedBounds,
+            "lastAccessedAt": Date().timeIntervalSince1970,
+        ]
+        return try JSONSerialization.data(withJSONObject: [
+            "formatVersion": 2,
+            "algorithmVersion": ImmersivePlaybackAnalyzer.algorithmVersion,
+            "configurationSignature": configuration.cacheSignature,
+            "entries": [path: entry],
+            "failures": [:],
+        ])
     }
 
     private func writeWAV(

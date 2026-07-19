@@ -19,6 +19,7 @@ enum UserDefaultsMigrator {
         case finiteNumber(ClosedRange<Double>?)
         case string(maximumUTF8Bytes: Int, allowed: Set<String>? = nil)
         case data(maximumBytes: Int)
+        case appPreferencesJSONData(maximumBytes: Int)
         case versionedJSONData(maximumBytes: Int, supportedVersions: ClosedRange<Int>)
         case stringArray(maximumCount: Int, maximumUTF8BytesPerItem: Int)
     }
@@ -38,16 +39,67 @@ enum UserDefaultsMigrator {
         let version: Int?
     }
 
+    private struct AppPreferencesEnvelopeV1: Decodable {
+        struct Preferences: Decodable {
+            struct Scope: Decodable {
+                enum Kind: String, Decodable { case queue, playlist }
+
+                let kind: Kind
+                let playlistID: UUID?
+
+                private enum CodingKeys: String, CodingKey {
+                    case kind, playlistID
+                }
+
+                init(from decoder: Decoder) throws {
+                    let container = try decoder.container(keyedBy: CodingKeys.self)
+                    kind = try container.decode(Kind.self, forKey: .kind)
+                    playlistID = try container.decodeIfPresent(UUID.self, forKey: .playlistID)
+                    switch kind {
+                    case .queue:
+                        guard playlistID == nil else {
+                            throw DecodingError.dataCorruptedError(
+                                forKey: .playlistID,
+                                in: container,
+                                debugDescription: "Queue scope must not carry a playlist ID"
+                            )
+                        }
+                    case .playlist:
+                        guard playlistID != nil else {
+                            throw DecodingError.keyNotFound(
+                                CodingKeys.playlistID,
+                                .init(
+                                    codingPath: decoder.codingPath,
+                                    debugDescription: "Playlist scope requires a playlist ID"
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+
+            let volume: Float
+            let playbackRate: Float
+            let playbackMode: AppPreferencesStore.PlaybackMode
+            let playbackScope: Scope
+        }
+
+        let version: Int
+        let preferences: Preferences
+    }
+
+    private struct AppPreferencesEnvelopeV2: Decodable {
+        let version: Int
+        let preferences: AppPreferencesStore.Preferences
+    }
+
     /// This is intentionally an explicit product-owned list. AppKit and future
     /// frameworks may add arbitrary values to a preferences domain; those must
     /// never be copied merely because they happen to be present.
     private static let allowlist: [AllowedPreference] = [
         .init(
             key: AppPreferencesStore.envelopeKey,
-            rule: .versionedJSONData(
-                maximumBytes: 64 * 1_024,
-                supportedVersions: AppPreferencesStore.formatVersion ... AppPreferencesStore.formatVersion
-            )
+            rule: .appPreferencesJSONData(maximumBytes: 64 * 1_024)
         ),
         .init(
             key: PlaybackStateStore.envelopeKey,
@@ -160,6 +212,14 @@ enum UserDefaultsMigrator {
                 // A valid destination wins even if stale legacy data is corrupt.
                 continue
             }
+            if currentValue != nil, isStructuredDataRule(entry.rule) {
+                // Unknown, future, corrupt, or oversized structured target data
+                // is protected byte-for-byte. A legacy source must never repair
+                // it by replacement because this process cannot prove which
+                // schema owns the newer destination.
+                invalidKeys.append(entry.key)
+                continue
+            }
 
             guard let sourceValue = sourceValues[entry.key] else {
                 // An absent value on both sides is expected. An existing target
@@ -268,6 +328,26 @@ enum UserDefaultsMigrator {
             guard let data = value as? Data else { return false }
             return data.count <= maximumBytes
 
+        case .appPreferencesJSONData(let maximumBytes):
+            guard let data = value as? Data,
+                  data.count <= maximumBytes,
+                  let probe = try? JSONDecoder().decode(VersionProbe.self, from: data),
+                  let version = probe.version else { return false }
+            switch version {
+            case 1:
+                return (try? JSONDecoder().decode(
+                    AppPreferencesEnvelopeV1.self,
+                    from: data
+                ))?.version == 1
+            case AppPreferencesStore.formatVersion:
+                return (try? JSONDecoder().decode(
+                    AppPreferencesEnvelopeV2.self,
+                    from: data
+                ))?.version == AppPreferencesStore.formatVersion
+            default:
+                return false
+            }
+
         case .versionedJSONData(let maximumBytes, let supportedVersions):
             guard let data = value as? Data,
                   data.count <= maximumBytes,
@@ -281,6 +361,15 @@ enum UserDefaultsMigrator {
             }
             return values.allSatisfy { $0.utf8.count <= maximumUTF8BytesPerItem }
 
+        }
+    }
+
+    private static func isStructuredDataRule(_ rule: ValueRule) -> Bool {
+        switch rule {
+        case .appPreferencesJSONData, .versionedJSONData:
+            return true
+        default:
+            return false
         }
     }
 

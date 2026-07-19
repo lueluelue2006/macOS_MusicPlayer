@@ -4,6 +4,10 @@ import XCTest
 
 @MainActor
 final class VolumeNormalizationCacheTests: XCTestCase {
+    private enum MigrationInterruption: Error, Sendable {
+        case injected
+    }
+
     private final class Clock: @unchecked Sendable {
         var value: TimeInterval
 
@@ -203,6 +207,191 @@ final class VolumeNormalizationCacheTests: XCTestCase {
         }
     }
 
+    func testApplicationSupportDatabaseMigratesLogicallyIntoCaches() throws {
+        try withTemporaryDirectory { directory in
+            let applicationSupport = directory
+                .appendingPathComponent("Application Support", isDirectory: true)
+                .appendingPathComponent("MusicPlayer", isDirectory: true)
+            let caches = directory
+                .appendingPathComponent("Caches", isDirectory: true)
+                .appendingPathComponent("MusicPlayer", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: applicationSupport,
+                withIntermediateDirectories: true
+            )
+            let sourceURL = applicationSupport.appendingPathComponent("volume-analysis.sqlite3")
+            let targetURL = caches.appendingPathComponent("volume-analysis.sqlite3")
+            let audioURL = directory.appendingPathComponent("migrated.bin")
+            try Data(repeating: 7, count: 64).write(to: audioURL)
+            try seedDatabase(
+                at: sourceURL,
+                audioURL: audioURL,
+                measurement: measurement(lufs: -17),
+                now: 100
+            )
+
+            let suiteName = "musicplayer-volume-migration-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            let environment = PersistenceEnvironment(
+                applicationSupportURL: applicationSupport,
+                cachesURL: caches,
+                userDefaults: defaults,
+                isTesting: true
+            )
+            let migrated = try VolumeAnalysisStore(
+                databaseURL: sourceURL,
+                persistenceEnvironment: environment
+            )
+
+            XCTAssertEqual(
+                migrated.measurement(for: audioURL)?.integratedLoudnessLUFS,
+                -17
+            )
+            XCTAssertTrue(FileManager.default.fileExists(atPath: targetURL.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: sourceURL.path))
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: sourceURL.path + "-wal")
+            )
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: sourceURL.path + "-shm")
+            )
+        }
+    }
+
+    func testDatabaseMigrationRollsBackAndRetriesAfterPreCommitInterruption() throws {
+        try withTemporaryDirectory { directory in
+            let sourceURL = directory.appendingPathComponent("legacy.sqlite3")
+            let targetURL = directory.appendingPathComponent("cache.sqlite3")
+            let audioURL = directory.appendingPathComponent("interrupted.bin")
+            try Data(repeating: 8, count: 72).write(to: audioURL)
+            try seedDatabase(
+                at: sourceURL,
+                audioURL: audioURL,
+                measurement: measurement(lufs: -16),
+                now: 100
+            )
+
+            do {
+                let interrupted = try VolumeAnalysisStore(
+                    databaseURL: targetURL,
+                    legacyDatabaseURL: sourceURL,
+                    databaseMigrationHook: { phase in
+                        if phase == .beforeCommit { throw MigrationInterruption.injected }
+                    }
+                )
+                XCTAssertEqual(interrupted.analysisCount, 0)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: sourceURL.path))
+            }
+
+            let retried = try VolumeAnalysisStore(
+                databaseURL: targetURL,
+                legacyDatabaseURL: sourceURL
+            )
+            XCTAssertEqual(retried.analysisCount, 1)
+            XCTAssertEqual(
+                retried.measurement(for: audioURL)?.integratedLoudnessLUFS,
+                -16
+            )
+            XCTAssertFalse(FileManager.default.fileExists(atPath: sourceURL.path))
+        }
+    }
+
+    func testCommittedMigrationIsIdempotentWhenCleanupWasInterrupted() throws {
+        try withTemporaryDirectory { directory in
+            let sourceURL = directory.appendingPathComponent("legacy.sqlite3")
+            let targetURL = directory.appendingPathComponent("cache.sqlite3")
+            let audioURL = directory.appendingPathComponent("idempotent.bin")
+            try Data(repeating: 9, count: 80).write(to: audioURL)
+            let snapshot = FileValidationSnapshot.load(for: audioURL)
+            try seedDatabase(
+                at: sourceURL,
+                audioURL: audioURL,
+                measurement: measurement(lufs: -15),
+                now: 100
+            )
+
+            do {
+                let interrupted = try VolumeAnalysisStore(
+                    databaseURL: targetURL,
+                    now: { 200 },
+                    legacyDatabaseURL: sourceURL,
+                    databaseMigrationHook: { phase in
+                        if phase == .afterCommitBeforeCleanup {
+                            throw MigrationInterruption.injected
+                        }
+                    }
+                )
+                XCTAssertEqual(interrupted.analysisCount, 1)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: sourceURL.path))
+                XCTAssertSuccess(interrupted.save(
+                    measurement: measurement(lufs: -12),
+                    for: audioURL,
+                    snapshot: snapshot
+                ))
+            }
+
+            let retried = try VolumeAnalysisStore(
+                databaseURL: targetURL,
+                legacyDatabaseURL: sourceURL
+            )
+            XCTAssertEqual(retried.analysisCount, 1)
+            XCTAssertEqual(
+                retried.measurement(for: audioURL)?.integratedLoudnessLUFS,
+                -12,
+                "An older legacy row must not overwrite a newer cache result"
+            )
+            XCTAssertFalse(FileManager.default.fileExists(atPath: sourceURL.path))
+        }
+    }
+
+    func testCorruptDerivedDatabasesAreRebuiltWithoutBlockingTheStore() throws {
+        try withTemporaryDirectory { directory in
+            let corruptTargetURL = directory.appendingPathComponent("corrupt-target.sqlite3")
+            try Data("not sqlite".utf8).write(to: corruptTargetURL)
+            let rebuilt = try VolumeAnalysisStore(databaseURL: corruptTargetURL)
+            XCTAssertEqual(rebuilt.analysisCount, 0)
+
+            let corruptSourceURL = directory.appendingPathComponent("corrupt-source.sqlite3")
+            let healthyTargetURL = directory.appendingPathComponent("healthy-target.sqlite3")
+            try Data("also not sqlite".utf8).write(to: corruptSourceURL)
+            let healthy = try VolumeAnalysisStore(
+                databaseURL: healthyTargetURL,
+                legacyDatabaseURL: corruptSourceURL
+            )
+            XCTAssertEqual(healthy.analysisCount, 0)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: corruptSourceURL.path))
+        }
+    }
+
+    func testFutureLegacyDatabaseIsPreservedUntilForcedClear() throws {
+        try withTemporaryDirectory { directory in
+            let sourceURL = directory.appendingPathComponent("future-legacy.sqlite3")
+            let targetURL = directory.appendingPathComponent("cache.sqlite3")
+            let seed = try SQLiteDatabase(fileURL: sourceURL)
+            try seed.execute("PRAGMA application_id = 1297110604")
+            try seed.execute("PRAGMA user_version = 99")
+            try seed.checkpoint()
+            seed.close()
+
+            let store = try VolumeAnalysisStore(
+                databaseURL: targetURL,
+                legacyDatabaseURL: sourceURL
+            )
+            XCTAssertEqual(store.protectedCacheReason, .futureDatabase(version: 99))
+            XCTAssertEqual(
+                store.clear(),
+                .requiresConfirmation(.futureDatabase(version: 99))
+            )
+            XCTAssertTrue(FileManager.default.fileExists(atPath: sourceURL.path))
+            XCTAssertEqual(
+                store.clear(forceProtectedData: true),
+                .cleared(analysisCount: 0, failureCount: 0, removedProtectedLegacy: true)
+            )
+            XCTAssertFalse(FileManager.default.fileExists(atPath: sourceURL.path))
+        }
+    }
+
     func testAudioPlayerUsesSQLiteCacheWithoutPlayingAudio() throws {
         try withTemporaryDirectory { directory in
             let audioURL = directory.appendingPathComponent("fixture.wav")
@@ -304,6 +493,24 @@ final class VolumeNormalizationCacheTests: XCTestCase {
             XCTFail("Expected successful cache write", file: file, line: line)
             return
         }
+    }
+
+    private func seedDatabase(
+        at databaseURL: URL,
+        audioURL: URL,
+        measurement: LoudnessMeasurement,
+        now: TimeInterval
+    ) throws {
+        let store = try VolumeAnalysisStore(
+            databaseURL: databaseURL,
+            now: { now }
+        )
+        XCTAssertSuccess(store.save(
+            measurement: measurement,
+            for: audioURL,
+            snapshot: FileValidationSnapshot.load(for: audioURL)
+        ))
+        XCTAssertEqual(store.flush(), .flushed)
     }
 
     private func withTemporaryDirectory(

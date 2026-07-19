@@ -79,6 +79,87 @@ final class PlaylistPersistenceTests: XCTestCase {
         XCTAssertEqual(snapshot.paths, manager.audioFiles.map { $0.url.path })
     }
 
+    func testLibraryDatabaseNavigationUpdatesOnlyCursorAndPreservesOccurrences() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-library-queue-cursor-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let database = try LibraryDatabase(
+            fileURL: directory.appendingPathComponent("Library.sqlite")
+        )
+        let manager = PlaylistManager(
+            libraryDatabase: database,
+            persistenceDebounceInterval: 0,
+            initialQueueLoadState: .ready
+        )
+        let firstURL = directory.appendingPathComponent("first.mp3")
+        let secondURL = directory.appendingPathComponent("second.mp3")
+        _ = manager.ensureInQueue([
+            makeAudioFile(at: firstURL, title: "first"),
+            makeAudioFile(at: secondURL, title: "second"),
+        ])
+        XCTAssertTrue(manager.flushPlaylistPersistence().isDurable)
+        let structural = try database.loadQueue()
+        XCTAssertEqual(structural.entries.count, 2)
+
+        XCTAssertEqual(manager.selectFile(at: 1)?.url, secondURL)
+        XCTAssertTrue(manager.flushPlaylistPersistence().isDurable)
+        let navigated = try database.loadQueue()
+
+        XCTAssertEqual(navigated.revision, structural.revision)
+        XCTAssertEqual(navigated.entries, structural.entries)
+        XCTAssertEqual(navigated.currentEntryID, structural.entries[1].id)
+    }
+
+    func testLibraryDatabaseQueueRestoresStableOccurrenceIDs() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-library-queue-restore-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let firstURL = directory.appendingPathComponent("first.mp3")
+        let secondURL = directory.appendingPathComponent("second.mp3")
+        try Data().write(to: firstURL)
+        try Data().write(to: secondURL)
+
+        let database = try LibraryDatabase(
+            fileURL: directory.appendingPathComponent("Library.sqlite")
+        )
+        let entries = [
+            LibraryQueueEntry(
+                id: UUID(), sortKey: 0, path: firstURL.path,
+                signature: nil, locationID: nil, relativePath: nil
+            ),
+            LibraryQueueEntry(
+                id: UUID(), sortKey: 1_024, path: secondURL.path,
+                signature: nil, locationID: nil, relativePath: nil
+            ),
+        ]
+        try database.replaceQueue(
+            LibraryQueueSnapshot(
+                revision: 12,
+                entries: entries,
+                currentEntryID: entries[1].id,
+                pendingRekeys: []
+            )
+        )
+        let manager = PlaylistManager(
+            libraryDatabase: database,
+            initialQueueLoadState: .ready
+        )
+        await manager.loadSavedPlaylist()
+
+        XCTAssertEqual(manager.audioFiles.map(\.url), [firstURL, secondURL])
+        XCTAssertEqual(manager.currentIndex, 1)
+        XCTAssertTrue(manager.flushPlaylistPersistence().isDurable)
+        XCTAssertEqual(try database.loadQueue().entries.map(\.id), entries.map(\.id))
+        await manager.waitForBackgroundRestoreWorkForTesting()
+    }
+
     func testFlushBeforeInitialRestorePreservesExistingQueueBytes() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "musicplayer-queue-quick-quit-\(UUID().uuidString)",
@@ -168,6 +249,42 @@ final class PlaylistPersistenceTests: XCTestCase {
         manager.flushPlaylistPersistence()
 
         XCTAssertEqual(try Data(contentsOf: playlistURL), original)
+        let diagnostics = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.hasPrefix("playlist.corrupted.") }
+        XCTAssertEqual(diagnostics.count, 1)
+        XCTAssertEqual(try Data(contentsOf: diagnostics[0]), original)
+    }
+
+    func testCorruptQueueRequiresExplicitRecoveryAndKeepsDiagnosticCopy() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "musicplayer-queue-corrupt-recovery-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let playlistURL = directory.appendingPathComponent("playlist.json")
+        let original = Data(#"{"version":2,"tracks":["broken""#.utf8)
+        try original.write(to: playlistURL)
+
+        let manager = PlaylistManager(playlistFileURLOverride: playlistURL)
+        await manager.loadSavedPlaylist()
+        let protected = await waitUntil(timeout: 1) {
+            manager.queuePersistenceProtection?.canResetQueue == true
+        }
+        XCTAssertTrue(protected)
+        XCTAssertEqual(try Data(contentsOf: playlistURL), original)
+
+        XCTAssertTrue(manager.recoverCorruptQueueStartingEmpty())
+        let becameWritable = await waitUntil(timeout: 1) {
+            manager.queuePersistenceProtection == nil
+        }
+        XCTAssertTrue(becameWritable)
+        let recovered = try readSnapshot(at: playlistURL)
+        XCTAssertTrue(recovered.paths.isEmpty)
+        XCTAssertEqual(recovered.currentIndex, 0)
+
         let diagnostics = try FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: nil

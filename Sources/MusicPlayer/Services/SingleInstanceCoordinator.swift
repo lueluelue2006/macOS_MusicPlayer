@@ -83,6 +83,16 @@ final class SingleInstanceCoordinator {
         let urls: [URL]
     }
 
+    struct ForwardedOpenRequest: Equatable {
+        fileprivate let id: String
+        let urls: [URL]
+    }
+
+    enum SecondaryLaunchResolution: Equatable {
+        case becamePrimary(openURLs: [URL])
+        case forwardedToPrimary
+    }
+
     static let defaultNotificationName = Notification.Name(
         "io.github.lueluelue2006.macosmusicplayer.single-instance.open.v1"
     )
@@ -97,6 +107,9 @@ final class SingleInstanceCoordinator {
     private static let maximumTotalPathBytes = 256 * 1_024
     private static let handoffTokenReadAttempts = 11
     private static let handoffTokenRetryDelayMicroseconds: useconds_t = 10_000
+    private static let defaultTakeoverTimeout: TimeInterval = 1.25
+    private static let maximumTakeoverTimeout: TimeInterval = 2.0
+    private static let defaultTakeoverRetryInterval: TimeInterval = 0.02
 
     private enum State {
         case idle
@@ -120,6 +133,7 @@ final class SingleInstanceCoordinator {
     private var rememberedRequestIDs: [String] = []
     private var rememberedRequestIDSet: Set<String> = []
     private var handoffToken: String?
+    private var isTakeoverInProgress = false
 
     convenience init() throws {
         try self.init(lockFileURL: Self.defaultLockFileURL())
@@ -222,38 +236,132 @@ final class SingleInstanceCoordinator {
 
     /// Sends an activation/open request to the primary process. Empty URL lists
     /// are valid and mean activation only.
-    func forwardOpenRequest(_ urls: [URL]) {
-        let paths = Self.sanitizedPaths(urls.map { $0.standardizedFileURL.path })
-        let requestID = UUID().uuidString
-        if let token = currentHandoffToken(refreshFromDescriptor: false) {
-            transport.post(
-                name: notificationName,
-                userInfo: Self.openRequestPayload(
-                    requestID: requestID,
-                    paths: paths,
-                    token: token
-                )
-            )
-        }
+    @discardableResult
+    func forwardOpenRequest(_ urls: [URL]) -> ForwardedOpenRequest {
+        let request = makeForwardedOpenRequest(urls)
+        postForwardedOpenRequest(request, refreshToken: false)
         // Reuse the same request ID so an established primary deduplicates the
         // retry. Re-read the token as well: a new primary may have held the
         // lock while its token was still empty, partial, or replacing a stale
         // token from the previous primary.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
-            guard let self,
-                  let token = self.currentHandoffToken(refreshFromDescriptor: true) else {
-                return
-            }
-            self.transport.post(
-                name: self.notificationName,
-                userInfo: Self.openRequestPayload(
-                    requestID: requestID,
-                    paths: paths,
-                    token: token
-                )
-            )
+            guard let self, self.isSecondary else { return }
+            self.postForwardedOpenRequest(request, refreshToken: true)
         }
         activateExistingApplication()
+        return request
+    }
+
+    /// Resolves the launch race where the old primary owns the lock while it is
+    /// already terminating. The request is forwarded immediately, then this
+    /// secondary polls the same descriptor for a finite period. If the lock is
+    /// released, exactly one contender can promote itself and the original
+    /// request is queued locally for the handler installed during primary setup.
+    ///
+    /// This method is synchronous by design so a composition root can decide
+    /// whether to build the primary object graph. Callers must not schedule the
+    /// secondary's forced exit until it returns.
+    func resolveSecondaryLaunch(
+        openURLs: [URL],
+        takeoverTimeout: TimeInterval = defaultTakeoverTimeout,
+        retryInterval: TimeInterval = defaultTakeoverRetryInterval
+    ) throws -> SecondaryLaunchResolution {
+        let request = forwardOpenRequest(openURLs)
+        let timeout = Self.sanitizedTakeoverTimeout(takeoverTimeout)
+        let interval = Self.sanitizedTakeoverRetryInterval(retryInterval)
+        let start = Self.monotonicNow()
+        let deadline = start + timeout
+        var didRefreshTokenSynchronously = false
+
+        stateLock.lock()
+        switch state {
+        case .primary:
+            stateLock.unlock()
+            return .becamePrimary(openURLs: request.urls)
+        case .secondary:
+            guard !isTakeoverInProgress else {
+                stateLock.unlock()
+                throw SingleInstanceCoordinatorError(operation: .acquireLock, code: EALREADY)
+            }
+            isTakeoverInProgress = true
+            stateLock.unlock()
+        case .idle, .released:
+            stateLock.unlock()
+            throw SingleInstanceCoordinatorError(operation: .acquireLock, code: EINVAL)
+        }
+
+        while true {
+            stateLock.lock()
+            guard case .secondary = state,
+                  isTakeoverInProgress,
+                  lockFileDescriptor >= 0 else {
+                let becamePrimary: Bool
+                if case .primary = state {
+                    becamePrimary = true
+                } else {
+                    becamePrimary = false
+                }
+                isTakeoverInProgress = false
+                stateLock.unlock()
+                return becamePrimary
+                    ? .becamePrimary(openURLs: request.urls)
+                    : .forwardedToPrimary
+            }
+
+            let descriptor = lockFileDescriptor
+            if systemFlock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+                let token = UUID().uuidString
+                do {
+                    try Self.writeHandoffToken(token, to: descriptor)
+                } catch {
+                    _ = systemFlock(descriptor, LOCK_UN)
+                    isTakeoverInProgress = false
+                    stateLock.unlock()
+                    throw error
+                }
+
+                handoffToken = token
+                state = .primary
+                isTakeoverInProgress = false
+                rememberRequestIDLocked(request.id)
+                let handler = openRequestHandler
+                if handler == nil, !request.urls.isEmpty {
+                    enqueuePendingOpenRequestLocked(
+                        OpenRequest(id: request.id, urls: request.urls)
+                    )
+                }
+                stateLock.unlock()
+
+                installObserver()
+                activateCurrentApplication()
+                if !request.urls.isEmpty {
+                    handler?(request.urls)
+                }
+                return .becamePrimary(openURLs: request.urls)
+            }
+
+            let lockError = errno
+            stateLock.unlock()
+            guard lockError == EWOULDBLOCK || lockError == EAGAIN || lockError == EINTR else {
+                finishTakeoverAttemptIfSecondary()
+                throw SingleInstanceCoordinatorError(operation: .acquireLock, code: lockError)
+            }
+
+            let now = Self.monotonicNow()
+            if !didRefreshTokenSynchronously, now - start >= 0.10 {
+                didRefreshTokenSynchronously = true
+                postForwardedOpenRequest(request, refreshToken: true)
+            }
+            guard now < deadline else {
+                finishTakeoverAttemptIfSecondary()
+                return .forwardedToPrimary
+            }
+
+            let sleepDuration = min(interval, max(0, deadline - now))
+            if sleepDuration > 0 {
+                usleep(useconds_t((sleepDuration * 1_000_000).rounded()))
+            }
+        }
     }
 
     /// Installs the primary-process consumer and drains requests that arrived
@@ -288,6 +396,7 @@ final class SingleInstanceCoordinator {
         }
         state = .released
         handoffToken = nil
+        isTakeoverInProgress = false
         pendingOpenRequests.removeAll(keepingCapacity: false)
         openRequestHandler = nil
         stateLock.unlock()
@@ -328,6 +437,11 @@ final class SingleInstanceCoordinator {
             self?.receive(userInfo: userInfo)
         }
         stateLock.lock()
+        guard case .primary = state, observer == nil else {
+            stateLock.unlock()
+            transport.removeObserver(token)
+            return
+        }
         observer = token
         stateLock.unlock()
     }
@@ -352,23 +466,15 @@ final class SingleInstanceCoordinator {
             stateLock.unlock()
             return
         }
-        guard rememberedRequestIDSet.insert(requestID).inserted else {
+        guard rememberRequestIDLocked(requestID) else {
             stateLock.unlock()
             return
-        }
-        rememberedRequestIDs.append(requestID)
-        if rememberedRequestIDs.count > Self.maximumRememberedRequestIDs {
-            let removed = rememberedRequestIDs.removeFirst()
-            rememberedRequestIDSet.remove(removed)
         }
 
         let urls = sanitizedPaths.map { URL(fileURLWithPath: $0).standardizedFileURL }
         let handler = openRequestHandler
         if handler == nil, !urls.isEmpty {
-            if pendingOpenRequests.count >= Self.maximumPendingOpenRequests {
-                pendingOpenRequests.removeFirst()
-            }
-            pendingOpenRequests.append(OpenRequest(id: requestID, urls: urls))
+            enqueuePendingOpenRequestLocked(OpenRequest(id: requestID, urls: urls))
         }
         stateLock.unlock()
 
@@ -376,6 +482,66 @@ final class SingleInstanceCoordinator {
         if !urls.isEmpty {
             handler?(urls)
         }
+    }
+
+    private var isSecondary: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if case .secondary = state { return true }
+        return false
+    }
+
+    private func makeForwardedOpenRequest(_ urls: [URL]) -> ForwardedOpenRequest {
+        let paths = Self.sanitizedPaths(urls.map { $0.standardizedFileURL.path })
+        return ForwardedOpenRequest(
+            id: UUID().uuidString,
+            urls: paths.map { URL(fileURLWithPath: $0).standardizedFileURL }
+        )
+    }
+
+    private func postForwardedOpenRequest(
+        _ request: ForwardedOpenRequest,
+        refreshToken: Bool
+    ) {
+        guard let token = currentHandoffToken(
+            refreshFromDescriptor: refreshToken
+        ) else { return }
+        transport.post(
+            name: notificationName,
+            userInfo: Self.openRequestPayload(
+                requestID: request.id,
+                paths: request.urls.map(\.path),
+                token: token
+            )
+        )
+    }
+
+    /// Must be called with `stateLock` held.
+    @discardableResult
+    private func rememberRequestIDLocked(_ requestID: String) -> Bool {
+        guard rememberedRequestIDSet.insert(requestID).inserted else { return false }
+        rememberedRequestIDs.append(requestID)
+        if rememberedRequestIDs.count > Self.maximumRememberedRequestIDs {
+            let removed = rememberedRequestIDs.removeFirst()
+            rememberedRequestIDSet.remove(removed)
+        }
+        return true
+    }
+
+    /// Must be called with `stateLock` held.
+    private func enqueuePendingOpenRequestLocked(_ request: OpenRequest) {
+        if pendingOpenRequests.count >= Self.maximumPendingOpenRequests {
+            pendingOpenRequests.removeFirst()
+        }
+        pendingOpenRequests.append(request)
+    }
+
+    private func finishTakeoverAttemptIfSecondary() {
+        stateLock.lock()
+        if case .secondary = state {
+            isTakeoverInProgress = false
+        }
+        stateLock.unlock()
     }
 
     private func currentHandoffToken(refreshFromDescriptor: Bool) -> String? {
@@ -387,6 +553,26 @@ final class SingleInstanceCoordinator {
             handoffToken = refreshed
         }
         return handoffToken
+    }
+
+    private static func sanitizedTakeoverTimeout(_ timeout: TimeInterval) -> TimeInterval {
+        if timeout.isNaN || timeout == -.infinity { return 0 }
+        if timeout == .infinity { return maximumTakeoverTimeout }
+        return min(max(0, timeout), maximumTakeoverTimeout)
+    }
+
+    private static func sanitizedTakeoverRetryInterval(
+        _ interval: TimeInterval
+    ) -> TimeInterval {
+        guard interval.isFinite, interval > 0 else {
+            return defaultTakeoverRetryInterval
+        }
+        return min(max(0.001, interval), 0.10)
+    }
+
+    private static func monotonicNow() -> TimeInterval {
+        let value = ProcessInfo.processInfo.systemUptime
+        return value.isFinite ? value : 0
     }
 
     private static func openRequestPayload(

@@ -31,7 +31,8 @@ struct PlaylistView: View {
     _viewModel = StateObject(wrappedValue: PlaylistViewModel(
       audioPlayer: audioPlayer,
       playlistManager: playlistManager,
-      playlistsStore: playlistsStore
+      playlistsStore: playlistsStore,
+      weights: playlistManager.playbackWeights
     ))
   }
 

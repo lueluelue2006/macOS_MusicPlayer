@@ -22,6 +22,11 @@ struct VolumeAnalysisStoreError: Error, Equatable, Sendable {
     let message: String
 }
 
+enum VolumeDatabaseMigrationPhase: Equatable, Sendable {
+    case beforeCommit
+    case afterCommitBeforeCleanup
+}
+
 struct StoredVolumeAnalysis: Equatable, Sendable {
     let pathKey: String
     let measurement: LoudnessMeasurement
@@ -122,19 +127,23 @@ final class VolumeAnalysisStore: @unchecked Sendable {
     private static let schemaVersion = 1
     private static let maximumLegacyJSONBytes = 16 * 1_024 * 1_024
     private static let legacyMetadataKey = "legacy_json_state"
+    private static let legacyDatabaseMetadataKey = "legacy_application_support_database_v1"
     private static let lastUsedWriteInterval: TimeInterval = 24 * 60 * 60
 
     private let queue = DispatchQueue(label: "audio.volume-analysis.store", qos: .utility)
     private let databaseURL: URL
+    private let legacyDatabaseURL: URL?
     private let legacyJSONURL: URL?
     private let analysisCapacity: Int
     private let failureCapacity: Int
     private let hotCacheCapacity: Int
     private let now: @Sendable () -> TimeInterval
+    private let databaseMigrationHook: (@Sendable (VolumeDatabaseMigrationPhase) throws -> Void)?
     private var database: SQLiteDatabase
     private var hotEntries: [String: HotEntry] = [:]
     private var accessSequence: UInt64 = 0
     private var legacyImportState: LegacyImportState = .notInspected
+    private var legacyDatabaseProtectionReason: ProtectedVolumeCacheReason?
 
     init(
         databaseURL: URL,
@@ -142,26 +151,29 @@ final class VolumeAnalysisStore: @unchecked Sendable {
         analysisCapacity: Int = 20_000,
         failureCapacity: Int = 5_000,
         hotCacheCapacity: Int = 256,
-        now: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 }
+        now: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 },
+        legacyDatabaseURL: URL? = nil,
+        persistenceEnvironment: PersistenceEnvironment? = nil,
+        databaseMigrationHook: (@Sendable (VolumeDatabaseMigrationPhase) throws -> Void)? = nil
     ) throws {
-        self.databaseURL = databaseURL
+        let locations = try Self.resolveDatabaseLocations(
+            requestedDatabaseURL: databaseURL,
+            explicitLegacyDatabaseURL: legacyDatabaseURL,
+            persistenceEnvironment: persistenceEnvironment
+        )
+        self.databaseURL = locations.active
+        self.legacyDatabaseURL = locations.legacy
         self.legacyJSONURL = legacyJSONURL
         self.analysisCapacity = max(1, analysisCapacity)
         self.failureCapacity = max(1, failureCapacity)
         self.hotCacheCapacity = max(1, hotCacheCapacity)
         self.now = now
+        self.databaseMigrationHook = databaseMigrationHook
 
-        var configuration = SQLiteConfiguration.production
-        configuration.pageCacheKiB = 512
-        configuration.journalSizeLimitBytes = 1_048_576
-        configuration.walAutoCheckpointPages = 128
-        database = try SQLiteDatabase(
-            fileURL: databaseURL,
-            schema: Self.schema,
-            configuration: configuration
-        )
+        database = try Self.openRebuildingDerivedDatabase(at: locations.active)
         switch database.accessMode {
         case .writable:
+            migrateLegacyDatabaseIfNeededLocked()
             legacyImportState = loadLegacyImportStateLocked()
             // Re-probe the bounded legacy file on every launch. A cache may be
             // restored or removed outside the app after a prior metadata marker;
@@ -180,8 +192,7 @@ final class VolumeAnalysisStore: @unchecked Sendable {
 
     var protectedCacheReason: ProtectedVolumeCacheReason? {
         queue.sync {
-            guard case .protectedCache(let reason) = legacyImportState else { return nil }
-            return reason
+            protectedCacheReasonLocked()
         }
     }
 
@@ -396,8 +407,7 @@ final class VolumeAnalysisStore: @unchecked Sendable {
 
     func clear(forceProtectedData: Bool = false) -> VolumeCacheClearResult {
         queue.sync {
-            if case .protectedCache(let reason) = legacyImportState,
-               !forceProtectedData {
+            if let reason = protectedCacheReasonLocked(), !forceProtectedData {
                 return .requiresConfirmation(reason)
             }
 
@@ -419,6 +429,15 @@ final class VolumeAnalysisStore: @unchecked Sendable {
                     try connection.execute("DELETE FROM failures")
                 }
                 hotEntries.removeAll(keepingCapacity: true)
+                if let legacyDatabaseURL,
+                   legacyDatabaseURL.standardizedFileURL != databaseURL.standardizedFileURL,
+                   Self.databaseFamilyExists(at: legacyDatabaseURL) {
+                    try Self.removeDatabaseFamily(at: legacyDatabaseURL)
+                    if forceProtectedData {
+                        removedProtectedLegacy = true
+                    }
+                }
+                legacyDatabaseProtectionReason = nil
                 if forceProtectedData, let legacyJSONURL,
                    FileManager.default.fileExists(atPath: legacyJSONURL.path) {
                     try FileManager.default.removeItem(at: legacyJSONURL)
@@ -464,6 +483,288 @@ final class VolumeAnalysisStore: @unchecked Sendable {
                 && fileSize == snapshot.fileSize
                 && modificationTimeNanoseconds == snapshot.mtimeNs
                 && fileIdentifier == snapshot.inode
+        }
+    }
+
+    private struct DatabaseLocations {
+        let active: URL
+        let legacy: URL?
+    }
+
+    private static func resolveDatabaseLocations(
+        requestedDatabaseURL: URL,
+        explicitLegacyDatabaseURL: URL?,
+        persistenceEnvironment: PersistenceEnvironment?
+    ) throws -> DatabaseLocations {
+        let requested = requestedDatabaseURL.standardizedFileURL
+        if let explicitLegacyDatabaseURL {
+            let legacy = explicitLegacyDatabaseURL.standardizedFileURL
+            return DatabaseLocations(
+                active: requested,
+                legacy: legacy == requested ? nil : legacy
+            )
+        }
+
+        let environment: PersistenceEnvironment?
+        if let persistenceEnvironment {
+            environment = persistenceEnvironment
+        } else {
+            environment = try? PersistenceEnvironment.production()
+        }
+        guard let environment else {
+            return DatabaseLocations(active: requested, legacy: nil)
+        }
+
+        let applicationSupport = environment.applicationSupportURL.standardizedFileURL
+        let caches = environment.cachesURL.standardizedFileURL
+        let parent = requested.deletingLastPathComponent().standardizedFileURL
+        if parent == applicationSupport || parent == caches {
+            _ = try environment.prepareCachesDirectory()
+            let active = caches.appendingPathComponent(
+                requested.lastPathComponent,
+                isDirectory: false
+            )
+            let legacy = applicationSupport.appendingPathComponent(
+                requested.lastPathComponent,
+                isDirectory: false
+            )
+            return DatabaseLocations(
+                active: active,
+                legacy: active.standardizedFileURL == legacy.standardizedFileURL ? nil : legacy
+            )
+        }
+        return DatabaseLocations(active: requested, legacy: nil)
+    }
+
+    private static func databaseConfiguration() -> SQLiteConfiguration {
+        var configuration = SQLiteConfiguration.production
+        configuration.pageCacheKiB = 512
+        configuration.journalSizeLimitBytes = 1_048_576
+        configuration.walAutoCheckpointPages = 128
+        return configuration
+    }
+
+    private static func makeDatabase(at url: URL) throws -> SQLiteDatabase {
+        try SQLiteDatabase(
+            fileURL: url,
+            schema: schema,
+            configuration: databaseConfiguration()
+        )
+    }
+
+    private static func openRebuildingDerivedDatabase(at url: URL) throws -> SQLiteDatabase {
+        do {
+            let opened = try makeDatabase(at: url)
+            guard opened.accessMode == .writable else { return opened }
+            do {
+                let report = try opened.integrityCheck(.quick, maximumErrors: 1)
+                guard !report.isHealthy else { return opened }
+            } catch {
+                opened.close()
+                guard isDatabaseCorruption(error) else { throw error }
+                try removeDatabaseFamily(at: url)
+                return try makeDatabase(at: url)
+            }
+            opened.close()
+            try removeDatabaseFamily(at: url)
+            return try makeDatabase(at: url)
+        } catch {
+            guard isDatabaseCorruption(error) else { throw error }
+            try removeDatabaseFamily(at: url)
+            return try makeDatabase(at: url)
+        }
+    }
+
+    private static func isDatabaseCorruption(_ error: Error) -> Bool {
+        guard let sqlite = error as? SQLitePersistenceError else { return false }
+        let detail = sqlite.detail.lowercased()
+        return detail.contains("not a database")
+            || detail.contains("malformed")
+            || detail.contains("unsupported file format")
+            || detail.contains("database disk image")
+    }
+
+    private static func databaseFamilyURLs(at databaseURL: URL) -> [URL] {
+        [
+            URL(fileURLWithPath: databaseURL.path + "-shm"),
+            URL(fileURLWithPath: databaseURL.path + "-wal"),
+            databaseURL
+        ]
+    }
+
+    private static func databaseFamilyExists(at databaseURL: URL) -> Bool {
+        databaseFamilyURLs(at: databaseURL).contains {
+            FileManager.default.fileExists(atPath: $0.path)
+        }
+    }
+
+    private static func removeDatabaseFamily(at databaseURL: URL) throws {
+        let fileManager = FileManager.default
+        for url in databaseFamilyURLs(at: databaseURL) {
+            do {
+                try fileManager.removeItem(at: url)
+            } catch let error as CocoaError where error.code == .fileNoSuchFile {
+                continue
+            }
+        }
+    }
+
+    private func migrateLegacyDatabaseIfNeededLocked() {
+        guard let legacyDatabaseURL,
+              legacyDatabaseURL.standardizedFileURL != databaseURL.standardizedFileURL,
+              Self.databaseFamilyExists(at: legacyDatabaseURL) else { return }
+
+        guard FileManager.default.fileExists(atPath: legacyDatabaseURL.path) else {
+            // A prior crash may leave only disposable WAL sidecars behind.
+            try? Self.removeDatabaseFamily(at: legacyDatabaseURL)
+            return
+        }
+
+        let source: SQLiteDatabase
+        do {
+            source = try Self.makeDatabase(at: legacyDatabaseURL)
+        } catch {
+            if Self.isDatabaseCorruption(error) {
+                try? Self.removeDatabaseFamily(at: legacyDatabaseURL)
+            }
+            return
+        }
+        defer { source.close() }
+
+        switch source.accessMode {
+        case .readOnlyFuture(let version):
+            legacyDatabaseProtectionReason = .futureDatabase(version: version)
+            return
+        case .readOnlyForeign(let applicationID):
+            legacyDatabaseProtectionReason = .foreignDatabase(applicationID: applicationID)
+            return
+        case .writable:
+            break
+        }
+
+        do {
+            let integrity = try source.integrityCheck(.quick, maximumErrors: 1)
+            guard integrity.isHealthy else {
+                source.close()
+                try? Self.removeDatabaseFamily(at: legacyDatabaseURL)
+                return
+            }
+
+            try source.transaction(.deferred) { sourceConnection in
+                try database.transaction { targetConnection in
+                    try copyAnalyses(
+                        from: sourceConnection,
+                        to: targetConnection
+                    )
+                    try copyFailures(
+                        from: sourceConnection,
+                        to: targetConnection
+                    )
+                    try Self.enforceAnalysisCapacity(
+                        connection: targetConnection,
+                        capacity: analysisCapacity
+                    )
+                    try Self.enforceFailureCapacity(
+                        connection: targetConnection,
+                        capacity: failureCapacity
+                    )
+                    try targetConnection.execute(
+                        """
+                        INSERT INTO metadata(key, value) VALUES (?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """,
+                        bindings: [
+                            .text(Self.legacyDatabaseMetadataKey),
+                            .text("complete")
+                        ]
+                    )
+                    try databaseMigrationHook?(.beforeCommit)
+                }
+            }
+            try database.checkpoint()
+            try databaseMigrationHook?(.afterCommitBeforeCleanup)
+            source.close()
+            try Self.removeDatabaseFamily(at: legacyDatabaseURL)
+            legacyDatabaseProtectionReason = nil
+        } catch {
+            source.close()
+            if Self.isDatabaseCorruption(error) {
+                try? Self.removeDatabaseFamily(at: legacyDatabaseURL)
+            }
+            // Transient and injected failures retain the source for an idempotent
+            // retry. Proven corruption is disposable derived data, so it is
+            // removed and rebuilt instead of trapping every future launch.
+        }
+    }
+
+    private func copyAnalyses(
+        from source: SQLiteConnection,
+        to target: SQLiteConnection
+    ) throws {
+        try source.forEachRow("SELECT * FROM analyses") { row in
+            let analysis = Self.decodeAnalysisRow(row)
+            guard !analysis.pathKey.isEmpty,
+                  analysis.pathKey.utf8.count <= 16 * 1_024,
+                  analysis.measurement.usesCurrentAlgorithm,
+                  analysis.measurement.integratedLoudnessLUFS?.isFinite != false,
+                  analysis.measurement.estimatedTruePeakDbTP.isFinite,
+                  analysis.measurement.samplePeakDbFS.isFinite,
+                  analysis.measurement.analyzedFrameCount > 0,
+                  analysis.measurement.sampleRate.isFinite,
+                  analysis.measurement.sampleRate > 0,
+                  analysis.fileSize >= 0,
+                  analysis.updatedAt.isFinite,
+                  analysis.lastUsedAt.isFinite else { return true }
+            let snapshot = FileValidationSnapshot(
+                exists: true,
+                fileSize: analysis.fileSize,
+                mtimeNs: analysis.modificationTimeNanoseconds,
+                inode: analysis.fileIdentifier.map { Int64(bitPattern: $0) }
+            )
+            try target.execute(
+                Self.analysisMigrationUpsertSQL,
+                bindings: Self.analysisBindings(
+                    pathKey: analysis.pathKey,
+                    measurement: analysis.measurement,
+                    snapshot: snapshot,
+                    updatedAt: analysis.updatedAt,
+                    lastUsedAt: analysis.lastUsedAt
+                )
+            )
+            return true
+        }
+    }
+
+    private func copyFailures(
+        from source: SQLiteConnection,
+        to target: SQLiteConnection
+    ) throws {
+        try source.forEachRow(
+            "SELECT path_key, file_size, mtime_ns, file_identifier, failure_code, attempts, retry_after, updated_at FROM failures"
+        ) { row in
+            guard let pathKey = row.string(at: 0),
+                  !pathKey.isEmpty,
+                  pathKey.utf8.count <= 16 * 1_024,
+                  let fileSize = row.int64(at: 1), fileSize >= 0,
+                  let modificationTime = row.int64(at: 2),
+                  let failureCode = row.string(at: 4), !failureCode.isEmpty,
+                  let attempts = row.int64(at: 5), attempts > 0,
+                  let retryAfter = row.double(at: 6), retryAfter.isFinite,
+                  let updatedAt = row.double(at: 7), updatedAt.isFinite else { return true }
+            try target.execute(
+                Self.failureMigrationUpsertSQL,
+                bindings: [
+                    .text(pathKey),
+                    .integer(fileSize),
+                    .integer(modificationTime),
+                    row.int64(at: 3).map(SQLiteValue.integer) ?? .null,
+                    .text(failureCode),
+                    .integer(attempts),
+                    .real(retryAfter),
+                    .real(updatedAt)
+                ]
+            )
+            return true
         }
     }
 
@@ -542,6 +843,11 @@ final class VolumeAnalysisStore: @unchecked Sendable {
             last_used_at = excluded.last_used_at
         """
 
+    private static let analysisMigrationUpsertSQL = analysisUpsertSQL + """
+
+        WHERE excluded.updated_at >= analyses.updated_at
+        """
+
     private static let failureUpsertSQL = """
         INSERT INTO failures(
             path_key, file_size, mtime_ns, file_identifier, failure_code,
@@ -555,6 +861,11 @@ final class VolumeAnalysisStore: @unchecked Sendable {
             attempts = excluded.attempts,
             retry_after = excluded.retry_after,
             updated_at = excluded.updated_at
+        """
+
+    private static let failureMigrationUpsertSQL = failureUpsertSQL + """
+
+        WHERE excluded.updated_at >= failures.updated_at
         """
 
     private static func analysisBindings(
@@ -842,7 +1153,7 @@ final class VolumeAnalysisStore: @unchecked Sendable {
                         inode: entry.fileIdentifier.map { Int64(bitPattern: $0) }
                     )
                     try connection.execute(
-                        Self.analysisUpsertSQL,
+                        Self.analysisMigrationUpsertSQL,
                         bindings: Self.analysisBindings(
                             pathKey: PathKey.canonical(path: rawPath),
                             measurement: measurement,
@@ -872,6 +1183,9 @@ final class VolumeAnalysisStore: @unchecked Sendable {
     }
 
     private func protectedCacheReasonLocked() -> ProtectedVolumeCacheReason? {
+        if let legacyDatabaseProtectionReason {
+            return legacyDatabaseProtectionReason
+        }
         switch database.accessMode {
         case .writable:
             if case .protectedCache(let reason) = legacyImportState { return reason }
@@ -885,22 +1199,10 @@ final class VolumeAnalysisStore: @unchecked Sendable {
 
     private func replaceProtectedDatabaseLocked() throws {
         database.close()
-        let fileManager = FileManager.default
-        for url in [
-            databaseURL,
-            URL(fileURLWithPath: databaseURL.path + "-wal"),
-            URL(fileURLWithPath: databaseURL.path + "-shm")
-        ] where fileManager.fileExists(atPath: url.path) {
-            try fileManager.removeItem(at: url)
-        }
-        var configuration = SQLiteConfiguration.production
-        configuration.pageCacheKiB = 512
-        database = try SQLiteDatabase(
-            fileURL: databaseURL,
-            schema: Self.schema,
-            configuration: configuration
-        )
+        try Self.removeDatabaseFamily(at: databaseURL)
+        database = try Self.makeDatabase(at: databaseURL)
         legacyImportState = .absent
+        legacyDatabaseProtectionReason = nil
         try persistLegacyImportStateLocked(.absent)
     }
 }

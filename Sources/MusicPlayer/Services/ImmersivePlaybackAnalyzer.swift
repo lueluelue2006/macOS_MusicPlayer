@@ -54,6 +54,8 @@ actor ImmersivePlaybackAnalyzer {
     private static let failureRetryDelay: TimeInterval = 15 * 60
     private static let accessTimestampWriteInterval: TimeInterval = 24 * 60 * 60
     private static let maximumExtendedEdgeDuration: TimeInterval = 120
+    static let legacyMigrationMarkerKey = "immersive-boundaries-json-to-derived-v1"
+    private static let derivedPayloadFormatVersion = 1
 
     struct Configuration: Equatable, Sendable {
         var analysisEdgeDuration: TimeInterval = 30
@@ -179,6 +181,22 @@ actor ImmersivePlaybackAnalyzer {
         let attemptCount: Int
     }
 
+    private struct DerivedBoundsPayload: Codable, Equatable {
+        let formatVersion: Int
+        let bounds: PlaybackBounds
+    }
+
+    private struct DerivedFailurePayload: Codable, Equatable {
+        let formatVersion: Int
+        let retryAfter: TimeInterval
+        let attemptCount: Int
+    }
+
+    private struct CacheGenerationToken: Equatable, Sendable {
+        let localEpoch: UInt64
+        let derivedStoreGeneration: UInt64?
+    }
+
     private struct CacheFile: Codable {
         let formatVersion: Int
         let algorithmVersion: Int
@@ -284,7 +302,13 @@ actor ImmersivePlaybackAnalyzer {
         }
     }
 
+    /// A non-nil explicit file backend is retained for deterministic tests and
+    /// compatibility fixtures. Production instances use `derivedCacheStore`
+    /// and only consult `legacyCacheFileURL` for one-time migration.
     private let cacheFileURL: URL?
+    private let derivedCacheStore: DerivedCacheStore?
+    private let usesSharedDerivedCacheBackend: Bool
+    private let legacyCacheFileURL: URL?
     private let configuration: Configuration
     private let decodeWorker: DecodeWorker
     private var didLoadCache = false
@@ -299,13 +323,48 @@ actor ImmersivePlaybackAnalyzer {
     private var cacheRetryAttempt = 0
 
     init(
-        cacheFileURL: URL? = ImmersivePlaybackAnalyzer.defaultCacheFileURL(),
+        configuration: Configuration = Configuration(),
+        analysisOperation: @escaping AnalysisOperation = { url, configuration in
+            try ImmersivePlaybackAnalyzer.analyzeFile(at: url, configuration: configuration)
+        }
+    ) {
+        cacheFileURL = nil
+        derivedCacheStore = .shared
+        usesSharedDerivedCacheBackend = true
+        legacyCacheFileURL = ImmersivePlaybackAnalyzer.defaultCacheFileURL()
+        self.configuration = configuration
+        decodeWorker = DecodeWorker(operation: analysisOperation)
+    }
+
+    init(
+        cacheFileURL: URL?,
         configuration: Configuration = Configuration(),
         analysisOperation: @escaping AnalysisOperation = { url, configuration in
             try ImmersivePlaybackAnalyzer.analyzeFile(at: url, configuration: configuration)
         }
     ) {
         self.cacheFileURL = cacheFileURL
+        derivedCacheStore = nil
+        usesSharedDerivedCacheBackend = false
+        legacyCacheFileURL = nil
+        self.configuration = configuration
+        decodeWorker = DecodeWorker(operation: analysisOperation)
+    }
+
+    /// Injection seam for the shared SQLite backend. It keeps production and
+    /// migration behavior testable without touching the process-global store.
+    init(
+        derivedCacheStore: DerivedCacheStore?,
+        legacyCacheFileURL: URL? = nil,
+        configuration: Configuration = Configuration(),
+        analysisOperation: @escaping AnalysisOperation = { url, configuration in
+            try ImmersivePlaybackAnalyzer.analyzeFile(at: url, configuration: configuration)
+        }
+    ) {
+        cacheFileURL = nil
+        self.derivedCacheStore = derivedCacheStore
+        usesSharedDerivedCacheBackend = true
+        self.legacyCacheFileURL = legacyCacheFileURL
         self.configuration = configuration
         decodeWorker = DecodeWorker(operation: analysisOperation)
     }
@@ -335,6 +394,13 @@ actor ImmersivePlaybackAnalyzer {
         }
 
         let key = PathKey.canonical(for: url)
+        if let derivedCacheStore {
+            return derivedCachedBounds(
+                store: derivedCacheStore,
+                key: key,
+                signature: signature
+            )
+        }
         guard var entry = entries[key] else { return nil }
         guard entry.signature == signature, entry.bounds.isValid else {
             entries.removeValue(forKey: key)
@@ -373,15 +439,17 @@ actor ImmersivePlaybackAnalyzer {
         }
         loadCacheIfNeeded()
         let key = PathKey.canonical(for: url)
-        if let failure = failures[key] {
+        let activeFailure = derivedCacheStore.map {
+            derivedFailure(store: $0, key: key, signature: initialSignature)
+        } ?? failures[key]
+        if let failure = activeFailure {
             if failure.signature == initialSignature,
                failure.retryAfter > Date().timeIntervalSince1970 {
                 return .fullRange(duration: 0)
             }
-            failures.removeValue(forKey: key)
-            scheduleCacheSave()
+            removeFailureRecord(for: key)
         }
-        let capturedEpoch = cacheEpoch
+        let capturedGeneration = currentCacheGenerationToken()
         let worker = decodeWorker
         let analysisConfiguration = configuration
 
@@ -399,7 +467,7 @@ actor ImmersivePlaybackAnalyzer {
                             url: url,
                             key: key,
                             expectedSignature: initialSignature,
-                            expectedEpoch: capturedEpoch
+                            expectedGeneration: capturedGeneration
                         ) else { return }
                         onLateBounds?(acceptedBounds)
                     }
@@ -407,7 +475,11 @@ actor ImmersivePlaybackAnalyzer {
             )
         } catch let failure as AnalysisFailure {
             if case .readFailed = failure {
-                recordFailure(for: key, signature: initialSignature)
+                recordFailure(
+                    for: key,
+                    signature: initialSignature,
+                    expectedGeneration: capturedGeneration
+                )
             }
             return failure.fallback
         } catch TimeoutError.timedOut {
@@ -416,7 +488,11 @@ actor ImmersivePlaybackAnalyzer {
             return .fullRange(duration: 0)
         } catch {
             if !Task.isCancelled {
-                recordFailure(for: key, signature: initialSignature)
+                recordFailure(
+                    for: key,
+                    signature: initialSignature,
+                    expectedGeneration: capturedGeneration
+                )
             }
             return .fullRange(duration: 0)
         }
@@ -424,7 +500,7 @@ actor ImmersivePlaybackAnalyzer {
         guard !Task.isCancelled else {
             return .fullRange(duration: outcome.bounds.physicalDuration)
         }
-        guard capturedEpoch == cacheEpoch else {
+        guard capturedGeneration == currentCacheGenerationToken() else {
             return outcome.bounds
         }
 
@@ -435,7 +511,12 @@ actor ImmersivePlaybackAnalyzer {
             return .fullRange(duration: outcome.bounds.physicalDuration)
         }
 
-        cacheOutcome(outcome, key: key, signature: finalSignature)
+        cacheOutcome(
+            outcome,
+            key: key,
+            signature: finalSignature,
+            expectedGeneration: capturedGeneration
+        )
         return outcome.bounds
     }
 
@@ -444,24 +525,40 @@ actor ImmersivePlaybackAnalyzer {
         url: URL,
         key: String,
         expectedSignature: FileSignature,
-        expectedEpoch: UInt64
+        expectedGeneration: CacheGenerationToken
     ) -> PlaybackBounds? {
-        guard expectedEpoch == cacheEpoch,
+        guard expectedGeneration == currentCacheGenerationToken(),
               let finalSignature = FileSignature(FileValidationSnapshot.load(for: url)),
               finalSignature == expectedSignature,
               outcome.isCacheable,
               outcome.bounds.isValid else { return nil }
-        cacheOutcome(outcome, key: key, signature: finalSignature)
+        cacheOutcome(
+            outcome,
+            key: key,
+            signature: finalSignature,
+            expectedGeneration: expectedGeneration
+        )
         return outcome.bounds
     }
 
     private func cacheOutcome(
         _ outcome: AnalysisOutcome,
         key: String,
-        signature: FileSignature
+        signature: FileSignature,
+        expectedGeneration: CacheGenerationToken
     ) {
         guard outcome.isCacheable, outcome.bounds.isValid else { return }
         loadCacheIfNeeded()
+        if let derivedCacheStore {
+            persistDerivedOutcome(
+                outcome,
+                store: derivedCacheStore,
+                key: key,
+                signature: signature,
+                expectedGeneration: expectedGeneration
+            )
+            return
+        }
         if entries[key] == nil, entries.count >= Self.maximumCacheEntries {
             let removeCount = entries.count - Self.cacheLowWatermark + 1
             for staleKey in entries.sorted(by: { lhs, rhs in
@@ -484,12 +581,28 @@ actor ImmersivePlaybackAnalyzer {
 
     func remove(for url: URL) {
         loadCacheIfNeeded()
+        cacheEpoch &+= 1
         removeEntry(for: url)
     }
 
     @discardableResult
     func removeAll() -> Result<CacheClearReport, CachePersistenceError> {
         loadCacheIfNeeded()
+        if let derivedCacheStore {
+            cacheEpoch &+= 1
+            switch derivedCacheStore.clear(.immersive) {
+            case .success(let report):
+                return .success(
+                    CacheClearReport(
+                        removedEntryCount: report.removedEntryCount,
+                        removedFailureCount: 0
+                    )
+                )
+            case .failure(let error):
+                cacheEpoch &+= 1
+                return .failure(cachePersistenceError(for: error))
+            }
+        }
         if persistenceIsBlocked {
             retryProtectedCacheQuarantine()
         }
@@ -521,6 +634,20 @@ actor ImmersivePlaybackAnalyzer {
     @discardableResult
     func flushPersistence() -> Result<CacheFlushReport, CachePersistenceError> {
         loadCacheIfNeeded()
+        if let derivedCacheStore {
+            switch derivedCacheStore.flush() {
+            case .success(let report):
+                return .success(
+                    CacheFlushReport(
+                        wroteFile: report.wroteDatabase,
+                        entryCount: derivedCacheStore.persistedEntryCount(for: .immersive),
+                        failureCount: 0
+                    )
+                )
+            case .failure(let error):
+                return .failure(cachePersistenceError(for: error))
+            }
+        }
         if persistenceIsBlocked {
             retryProtectedCacheQuarantine()
         }
@@ -1226,9 +1353,181 @@ actor ImmersivePlaybackAnalyzer {
 
     // MARK: - Cache IO
 
+    private var derivedBoundsVariant: String {
+        "bounds-v\(Self.derivedPayloadFormatVersion)|\(configuration.cacheSignature)"
+    }
+
+    private var derivedFailureVariant: String {
+        "failure-v\(Self.derivedPayloadFormatVersion)|\(configuration.cacheSignature)"
+    }
+
+    private func currentCacheGenerationToken() -> CacheGenerationToken {
+        CacheGenerationToken(
+            localEpoch: cacheEpoch,
+            derivedStoreGeneration: derivedCacheStore?.generation(for: .immersive)
+        )
+    }
+
+    private func derivedIdentity(
+        for signature: FileSignature
+    ) -> DerivedCacheStore.FileIdentity {
+        DerivedCacheStore.FileIdentity(
+            fileSize: signature.fileSize,
+            modificationTimeNanoseconds: signature.mtimeNs,
+            fileIdentifier: signature.inode
+        )
+    }
+
+    private func derivedCachedBounds(
+        store: DerivedCacheStore,
+        key: String,
+        signature: FileSignature
+    ) -> PlaybackBounds? {
+        guard let record = store.record(
+            kind: .immersive,
+            key: key,
+            variant: derivedBoundsVariant,
+            matching: derivedIdentity(for: signature)
+        ) else { return nil }
+        guard let payload = try? JSONDecoder().decode(
+            DerivedBoundsPayload.self,
+            from: record.payload
+        ),
+        payload.formatVersion == Self.derivedPayloadFormatVersion,
+        payload.bounds.isValid else {
+            let generation = store.generation(for: .immersive)
+            _ = store.enqueue([
+                .delete(
+                    kind: .immersive,
+                    key: key,
+                    variant: derivedBoundsVariant,
+                    expectedGeneration: generation
+                )
+            ])
+            return nil
+        }
+        return payload.bounds
+    }
+
+    private func derivedFailure(
+        store: DerivedCacheStore,
+        key: String,
+        signature: FileSignature
+    ) -> FailureEntry? {
+        guard let record = store.record(
+            kind: .immersive,
+            key: key,
+            variant: derivedFailureVariant,
+            matching: derivedIdentity(for: signature),
+            touch: false
+        ) else { return nil }
+        guard let payload = try? JSONDecoder().decode(
+            DerivedFailurePayload.self,
+            from: record.payload
+        ),
+        payload.formatVersion == Self.derivedPayloadFormatVersion,
+        payload.retryAfter.isFinite,
+        payload.attemptCount > 0,
+        payload.attemptCount <= 8 else {
+            let generation = store.generation(for: .immersive)
+            _ = store.enqueue([
+                .delete(
+                    kind: .immersive,
+                    key: key,
+                    variant: derivedFailureVariant,
+                    expectedGeneration: generation
+                )
+            ])
+            return nil
+        }
+        return FailureEntry(
+            signature: signature,
+            retryAfter: payload.retryAfter,
+            attemptCount: payload.attemptCount
+        )
+    }
+
+    private func persistDerivedOutcome(
+        _ outcome: AnalysisOutcome,
+        store: DerivedCacheStore,
+        key: String,
+        signature: FileSignature,
+        expectedGeneration: CacheGenerationToken
+    ) {
+        guard expectedGeneration == currentCacheGenerationToken(),
+              let storeGeneration = expectedGeneration.derivedStoreGeneration,
+              let payload = try? JSONEncoder().encode(
+                  DerivedBoundsPayload(
+                      formatVersion: Self.derivedPayloadFormatVersion,
+                      bounds: outcome.bounds
+                  )
+              ) else { return }
+        let now = Date().timeIntervalSince1970
+        let record = DerivedCacheStore.Record(
+            kind: .immersive,
+            key: key,
+            variant: derivedBoundsVariant,
+            payload: payload,
+            fileIdentity: derivedIdentity(for: signature),
+            updatedAt: now,
+            lastAccessedAt: now
+        )
+        if case .failure(let error) = store.enqueue([
+            .upsert(record, expectedGeneration: storeGeneration),
+            .delete(
+                kind: .immersive,
+                key: key,
+                variant: derivedFailureVariant,
+                expectedGeneration: storeGeneration
+            )
+        ]) {
+            PersistenceLogger.log("沉浸分析结果写入派生缓存失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func removeFailureRecord(for key: String) {
+        if let derivedCacheStore {
+            let generation = derivedCacheStore.generation(for: .immersive)
+            _ = derivedCacheStore.enqueue([
+                .delete(
+                    kind: .immersive,
+                    key: key,
+                    variant: derivedFailureVariant,
+                    expectedGeneration: generation
+                )
+            ])
+            return
+        }
+        if failures.removeValue(forKey: key) != nil {
+            scheduleCacheSave()
+        }
+    }
+
+    private func cachePersistenceError(
+        for error: DerivedCacheStore.StoreError
+    ) -> CachePersistenceError {
+        switch error {
+        case .storageUnavailable:
+            return .storageUnavailable
+        case .readOnly:
+            return .blockedByProtectedFile
+        case .invalidKey, .invalidVariant, .payloadTooLarge, .invalidRecord,
+             .invalidMigrationMarker, .staleGeneration:
+            return .encodeFailed
+        case .databaseFailure:
+            return .writeFailed
+        }
+    }
+
     private func loadCacheIfNeeded() {
         guard !didLoadCache else { return }
         didLoadCache = true
+        if usesSharedDerivedCacheBackend {
+            if let derivedCacheStore {
+                migrateLegacyCacheIfNeeded(into: derivedCacheStore)
+            }
+            return
+        }
         guard let cacheFileURL,
               FileManager.default.fileExists(atPath: cacheFileURL.path) else { return }
 
@@ -1292,6 +1591,207 @@ actor ImmersivePlaybackAnalyzer {
         }
 
         quarantineActiveCache(reason: probedVersion == nil ? "corrupt" : "stale")
+    }
+
+    private func migrateLegacyCacheIfNeeded(into store: DerivedCacheStore) {
+        guard store.migrationMarker(for: Self.legacyMigrationMarkerKey) == nil else {
+            return
+        }
+
+        let now = Date().timeIntervalSince1970
+        guard let legacyCacheFileURL,
+              FileManager.default.fileExists(atPath: legacyCacheFileURL.path) else {
+            commitLegacyMigration(
+                mutations: [],
+                fingerprint: "absent",
+                completedAt: now,
+                sourceURL: nil,
+                quarantineReason: nil,
+                store: store
+            )
+            return
+        }
+
+        let data: Data
+        let fingerprint: String
+        do {
+            let fileSize = try DerivedCacheFileIO.fileSize(at: legacyCacheFileURL)
+            guard fileSize <= Self.maximumCacheBytes else {
+                commitLegacyMigration(
+                    mutations: [],
+                    fingerprint: "oversized:\(fileSize)",
+                    completedAt: now,
+                    sourceURL: legacyCacheFileURL,
+                    quarantineReason: .oversized,
+                    store: store
+                )
+                return
+            }
+            data = try DerivedCacheFileIO.readBoundedRegularFile(
+                at: legacyCacheFileURL,
+                maximumBytes: Self.maximumCacheBytes
+            )
+            fingerprint = "fnv64:\(Self.stableDigest(data)):\(data.count)"
+        } catch {
+            commitLegacyMigration(
+                mutations: [],
+                fingerprint: "unreadable",
+                completedAt: now,
+                sourceURL: legacyCacheFileURL,
+                quarantineReason: .corrupt,
+                store: store
+            )
+            return
+        }
+
+        let decoder = JSONDecoder()
+        let probedVersion = (try? decoder.decode(CacheVersionProbe.self, from: data))?.formatVersion
+        var migratedEntries: [String: CacheEntry] = [:]
+        var migratedFailures: [String: FailureEntry] = [:]
+        let reason: DerivedCacheQuarantineReason
+
+        if probedVersion == Self.cacheFormatVersion,
+           let cache = try? decoder.decode(CacheFile.self, from: data),
+           cache.algorithmVersion == Self.algorithmVersion,
+           cache.configurationSignature == configuration.cacheSignature {
+            migratedEntries = normalizedEntries(cache.entries)
+            migratedFailures = normalizedFailures(cache.failures)
+            reason = .legacy(version: Self.cacheFormatVersion)
+        } else if probedVersion == 1,
+                  let legacy = try? decoder.decode(LegacyCacheFile.self, from: data),
+                  legacy.algorithmVersion == Self.algorithmVersion,
+                  legacy.configurationSignature == configuration.cacheSignature {
+            migratedEntries = normalizedEntries(
+                legacy.entries.mapValues {
+                    CacheEntry(
+                        signature: $0.signature,
+                        bounds: $0.bounds,
+                        lastAccessedAt: now
+                    )
+                }
+            )
+            reason = .legacy(version: 1)
+        } else if let probedVersion, probedVersion > Self.cacheFormatVersion {
+            reason = .future(version: probedVersion)
+        } else if probedVersion == nil {
+            reason = .corrupt
+        } else {
+            reason = .legacy(version: probedVersion ?? 0)
+        }
+
+        let generation = store.generation(for: .immersive)
+        var mutations: [DerivedCacheStore.Mutation] = []
+        mutations.reserveCapacity(migratedEntries.count + migratedFailures.count)
+        let encoder = JSONEncoder()
+
+        for (key, entry) in migratedEntries {
+            guard !key.isEmpty,
+                  key.utf8.count <= 16 * 1_024,
+                  entry.signature.fileSize >= 0,
+                  entry.bounds.isValid,
+                  let payload = try? encoder.encode(
+                      DerivedBoundsPayload(
+                          formatVersion: Self.derivedPayloadFormatVersion,
+                          bounds: entry.bounds
+                      )
+                  ) else { continue }
+            let lastAccess = entry.lastAccessedAt?.isFinite == true
+                ? entry.lastAccessedAt!
+                : now
+            mutations.append(
+                .upsert(
+                    DerivedCacheStore.Record(
+                        kind: .immersive,
+                        key: key,
+                        variant: derivedBoundsVariant,
+                        payload: payload,
+                        fileIdentity: derivedIdentity(for: entry.signature),
+                        updatedAt: now,
+                        lastAccessedAt: lastAccess
+                    ),
+                    expectedGeneration: generation
+                )
+            )
+        }
+
+        for (key, failure) in migratedFailures {
+            guard !key.isEmpty,
+                  key.utf8.count <= 16 * 1_024,
+                  failure.signature.fileSize >= 0,
+                  failure.retryAfter.isFinite,
+                  (1 ... 8).contains(failure.attemptCount),
+                  let payload = try? encoder.encode(
+                      DerivedFailurePayload(
+                          formatVersion: Self.derivedPayloadFormatVersion,
+                          retryAfter: failure.retryAfter,
+                          attemptCount: failure.attemptCount
+                      )
+                  ) else { continue }
+            mutations.append(
+                .upsert(
+                    DerivedCacheStore.Record(
+                        kind: .immersive,
+                        key: key,
+                        variant: derivedFailureVariant,
+                        payload: payload,
+                        fileIdentity: derivedIdentity(for: failure.signature),
+                        updatedAt: now,
+                        lastAccessedAt: now
+                    ),
+                    expectedGeneration: generation
+                )
+            )
+        }
+
+        commitLegacyMigration(
+            mutations: mutations,
+            fingerprint: fingerprint,
+            completedAt: now,
+            sourceURL: legacyCacheFileURL,
+            quarantineReason: reason,
+            store: store
+        )
+    }
+
+    private func commitLegacyMigration(
+        mutations: [DerivedCacheStore.Mutation],
+        fingerprint: String,
+        completedAt: TimeInterval,
+        sourceURL: URL?,
+        quarantineReason: DerivedCacheQuarantineReason?,
+        store: DerivedCacheStore
+    ) {
+        let marker = DerivedCacheStore.MigrationMarker(
+            key: Self.legacyMigrationMarkerKey,
+            sourceFingerprint: fingerprint,
+            completedAt: completedAt
+        )
+        guard case .success = store.enqueue(
+            mutations,
+            migrationMarkers: [marker]
+        ),
+        case .success = store.flush() else {
+            PersistenceLogger.log("旧沉浸分析缓存迁移尚未持久化，将在下次启动重试")
+            return
+        }
+        guard let sourceURL, let quarantineReason,
+              FileManager.default.fileExists(atPath: sourceURL.path) else { return }
+        do {
+            _ = try DerivedCacheFileIO.quarantine(sourceURL, reason: quarantineReason)
+        } catch {
+            // The durable marker prevents duplicate import. Leaving a derived
+            // source file behind is safe and permits manual inspection.
+            PersistenceLogger.log("旧沉浸分析缓存迁移成功，但归档失败：\(error.localizedDescription)")
+        }
+    }
+
+    nonisolated private static func stableDigest(_ data: Data) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return String(format: "%016llx", hash)
     }
 
     private func normalizedEntries(_ source: [String: CacheEntry]) -> [String: CacheEntry] {
@@ -1366,6 +1866,24 @@ actor ImmersivePlaybackAnalyzer {
 
     private func removeEntry(for url: URL) {
         let key = PathKey.canonical(for: url)
+        if let derivedCacheStore {
+            let generation = derivedCacheStore.generation(for: .immersive)
+            _ = derivedCacheStore.enqueue([
+                .delete(
+                    kind: .immersive,
+                    key: key,
+                    variant: derivedBoundsVariant,
+                    expectedGeneration: generation
+                ),
+                .delete(
+                    kind: .immersive,
+                    key: key,
+                    variant: derivedFailureVariant,
+                    expectedGeneration: generation
+                )
+            ])
+            return
+        }
         let removedEntry = entries.removeValue(forKey: key) != nil
         let removedFailure = failures.removeValue(forKey: key) != nil
         if removedEntry || removedFailure {
@@ -1374,18 +1892,59 @@ actor ImmersivePlaybackAnalyzer {
         }
     }
 
-    private func recordFailure(for key: String, signature: FileSignature) {
-        guard !Task.isCancelled else { return }
-        let previousAttempts = failures[key]?.signature == signature
-            ? failures[key]?.attemptCount ?? 0
+    private func recordFailure(
+        for key: String,
+        signature: FileSignature,
+        expectedGeneration: CacheGenerationToken
+    ) {
+        guard !Task.isCancelled,
+              expectedGeneration == currentCacheGenerationToken() else { return }
+        let previousFailure = derivedCacheStore.map {
+            derivedFailure(store: $0, key: key, signature: signature)
+        } ?? failures[key]
+        let previousAttempts = previousFailure?.signature == signature
+            ? previousFailure?.attemptCount ?? 0
             : 0
         let attempts = min(previousAttempts + 1, 8)
         let delay = min(24 * 60 * 60, Self.failureRetryDelay * pow(2, Double(attempts - 1)))
-        failures[key] = FailureEntry(
+        let failure = FailureEntry(
             signature: signature,
             retryAfter: Date().timeIntervalSince1970 + delay,
             attemptCount: attempts
         )
+        if let derivedCacheStore,
+           let storeGeneration = expectedGeneration.derivedStoreGeneration,
+           let payload = try? JSONEncoder().encode(
+               DerivedFailurePayload(
+                   formatVersion: Self.derivedPayloadFormatVersion,
+                   retryAfter: failure.retryAfter,
+                   attemptCount: failure.attemptCount
+               )
+           ) {
+            let now = Date().timeIntervalSince1970
+            let record = DerivedCacheStore.Record(
+                kind: .immersive,
+                key: key,
+                variant: derivedFailureVariant,
+                payload: payload,
+                fileIdentity: derivedIdentity(for: signature),
+                updatedAt: now,
+                lastAccessedAt: now
+            )
+            if case .failure(let error) = derivedCacheStore.enqueue([
+                .upsert(record, expectedGeneration: storeGeneration),
+                .delete(
+                    kind: .immersive,
+                    key: key,
+                    variant: derivedBoundsVariant,
+                    expectedGeneration: storeGeneration
+                )
+            ]) {
+                PersistenceLogger.log("沉浸分析失败退避写入派生缓存失败：\(error.localizedDescription)")
+            }
+            return
+        }
+        failures[key] = failure
         if failures.count > 512 {
             let overflow = failures.count - 512
             for staleKey in failures

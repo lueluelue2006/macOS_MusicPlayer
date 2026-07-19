@@ -9,17 +9,31 @@ struct UserPlaylist: Identifiable, Codable, Equatable {
         let path: String
         /// Optional file signature for relocation support.
         let signature: FileSignature?
+        /// Optional persisted root bookmark identity for removable media.
+        let locationID: UUID?
+        /// Validated path below a directory root; nil for legacy/single-file rows.
+        let relativePath: String?
 
-        init(id: UUID = UUID(), path: String, signature: FileSignature? = nil) {
+        init(
+            id: UUID = UUID(),
+            path: String,
+            signature: FileSignature? = nil,
+            locationID: UUID? = nil,
+            relativePath: String? = nil
+        ) {
             self.id = id
             self.path = path
             self.signature = signature
+            self.locationID = locationID
+            self.relativePath = relativePath
         }
 
         private enum CodingKeys: String, CodingKey {
             case id
             case path
             case signature
+            case locationID
+            case relativePath
         }
 
         init(from decoder: Decoder) throws {
@@ -27,6 +41,8 @@ struct UserPlaylist: Identifiable, Codable, Equatable {
             id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
             path = try container.decode(String.self, forKey: .path)
             signature = try container.decodeIfPresent(FileSignature.self, forKey: .signature)
+            locationID = try container.decodeIfPresent(UUID.self, forKey: .locationID)
+            relativePath = try container.decodeIfPresent(String.self, forKey: .relativePath)
         }
 
         func encode(to encoder: Encoder) throws {
@@ -34,6 +50,8 @@ struct UserPlaylist: Identifiable, Codable, Equatable {
             try container.encode(id, forKey: .id)
             try container.encode(path, forKey: .path)
             try container.encodeIfPresent(signature, forKey: .signature)
+            try container.encodeIfPresent(locationID, forKey: .locationID)
+            try container.encodeIfPresent(relativePath, forKey: .relativePath)
         }
     }
 

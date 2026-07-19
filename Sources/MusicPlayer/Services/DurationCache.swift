@@ -3,14 +3,19 @@ import Foundation
 /// Bounded disk-backed cache for audio duration. Every value is derived from
 /// the source file and may be safely quarantined or rebuilt.
 actor DurationCache {
-    static let shared = DurationCache(cacheFileURLOverride: isolatedTestCacheURL())
+    static let shared = DurationCache()
 
     private static let cacheFileName = "duration-cache.json"
     private static let formatVersion = 3
     private static let legacyFormatVersion = 2
     private static let accessRefreshInterval: TimeInterval = 24 * 60 * 60
+    private static let derivedPayloadVersion = 1
+    internal static let derivedVariant = "duration-v1"
+    internal static let derivedMigrationMarkerKey = "duration-cache-json-to-derived-v1"
 
     private let cacheFileURLOverride: URL?
+    private let derivedStore: DerivedCacheStore?
+    private let legacyMigrationURLOverride: URL?
     private let limits: DerivedCacheLimits
     private let now: @Sendable () -> Date
     private let saveDebounce: TimeInterval
@@ -18,16 +23,24 @@ actor DurationCache {
 
     init(
         cacheFileURLOverride: URL? = nil,
+        derivedStoreOverride: DerivedCacheStore? = nil,
+        legacyMigrationURLOverride: URL? = nil,
         limits: DerivedCacheLimits = .standard,
         now: @escaping @Sendable () -> Date = { Date() },
         saveDebounce: TimeInterval = 0.75,
         maximumSaveLatency: TimeInterval = 5
     ) {
+        let resolvedDerivedStore = cacheFileURLOverride == nil
+            ? (derivedStoreOverride ?? DerivedCacheStore.shared)
+            : nil
         self.cacheFileURLOverride = cacheFileURLOverride
+        self.derivedStore = resolvedDerivedStore
+        self.legacyMigrationURLOverride = legacyMigrationURLOverride
         self.limits = limits
         self.now = now
         self.saveDebounce = max(0.01, saveDebounce)
         self.maximumSaveLatency = max(self.saveDebounce, maximumSaveLatency)
+        self.derivedGeneration = resolvedDerivedStore?.generation(for: .duration) ?? 0
     }
 
     private struct CacheFile: Codable {
@@ -105,6 +118,11 @@ actor DurationCache {
         let inode: Int64?
     }
 
+    private struct DerivedPayload: Codable, Equatable {
+        let version: Int
+        let durationSeconds: Double
+    }
+
     private struct FileSignature: Equatable {
         let fileSize: Int64
         let mtimeNs: Int64
@@ -122,6 +140,7 @@ actor DurationCache {
     private var pendingPrunedEntryCount = 0
     private var blockedQuarantineReason: DerivedCacheQuarantineReason?
     private var blockedPersistenceError: DerivedCachePersistenceError?
+    private var derivedGeneration: UInt64
 
     nonisolated static func key(for url: URL) -> String {
         PathKey.canonical(for: url)
@@ -136,6 +155,9 @@ actor DurationCache {
         snapshot: FileValidationSnapshot? = nil
     ) -> TimeInterval? {
         loadIfNeeded()
+        if cacheFileURLOverride == nil {
+            return cachedDerivedDurationIfValid(for: url, snapshot: snapshot)
+        }
 
         let key = Self.key(for: url)
         let legacyKey = Self.legacyKey(for: url)
@@ -190,6 +212,11 @@ actor DurationCache {
         guard duration.isFinite, duration > 0 else { return }
         guard let signature = fileSignature(for: url, snapshot: snapshot) else { return }
 
+        if cacheFileURLOverride == nil {
+            storeDerivedDuration(duration, for: url, signature: signature)
+            return
+        }
+
         let key = Self.key(for: url)
         let legacyKey = Self.legacyKey(for: url)
         let entry = Entry(
@@ -212,11 +239,19 @@ actor DurationCache {
 
     func remove(for url: URL) {
         loadIfNeeded()
+        if cacheFileURLOverride == nil {
+            removeDerivedEntry(for: url)
+            return
+        }
         removeEntryWithoutLoading(for: url)
     }
 
     func removeAll() {
         loadIfNeeded()
+        if cacheFileURLOverride == nil {
+            clearDerivedEntries()
+            return
+        }
         guard !entries.isEmpty else { return }
         pendingPrunedEntryCount += entries.count
         entries.removeAll(keepingCapacity: false)
@@ -226,12 +261,18 @@ actor DurationCache {
     @discardableResult
     func flushPersistence() -> Result<DerivedCacheFlushReport, DerivedCachePersistenceError> {
         loadIfNeeded()
+        if cacheFileURLOverride == nil {
+            return flushDerivedPersistence()
+        }
         return flushPersistenceInternal(cancelPending: true, retryOnFailure: false)
     }
 
     @discardableResult
     func clearPersistence() -> Result<DerivedCacheClearReport, DerivedCachePersistenceError> {
         loadIfNeeded()
+        if cacheFileURLOverride == nil {
+            return clearDerivedPersistence()
+        }
         cancelPendingSave()
 
         var quarantinedFileCount = 0
@@ -286,11 +327,262 @@ actor DurationCache {
         _ = flushPersistence()
     }
 
+    // MARK: - Incremental derived-store backend
+
+    private func cachedDerivedDurationIfValid(
+        for url: URL,
+        snapshot: FileValidationSnapshot?
+    ) -> TimeInterval? {
+        guard let derivedStore else { return nil }
+        let key = Self.key(for: url)
+        let legacyKey = Self.legacyKey(for: url)
+        guard let signature = fileSignature(for: url, snapshot: snapshot) else {
+            removeDerivedKeys([key, legacyKey], store: derivedStore)
+            return nil
+        }
+        let identity = derivedIdentity(signature)
+
+        if let record = derivedStore.record(
+            kind: .duration,
+            key: key,
+            variant: Self.derivedVariant,
+            matching: identity,
+            touch: true
+        ) {
+            return decodedDerivedDuration(from: record, store: derivedStore)
+        }
+
+        guard legacyKey != key,
+              let legacyRecord = derivedStore.record(
+                kind: .duration,
+                key: legacyKey,
+                variant: Self.derivedVariant,
+                matching: identity,
+                touch: true
+              ),
+              let duration = decodedDerivedDuration(
+                from: legacyRecord,
+                store: derivedStore,
+                deleteIfInvalid: false
+              ) else {
+            return nil
+        }
+
+        let canonicalRecord = DerivedCacheStore.Record(
+            kind: .duration,
+            key: key,
+            variant: Self.derivedVariant,
+            payload: legacyRecord.payload,
+            fileIdentity: legacyRecord.fileIdentity,
+            updatedAt: legacyRecord.updatedAt,
+            lastAccessedAt: legacyRecord.lastAccessedAt
+        )
+        let migrated = enqueueDerived(
+            [
+                .upsert(canonicalRecord, expectedGeneration: derivedGeneration),
+                .delete(
+                    kind: .duration,
+                    key: legacyKey,
+                    variant: Self.derivedVariant,
+                    expectedGeneration: derivedGeneration
+                )
+            ],
+            store: derivedStore
+        )
+        return migrated ? duration : nil
+    }
+
+    private func storeDerivedDuration(
+        _ duration: TimeInterval,
+        for url: URL,
+        signature: FileSignature
+    ) {
+        guard let derivedStore,
+              let payload = encodedDerivedPayload(duration: duration) else { return }
+        let timestamp = now().timeIntervalSince1970
+        guard timestamp.isFinite else { return }
+
+        let key = Self.key(for: url)
+        let legacyKey = Self.legacyKey(for: url)
+        let record = DerivedCacheStore.Record(
+            kind: .duration,
+            key: key,
+            variant: Self.derivedVariant,
+            payload: payload,
+            fileIdentity: derivedIdentity(signature),
+            updatedAt: timestamp,
+            lastAccessedAt: timestamp
+        )
+        var mutations: [DerivedCacheStore.Mutation] = [
+            .upsert(record, expectedGeneration: derivedGeneration)
+        ]
+        if legacyKey != key {
+            mutations.append(
+                .delete(
+                    kind: .duration,
+                    key: legacyKey,
+                    variant: Self.derivedVariant,
+                    expectedGeneration: derivedGeneration
+                )
+            )
+        }
+        _ = enqueueDerived(mutations, store: derivedStore)
+    }
+
+    private func removeDerivedEntry(for url: URL) {
+        guard let derivedStore else { return }
+        removeDerivedKeys(
+            [Self.key(for: url), Self.legacyKey(for: url)],
+            store: derivedStore
+        )
+    }
+
+    private func removeDerivedKeys(
+        _ keys: [String],
+        store: DerivedCacheStore
+    ) {
+        let mutations = Set(keys).map {
+            DerivedCacheStore.Mutation.delete(
+                kind: .duration,
+                key: $0,
+                variant: Self.derivedVariant,
+                expectedGeneration: derivedGeneration
+            )
+        }
+        _ = enqueueDerived(mutations, store: store)
+    }
+
+    private func clearDerivedEntries() {
+        guard let derivedStore else { return }
+        switch derivedStore.clear(.duration) {
+        case .success:
+            derivedGeneration = derivedStore.generation(for: .duration)
+        case .failure(let error):
+            PersistenceLogger.log("清空时长派生缓存失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func flushDerivedPersistence(
+    ) -> Result<DerivedCacheFlushReport, DerivedCachePersistenceError> {
+        guard let derivedStore else { return .failure(.storageUnavailable) }
+        switch derivedStore.flush() {
+        case .success(let report):
+            return .success(
+                DerivedCacheFlushReport(
+                    wroteFile: report.wroteDatabase,
+                    entryCount: derivedStore.persistedEntryCount(for: .duration),
+                    prunedEntryCount: report.prunedEntryCount
+                )
+            )
+        case .failure(let error):
+            return .failure(derivedPersistenceError(error))
+        }
+    }
+
+    private func clearDerivedPersistence(
+    ) -> Result<DerivedCacheClearReport, DerivedCachePersistenceError> {
+        guard let derivedStore else { return .failure(.storageUnavailable) }
+        switch derivedStore.clear(.duration) {
+        case .success(let report):
+            derivedGeneration = derivedStore.generation(for: .duration)
+            return .success(
+                DerivedCacheClearReport(
+                    removedEntryCount: report.removedEntryCount,
+                    quarantinedFileCount: 0
+                )
+            )
+        case .failure(let error):
+            return .failure(derivedPersistenceError(error))
+        }
+    }
+
+    private func enqueueDerived(
+        _ mutations: [DerivedCacheStore.Mutation],
+        store: DerivedCacheStore
+    ) -> Bool {
+        guard !mutations.isEmpty else { return true }
+        switch store.enqueue(mutations) {
+        case .success:
+            return true
+        case .failure(.staleGeneration(_, _, let actual)):
+            derivedGeneration = actual
+            return false
+        case .failure(let error):
+            PersistenceLogger.log("更新时长派生缓存失败：\(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func decodedDerivedDuration(
+        from record: DerivedCacheStore.Record,
+        store: DerivedCacheStore,
+        deleteIfInvalid: Bool = true
+    ) -> TimeInterval? {
+        guard let payload = try? JSONDecoder().decode(
+            DerivedPayload.self,
+            from: record.payload
+        ),
+              payload.version == Self.derivedPayloadVersion,
+              payload.durationSeconds.isFinite,
+              payload.durationSeconds > 0 else {
+            if deleteIfInvalid {
+                _ = enqueueDerived(
+                    [
+                        .delete(
+                            kind: .duration,
+                            key: record.key,
+                            variant: record.variant,
+                            expectedGeneration: derivedGeneration
+                        )
+                    ],
+                    store: store
+                )
+            }
+            return nil
+        }
+        return payload.durationSeconds
+    }
+
+    private func encodedDerivedPayload(duration: TimeInterval) -> Data? {
+        try? JSONEncoder().encode(
+            DerivedPayload(
+                version: Self.derivedPayloadVersion,
+                durationSeconds: duration
+            )
+        )
+    }
+
+    private func derivedIdentity(
+        _ signature: FileSignature
+    ) -> DerivedCacheStore.FileIdentity {
+        DerivedCacheStore.FileIdentity(
+            fileSize: signature.fileSize,
+            modificationTimeNanoseconds: signature.mtimeNs,
+            fileIdentifier: signature.inode
+        )
+    }
+
+    private func derivedPersistenceError(
+        _ error: DerivedCacheStore.StoreError
+    ) -> DerivedCachePersistenceError {
+        switch error {
+        case .storageUnavailable:
+            return .storageUnavailable
+        default:
+            return .writeFailed(error.localizedDescription)
+        }
+    }
+
     // MARK: - Loading
 
     private func loadIfNeeded() {
         guard !isLoaded else { return }
         isLoaded = true
+
+        if cacheFileURLOverride == nil {
+            migrateLegacyJSONToDerivedStoreIfNeeded()
+            return
+        }
 
         guard let url = rawCacheFileURL() else { return }
         guard FileManager.default.fileExists(atPath: url.path) else { return }
@@ -349,6 +641,244 @@ actor DurationCache {
             pendingPrunedEntryCount += rejectedCount
             recordMutation()
         }
+    }
+
+    private func migrateLegacyJSONToDerivedStoreIfNeeded() {
+        guard let derivedStore else { return }
+        let markerKey = Self.derivedMigrationMarkerKey
+        guard derivedStore.migrationMarker(for: markerKey) == nil else { return }
+
+        guard let legacyURL = legacyCacheFileURL() else {
+            completeDerivedMigration(
+                mutations: [],
+                fingerprint: "legacy-location-unavailable",
+                store: derivedStore
+            )
+            return
+        }
+        guard FileManager.default.fileExists(atPath: legacyURL.path) else {
+            completeDerivedMigration(
+                mutations: [],
+                fingerprint: "missing",
+                store: derivedStore
+            )
+            return
+        }
+
+        let data: Data
+        do {
+            data = try DerivedCacheFileIO.readBoundedRegularFile(
+                at: legacyURL,
+                maximumBytes: limits.maximumFileBytes
+            )
+        } catch {
+            completeDerivedMigration(
+                mutations: [],
+                fingerprint: "unreadable-or-oversized",
+                store: derivedStore
+            )
+            return
+        }
+
+        let fingerprint = Self.legacyFingerprint(data)
+        guard let probe = try? JSONDecoder().decode(CacheVersionProbe.self, from: data),
+              let version = probe.version else {
+            completeDerivedMigration(
+                mutations: [],
+                fingerprint: "invalid:\(fingerprint)",
+                store: derivedStore
+            )
+            return
+        }
+
+        let decodedEntries: [String: Entry]
+        switch version {
+        case Self.formatVersion:
+            guard let decoded = try? JSONDecoder().decode(CacheFile.self, from: data) else {
+                completeDerivedMigration(
+                    mutations: [],
+                    fingerprint: "invalid-v3:\(fingerprint)",
+                    store: derivedStore
+                )
+                return
+            }
+            var rejected = decoded.rejectedEntryCount
+            decodedEntries = normalizedLegacyEntries(
+                decoded.entries,
+                rejectedCount: &rejected
+            )
+
+        case Self.legacyFormatVersion:
+            guard let decoded = try? JSONDecoder().decode(LegacyCacheFile.self, from: data) else {
+                completeDerivedMigration(
+                    mutations: [],
+                    fingerprint: "invalid-v2:\(fingerprint)",
+                    store: derivedStore
+                )
+                return
+            }
+            let accessTime = Int64(now().timeIntervalSince1970.rounded(.down))
+            var current: [String: Entry] = [:]
+            current.reserveCapacity(min(decoded.entries.count, limits.maximumEntries))
+            for (path, legacy) in decoded.entries {
+                current[path] = Entry(
+                    durationSeconds: legacy.durationSeconds,
+                    fileSize: legacy.fileSize,
+                    mtimeNs: legacy.mtimeNs,
+                    inode: legacy.inode,
+                    lastAccessedAt: accessTime
+                )
+            }
+            var rejected = decoded.rejectedEntryCount
+            decodedEntries = normalizedLegacyEntries(
+                current,
+                rejectedCount: &rejected
+            )
+
+        default:
+            completeDerivedMigration(
+                mutations: [],
+                fingerprint: "unsupported-v\(version):\(fingerprint)",
+                store: derivedStore
+            )
+            return
+        }
+
+        let mutations = decodedEntries.compactMap { key, entry -> DerivedCacheStore.Mutation? in
+            guard let payload = encodedDerivedPayload(duration: entry.durationSeconds) else {
+                return nil
+            }
+            let timestamp = TimeInterval(entry.lastAccessedAt)
+            let record = DerivedCacheStore.Record(
+                kind: .duration,
+                key: key,
+                variant: Self.derivedVariant,
+                payload: payload,
+                fileIdentity: DerivedCacheStore.FileIdentity(
+                    fileSize: entry.fileSize,
+                    modificationTimeNanoseconds: entry.mtimeNs,
+                    fileIdentifier: entry.inode
+                ),
+                updatedAt: timestamp,
+                lastAccessedAt: timestamp
+            )
+            return .upsert(record, expectedGeneration: derivedGeneration)
+        }
+        completeDerivedMigration(
+            mutations: mutations,
+            fingerprint: fingerprint,
+            store: derivedStore,
+            cleanupLegacyURL: legacyURL
+        )
+    }
+
+    private func normalizedLegacyEntries(
+        _ raw: [String: Entry],
+        rejectedCount: inout Int
+    ) -> [String: Entry] {
+        var normalized: [String: Entry] = [:]
+        normalized.reserveCapacity(min(raw.count, limits.maximumEntries))
+        for path in raw.keys.sorted() {
+            guard let entry = raw[path],
+                  Self.isValidLegacyPath(path),
+                  isValid(entry) else {
+                rejectedCount += 1
+                continue
+            }
+            let key = PathKey.canonical(path: path)
+            if let existing = normalized[key] {
+                if entry.lastAccessedAt > existing.lastAccessedAt {
+                    normalized[key] = entry
+                }
+                rejectedCount += 1
+            } else {
+                normalized[key] = entry
+            }
+        }
+
+        guard normalized.count > limits.maximumEntries else { return normalized }
+        let keepCount = min(limits.lowWatermark, normalized.count)
+        let newest = normalized.sorted { lhs, rhs in
+            if lhs.value.lastAccessedAt == rhs.value.lastAccessedAt {
+                return lhs.key < rhs.key
+            }
+            return lhs.value.lastAccessedAt > rhs.value.lastAccessedAt
+        }.prefix(keepCount)
+        rejectedCount += normalized.count - newest.count
+        return Dictionary(uniqueKeysWithValues: newest.map { ($0.key, $0.value) })
+    }
+
+    private func completeDerivedMigration(
+        mutations: [DerivedCacheStore.Mutation],
+        fingerprint: String,
+        store: DerivedCacheStore,
+        cleanupLegacyURL: URL? = nil
+    ) {
+        let marker = DerivedCacheStore.MigrationMarker(
+            key: Self.derivedMigrationMarkerKey,
+            sourceFingerprint: fingerprint,
+            completedAt: now().timeIntervalSince1970
+        )
+        switch store.enqueue(mutations, migrationMarkers: [marker]) {
+        case .success:
+            if case .failure(let error) = store.flush() {
+                PersistenceLogger.log("迁移旧时长缓存落盘失败：\(error.localizedDescription)")
+            } else if store.migrationMarker(for: marker.key) == marker,
+                      let cleanupLegacyURL {
+                cleanupMigratedLegacyFileIfMatching(marker, at: cleanupLegacyURL)
+            }
+
+        case .failure(.staleGeneration(_, _, let actual)):
+            // A concurrent clear won the generation race. Preserve the clear by
+            // committing only the marker, so a later launch cannot resurrect
+            // rows from the old JSON file.
+            derivedGeneration = actual
+            switch store.enqueue([], migrationMarkers: [marker]) {
+            case .success:
+                if case .success = store.flush(),
+                   store.migrationMarker(for: marker.key) == marker,
+                   let cleanupLegacyURL {
+                    cleanupMigratedLegacyFileIfMatching(marker, at: cleanupLegacyURL)
+                }
+            case .failure(let error):
+                PersistenceLogger.log("记录时长缓存迁移标记失败：\(error.localizedDescription)")
+            }
+
+        case .failure(let error):
+            PersistenceLogger.log("迁移旧时长缓存失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func cleanupMigratedLegacyFileIfMatching(
+        _ marker: DerivedCacheStore.MigrationMarker,
+        at legacyURL: URL
+    ) {
+        guard let current = try? DerivedCacheFileIO.readBoundedRegularFile(
+            at: legacyURL,
+            maximumBytes: limits.maximumFileBytes
+        ),
+              Self.legacyFingerprint(current) == marker.sourceFingerprint else { return }
+        do {
+            try FileManager.default.removeItem(at: legacyURL)
+        } catch {
+            PersistenceLogger.log("清理已迁移的时长 JSON 缓存失败：\(error.localizedDescription)")
+        }
+    }
+
+    nonisolated private static func isValidLegacyPath(_ path: String) -> Bool {
+        !path.isEmpty
+            && path.hasPrefix("/")
+            && !path.utf8.contains(0)
+            && path.utf8.count <= 16 * 1_024
+    }
+
+    nonisolated private static func legacyFingerprint(_ data: Data) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return "fnv1a64:\(data.count):\(String(format: "%016llx", hash))"
     }
 
     private func loadLegacyV2(data: Data, url: URL) {
@@ -631,14 +1161,7 @@ actor DurationCache {
     // MARK: - Paths and signatures
 
     private func rawCacheFileURL() -> URL? {
-        if let cacheFileURLOverride { return cacheFileURLOverride }
-        guard let base = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first else { return nil }
-        return base
-            .appendingPathComponent("MusicPlayer", isDirectory: true)
-            .appendingPathComponent(Self.cacheFileName, isDirectory: false)
+        cacheFileURLOverride
     }
 
     private func cacheFileURL() -> URL? {
@@ -651,18 +1174,11 @@ actor DurationCache {
         }
     }
 
-    nonisolated private static func isolatedTestCacheURL() -> URL? {
-        let process = ProcessInfo.processInfo
-        let environment = process.environment
-        let isRegressionRun = environment["MUSICPLAYER_RUN_REGRESSION_TESTS"] == "1"
-        let isTestProcess =
-            environment["XCTestConfigurationFilePath"] != nil
-            || process.processName.localizedCaseInsensitiveContains("test")
-            || process.processName.localizedCaseInsensitiveContains("xctest")
-        guard isRegressionRun || isTestProcess else { return nil }
-
-        return FileManager.default.temporaryDirectory.appendingPathComponent(
-            "musicplayer-duration-cache-\(process.processIdentifier).json",
+    private func legacyCacheFileURL() -> URL? {
+        if let legacyMigrationURLOverride { return legacyMigrationURLOverride }
+        guard let environment = try? PersistenceEnvironment.production() else { return nil }
+        return environment.applicationSupportURL.appendingPathComponent(
+            Self.cacheFileName,
             isDirectory: false
         )
     }

@@ -6,7 +6,7 @@ struct VolumeNormalizationAnalysisView: View {
   @ObservedObject var audioPlayer: AudioPlayer
   @ObservedObject var playlistManager: PlaylistManager
   @ObservedObject private var sortState = SearchSortState.shared
-  @ObservedObject private var weights = PlaybackWeights.shared
+  @ObservedObject private var weights: PlaybackWeights
 
   @Environment(\.dismiss) private var dismiss
   @Environment(\.colorScheme) private var colorScheme
@@ -24,6 +24,12 @@ struct VolumeNormalizationAnalysisView: View {
   private var theme: AppTheme { AppTheme(scheme: colorScheme) }
   private var playlistCount: Int { playlistManager.audioFiles.count }
   private var analyzedCount: Int { cachedFileIDs.count }
+
+  init(audioPlayer: AudioPlayer, playlistManager: PlaylistManager) {
+    self.audioPlayer = audioPlayer
+    self.playlistManager = playlistManager
+    _weights = ObservedObject(wrappedValue: playlistManager.playbackWeights)
+  }
 
   var body: some View {
     VStack(spacing: 0) {

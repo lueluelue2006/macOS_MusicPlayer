@@ -764,6 +764,205 @@ final class PlaybackWeightsTests: XCTestCase {
         }
     }
 
+    func testLibraryDatabaseBackendRoundTripsSixSparseLevelsAndOrphanPlaylist() throws {
+        try withTemporaryCache { legacyURL, directory in
+            let database = try LibraryDatabase(
+                fileURL: directory.appendingPathComponent("Library.sqlite")
+            )
+            defer { database.close() }
+            let weights = PlaybackWeights(
+                cacheFileURLOverride: legacyURL,
+                persistenceDebounceInterval: 60,
+                maximumAutomaticRetryAttempts: 0,
+                libraryDatabase: database
+            )
+            let orphanPlaylistID = UUID()
+            let queueURLs = PlaybackWeights.Level.allCases.map {
+                directory.appendingPathComponent("db-queue-\($0.rawValue).mp3")
+            }
+            let playlistURLs = PlaybackWeights.Level.allCases.map {
+                directory.appendingPathComponent("db-playlist-\($0.rawValue).mp3")
+            }
+
+            for (index, level) in PlaybackWeights.Level.allCases.enumerated() {
+                _ = weights.setLevel(level, for: queueURLs[index], scope: .queue)
+                _ = weights.setLevel(
+                    level,
+                    for: playlistURLs[index],
+                    scope: .playlist(orphanPlaylistID)
+                )
+            }
+            let flush = weights.flushPersistence()
+            XCTAssertTrue(flush.isDurable)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path))
+
+            let stored = try database.loadWeights()
+            XCTAssertEqual(stored.revision, flush.durableGeneration)
+            XCTAssertEqual(stored.queueLevels.count, 5)
+            XCTAssertEqual(stored.playlistLevels[orphanPlaylistID]?.count, 5)
+            XCTAssertNil(stored.queueLevels[PlaybackWeights.key(for: queueURLs[1])])
+            XCTAssertNil(
+                stored.playlistLevels[orphanPlaylistID]?[PlaybackWeights.key(for: playlistURLs[1])]
+            )
+
+            let reloaded = PlaybackWeights(libraryDatabase: database)
+            for (index, level) in PlaybackWeights.Level.allCases.enumerated() {
+                XCTAssertEqual(reloaded.level(for: queueURLs[index], scope: .queue), level)
+                XCTAssertEqual(
+                    reloaded.level(for: playlistURLs[index], scope: .playlist(orphanPlaylistID)),
+                    level
+                )
+            }
+            let alreadyCurrent = reloaded.flushPersistence()
+            XCTAssertEqual(alreadyCurrent.outcome, .alreadyCurrent)
+            XCTAssertEqual(alreadyCurrent.attemptedGeneration, stored.revision)
+            XCTAssertEqual(alreadyCurrent.durableGeneration, stored.revision)
+        }
+    }
+
+    func testLibraryDatabaseCASConflictAndStaleEnterReadOnlyProtection() throws {
+        try withTemporaryCache { _, directory in
+            let conflictDatabase = try LibraryDatabase(
+                fileURL: directory.appendingPathComponent("conflict-Library.sqlite")
+            )
+            defer { conflictDatabase.close() }
+            let conflictWeights = PlaybackWeights(
+                persistenceDebounceInterval: 60,
+                maximumAutomaticRetryAttempts: 0,
+                libraryDatabase: conflictDatabase
+            )
+            let conflictURL = directory.appendingPathComponent("conflict.mp3")
+            try conflictDatabase.replaceWeights(
+                .init(
+                    revision: 1,
+                    queueLevels: [PlaybackWeights.key(for: conflictURL): 5],
+                    playlistLevels: [:]
+                )
+            )
+            XCTAssertEqual(
+                conflictWeights.setLevel(.purple, for: conflictURL, scope: .queue),
+                .applied
+            )
+            let conflict = conflictWeights.flushPersistence()
+            XCTAssertEqual(
+                conflict.outcome,
+                .rejectedReadOnly(.databaseConflict(storedRevision: 1))
+            )
+            XCTAssertTrue(conflict.hasPendingChanges)
+
+            let staleDatabase = try LibraryDatabase(
+                fileURL: directory.appendingPathComponent("stale-Library.sqlite")
+            )
+            defer { staleDatabase.close() }
+            let staleWeights = PlaybackWeights(
+                persistenceDebounceInterval: 60,
+                maximumAutomaticRetryAttempts: 0,
+                libraryDatabase: staleDatabase
+            )
+            let staleURL = directory.appendingPathComponent("stale.mp3")
+            try staleDatabase.replaceWeights(
+                .init(
+                    revision: 2,
+                    queueLevels: [PlaybackWeights.key(for: staleURL): 5],
+                    playlistLevels: [:]
+                )
+            )
+            XCTAssertEqual(staleWeights.setLevel(.purple, for: staleURL, scope: .queue), .applied)
+            XCTAssertEqual(
+                staleWeights.flushPersistence().outcome,
+                .rejectedReadOnly(.databaseConflict(storedRevision: 2))
+            )
+        }
+    }
+
+    func testLibraryDatabaseWriteFailureKeepsDirtyGenerationForRetry() throws {
+        try withTemporaryCache { _, directory in
+            let database = try LibraryDatabase(
+                fileURL: directory.appendingPathComponent("Library.sqlite")
+            )
+            let weights = PlaybackWeights(
+                persistenceDebounceInterval: 60,
+                maximumAutomaticRetryAttempts: 0,
+                libraryDatabase: database
+            )
+            let trackURL = directory.appendingPathComponent("db-write-failure.mp3")
+            XCTAssertEqual(weights.setLevel(.red, for: trackURL, scope: .queue), .applied)
+            database.close()
+
+            let failed = weights.flushPersistence()
+            XCTAssertEqual(failed.outcome, .failed(.writeFailed))
+            XCTAssertEqual(failed.attemptedGeneration, 1)
+            XCTAssertEqual(failed.durableGeneration, 0)
+            XCTAssertTrue(failed.hasPendingChanges)
+            XCTAssertTrue(weights.hasPendingPersistence)
+
+            let retried = weights.flushPersistence()
+            XCTAssertEqual(retried.outcome, .failed(.writeFailed))
+            XCTAssertEqual(retried.attemptedGeneration, 1)
+            XCTAssertEqual(retried.durableGeneration, 0)
+            XCTAssertTrue(retried.hasPendingChanges)
+        }
+    }
+
+    func testFutureLibraryDatabaseMapsToUnsupportedVersionReadOnly() throws {
+        try withTemporaryCache { _, directory in
+            let databaseURL = directory.appendingPathComponent("future-Library.sqlite")
+            let database = try makeProtectedLibraryDatabase(
+                at: databaseURL,
+                applicationID: LibraryDatabase.applicationID,
+                version: 99
+            )
+            defer { database.close() }
+            XCTAssertEqual(database.accessMode, .readOnlyFuture(version: 99))
+
+            let weights = PlaybackWeights(libraryDatabase: database)
+            XCTAssertEqual(
+                weights.persistenceState,
+                .readOnlyPreserved(.unsupportedVersion(99))
+            )
+            let trackURL = directory.appendingPathComponent("future.mp3")
+            XCTAssertEqual(
+                weights.setLevel(.red, for: trackURL, scope: .queue),
+                .rejectedReadOnly(.unsupportedVersion(99))
+            )
+            XCTAssertEqual(
+                weights.flushPersistence().outcome,
+                .rejectedReadOnly(.unsupportedVersion(99))
+            )
+        }
+    }
+
+    func testForeignLibraryDatabaseMapsToForeignReadOnly() throws {
+        try withTemporaryCache { _, directory in
+            let databaseURL = directory.appendingPathComponent("foreign-Library.sqlite")
+            let foreignApplicationID = LibraryDatabase.applicationID + 1
+            let database = try makeProtectedLibraryDatabase(
+                at: databaseURL,
+                applicationID: foreignApplicationID,
+                version: LibraryDatabase.schemaVersion
+            )
+            defer { database.close() }
+            XCTAssertEqual(
+                database.accessMode,
+                .readOnlyForeign(applicationID: foreignApplicationID)
+            )
+
+            let weights = PlaybackWeights(libraryDatabase: database)
+            XCTAssertEqual(
+                weights.persistenceState,
+                .readOnlyPreserved(.foreignDatabase(foreignApplicationID))
+            )
+            XCTAssertEqual(
+                weights.clearAll(),
+                .rejectedReadOnly(.foreignDatabase(foreignApplicationID))
+            )
+            XCTAssertEqual(
+                weights.flushPersistence().outcome,
+                .rejectedReadOnly(.foreignDatabase(foreignApplicationID))
+            )
+        }
+    }
+
     private func withTemporaryCache(
         _ body: (URL, URL) throws -> Void
     ) throws {
@@ -790,6 +989,18 @@ final class PlaybackWeightsTests: XCTestCase {
 
     private func decodeEnvelope(at url: URL) throws -> CacheEnvelope {
         try JSONDecoder().decode(CacheEnvelope.self, from: Data(contentsOf: url))
+    }
+
+    private func makeProtectedLibraryDatabase(
+        at url: URL,
+        applicationID: Int32,
+        version: Int
+    ) throws -> LibraryDatabase {
+        let raw = try SQLiteDatabase(fileURL: url)
+        try raw.execute("PRAGMA application_id = \(applicationID)")
+        try raw.execute("PRAGMA user_version = \(version)")
+        raw.close()
+        return try LibraryDatabase(fileURL: url)
     }
 
     private func streamingFingerprint(of url: URL) throws -> (byteCount: UInt64, hash: UInt64) {

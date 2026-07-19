@@ -500,6 +500,187 @@ final class SignatureCaptureTests: XCTestCase {
         XCTAssertEqual(signaturesPresent, 2, "M3U8 tracks should have persisted signatures")
     }
 
+    func testCoordinatorGloballyBoundsMultipleBatchesAndChunks() async throws {
+        await counter.pause()
+        let service = SignatureCaptureService(counter: counter)
+        let coordinator = SignatureCaptureCoordinator(
+            service: service,
+            maximumChunkSize: 2,
+            maximumAdmittedBatches: 4
+        )
+        let batches = (0..<3).map { batchIndex in
+            makeCaptureBatch(prefix: "bounded-\(batchIndex)", count: 6)
+        }
+
+        var tasks: [Task<SignatureCaptureResult, Never>] = []
+        for batch in batches {
+            let submitted = await coordinator.submitBatch(batch)
+            tasks.append(try XCTUnwrap(submitted))
+        }
+
+        await counter.waitForCaptureCount(2)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        let capturesWhilePaused = await counter.captureCount()
+        let running = await coordinator.diagnostics()
+        XCTAssertEqual(capturesWhilePaused, 2)
+        XCTAssertEqual(running.activeCaptureCount, 2)
+        XCTAssertEqual(running.peakActiveCaptureCount, 2)
+        XCTAssertEqual(running.activeChunkCount, 2)
+        XCTAssertGreaterThan(running.pendingChunkCount, 0)
+        XCTAssertLessThanOrEqual(running.largestScheduledChunkSize, 2)
+
+        await counter.resume()
+        for (batch, task) in zip(batches, tasks) {
+            let result = await task.value
+            XCTAssertEqual(result.batchID, batch.id)
+            XCTAssertEqual(result.entries.count, batch.targets.count)
+            await coordinator.finishBatch(batch.id)
+        }
+
+        let completed = await coordinator.diagnostics()
+        XCTAssertEqual(completed.activeCaptureCount, 0)
+        XCTAssertEqual(completed.activeChunkCount, 0)
+        XCTAssertEqual(completed.pendingCaptureCount, 0)
+        XCTAssertEqual(completed.pendingChunkCount, 0)
+        XCTAssertEqual(completed.admittedBatchCount, 0)
+        XCTAssertEqual(completed.peakActiveCaptureCount, 2)
+    }
+
+    func testCoordinatorFairnessLetsSmallBatchJoinLargeBatchPromptly() async throws {
+        await counter.pause()
+        let service = SignatureCaptureService(counter: counter)
+        let coordinator = SignatureCaptureCoordinator(
+            service: service,
+            maximumChunkSize: 1,
+            maximumAdmittedBatches: 4
+        )
+        let largeBatch = makeCaptureBatch(prefix: "fair-large", count: 8)
+        let smallBatch = makeCaptureBatch(prefix: "fair-small", count: 2)
+
+        let largeSubmission = await coordinator.submitBatch(largeBatch)
+        let largeTask = try XCTUnwrap(largeSubmission)
+        await counter.waitForCaptureCount(2)
+        let smallSubmission = await coordinator.submitBatch(smallBatch)
+        let smallTask = try XCTUnwrap(smallSubmission)
+
+        await counter.resume()
+        let largeResult = await largeTask.value
+        let smallResult = await smallTask.value
+        await coordinator.finishBatch(largeBatch.id)
+        await coordinator.finishBatch(smallBatch.id)
+
+        XCTAssertEqual(largeResult.entries.count, 8)
+        XCTAssertEqual(smallResult.entries.count, 2)
+        let captureOrder = await counter.capturedPaths
+        let firstSmallIndex = captureOrder.firstIndex { $0.contains("fair-small") }
+        XCTAssertNotNil(firstSmallIndex)
+        let unwrappedFirstSmallIndex = try XCTUnwrap(firstSmallIndex)
+        XCTAssertLessThanOrEqual(
+            unwrappedFirstSmallIndex,
+            3,
+            "A small later batch should receive one of the next released global slots"
+        )
+    }
+
+    func testCoordinatorRetainsCrossBatchPathInFlightDeduplication() async throws {
+        await counter.pause()
+        let service = SignatureCaptureService(counter: counter)
+        let coordinator = SignatureCaptureCoordinator(
+            service: service,
+            maximumChunkSize: 1
+        )
+        let sharedPath = tempDir.appendingPathComponent("shared-missing.wav").path
+        let firstBatch = makeCaptureBatch(paths: [sharedPath])
+        let secondBatch = makeCaptureBatch(paths: [sharedPath])
+
+        let firstSubmission = await coordinator.submitBatch(firstBatch)
+        let firstTask = try XCTUnwrap(firstSubmission)
+        let secondSubmission = await coordinator.submitBatch(secondBatch)
+        let secondTask = try XCTUnwrap(secondSubmission)
+        await counter.waitForCaptureCount(1)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        let capturesWhilePaused = await counter.captureCount()
+        let diagnostics = await coordinator.diagnostics()
+        XCTAssertEqual(capturesWhilePaused, 1)
+        XCTAssertEqual(diagnostics.activeCaptureCount, 1)
+        XCTAssertEqual(diagnostics.activeChunkCount, 2)
+
+        await counter.resume()
+        let firstResult = await firstTask.value
+        let secondResult = await secondTask.value
+        XCTAssertEqual(firstResult.entries.count, 1)
+        XCTAssertEqual(secondResult.entries.count, 1)
+        await coordinator.finishBatch(firstBatch.id)
+        await coordinator.finishBatch(secondBatch.id)
+    }
+
+    func testCoordinatorTerminationPromptlyCancelsActiveAndWaitingBatches() async throws {
+        await counter.pause()
+        let service = SignatureCaptureService(counter: counter)
+        let coordinator = SignatureCaptureCoordinator(
+            service: service,
+            maximumChunkSize: 1,
+            maximumAdmittedBatches: 1
+        )
+        let activeBatch = makeCaptureBatch(prefix: "terminate-active", count: 4)
+        let waitingBatch = makeCaptureBatch(prefix: "terminate-waiting", count: 2)
+
+        let activeSubmission = await coordinator.submitBatch(activeBatch)
+        let activeTask = try XCTUnwrap(activeSubmission)
+        await counter.waitForCaptureCount(2)
+        let waitingSubmission = Task {
+            await coordinator.submitBatch(waitingBatch)
+        }
+        let didQueueWaitingSubmission = await waitUntilAsync {
+            (await coordinator.diagnostics()).waitingSubmissionCount == 1
+        }
+        XCTAssertTrue(didQueueWaitingSubmission)
+
+        let startedAt = Date()
+        await coordinator.cancelForTermination()
+        let cancellationDuration = Date().timeIntervalSince(startedAt)
+        XCTAssertLessThan(cancellationDuration, 0.2)
+
+        let activeResult = await activeTask.value
+        let rejectedWaitingTask = await waitingSubmission.value
+        XCTAssertTrue(activeResult.entries.isEmpty)
+        XCTAssertNil(rejectedWaitingTask)
+        let terminated = await coordinator.diagnostics()
+        XCTAssertEqual(terminated.activeCaptureCount, 0)
+        XCTAssertEqual(terminated.pendingCaptureCount, 0)
+        XCTAssertEqual(terminated.activeChunkCount, 0)
+        XCTAssertEqual(terminated.pendingChunkCount, 0)
+        XCTAssertEqual(terminated.admittedBatchCount, 0)
+        XCTAssertEqual(terminated.waitingSubmissionCount, 0)
+        let hasActiveBatches = await coordinator.hasActiveBatches()
+        XCTAssertFalse(hasActiveBatches)
+
+        // Release the deliberately paused test hook; late filesystem results are
+        // detached and cannot repopulate the terminated coordinator.
+        await counter.resume()
+        await coordinator.finishBatch(activeBatch.id)
+    }
+
+    private func makeCaptureBatch(prefix: String, count: Int) -> SignatureCaptureBatch {
+        let paths = (0..<count).map { index in
+            tempDir.appendingPathComponent("\(prefix)-\(index).wav").path
+        }
+        return makeCaptureBatch(paths: paths)
+    }
+
+    private func makeCaptureBatch(paths: [String]) -> SignatureCaptureBatch {
+        let playlistID = UUID()
+        return SignatureCaptureBatch(targets: paths.enumerated().map { index, path in
+            SignatureCaptureTarget(
+                playlistID: playlistID,
+                trackID: UUID(),
+                expectedPath: path,
+                generation: UInt64(index + 1)
+            )
+        })
+    }
+
     private func waitUntil(
         timeout: TimeInterval = 2,
         condition: @escaping @MainActor () -> Bool
@@ -510,5 +691,17 @@ final class SignatureCaptureTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return condition()
+    }
+
+    private func waitUntilAsync(
+        timeout: TimeInterval = 2,
+        condition: @escaping () async -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return await condition()
     }
 }

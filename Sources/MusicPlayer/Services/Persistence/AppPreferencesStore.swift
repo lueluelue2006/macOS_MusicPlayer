@@ -55,6 +55,177 @@ final class AppPreferencesStore: @unchecked Sendable {
         var playbackRate: Float
         var playbackMode: PlaybackMode
         var playbackScope: PlaybackScope
+        var normalizationEnabled: Bool
+        var immersiveEnabled: Bool
+        var analyzeDuringPlayback: Bool
+        var autoPreanalyze: Bool
+        var targetLUFS: Float
+        var immersiveFadeDuration: Double
+        var requireAnalysisBeforeTransition: Bool
+        var scanSubfolders: Bool
+        var notifyOnDeviceSwitch: Bool
+        var notifyDeviceSwitchSilent: Bool
+        var colorSchemeOverride: Int
+        var playlistPanelMode: Int
+        var compactRootPane: Int
+        var ipcDebugEnabled: Bool
+
+        init(
+            volume: Float,
+            playbackRate: Float,
+            playbackMode: PlaybackMode,
+            playbackScope: PlaybackScope,
+            normalizationEnabled: Bool = true,
+            immersiveEnabled: Bool = false,
+            analyzeDuringPlayback: Bool = false,
+            autoPreanalyze: Bool = true,
+            targetLUFS: Float = -16,
+            immersiveFadeDuration: Double = 0.6,
+            requireAnalysisBeforeTransition: Bool = false,
+            scanSubfolders: Bool = true,
+            notifyOnDeviceSwitch: Bool = true,
+            notifyDeviceSwitchSilent: Bool = true,
+            colorSchemeOverride: Int = 0,
+            playlistPanelMode: Int = 0,
+            compactRootPane: Int = 0,
+            ipcDebugEnabled: Bool = false
+        ) {
+            self.volume = volume
+            self.playbackRate = playbackRate
+            self.playbackMode = playbackMode
+            self.playbackScope = playbackScope
+            self.normalizationEnabled = normalizationEnabled
+            self.immersiveEnabled = immersiveEnabled
+            self.analyzeDuringPlayback = analyzeDuringPlayback
+            self.autoPreanalyze = autoPreanalyze
+            self.targetLUFS = targetLUFS
+            self.immersiveFadeDuration = immersiveFadeDuration
+            self.requireAnalysisBeforeTransition = requireAnalysisBeforeTransition
+            self.scanSubfolders = scanSubfolders
+            self.notifyOnDeviceSwitch = notifyOnDeviceSwitch
+            self.notifyDeviceSwitchSilent = notifyDeviceSwitchSilent
+            self.colorSchemeOverride = colorSchemeOverride
+            self.playlistPanelMode = playlistPanelMode
+            self.compactRootPane = compactRootPane
+            self.ipcDebugEnabled = ipcDebugEnabled
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case volume
+            case playbackRate
+            case playbackMode
+            case playbackScope
+            case normalizationEnabled
+            case immersiveEnabled
+            case analyzeDuringPlayback
+            case autoPreanalyze
+            case targetLUFS
+            case immersiveFadeDuration
+            case requireAnalysisBeforeTransition
+            case scanSubfolders
+            case notifyOnDeviceSwitch
+            case notifyDeviceSwitchSilent
+            case colorSchemeOverride
+            case playlistPanelMode
+            case compactRootPane
+            case ipcDebugEnabled
+        }
+
+        /// New fields use product defaults when decoding an older partial
+        /// payload. Type mismatches still fail decoding so corrupt envelopes
+        /// cannot silently become valid preferences.
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let defaults = Self.default
+            volume = try container.decode(Float.self, forKey: .volume)
+            playbackRate = try container.decode(Float.self, forKey: .playbackRate)
+            playbackMode = try container.decode(PlaybackMode.self, forKey: .playbackMode)
+            // Playback scope is session state in LibraryDatabase as of v2.
+            // Keep the runtime field for source compatibility, but never let a
+            // v2 preference envelope restore it as an authority.
+            playbackScope = .queue
+            normalizationEnabled = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .normalizationEnabled
+            ) ?? defaults.normalizationEnabled
+            immersiveEnabled = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .immersiveEnabled
+            ) ?? defaults.immersiveEnabled
+            analyzeDuringPlayback = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .analyzeDuringPlayback
+            ) ?? defaults.analyzeDuringPlayback
+            autoPreanalyze = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .autoPreanalyze
+            ) ?? defaults.autoPreanalyze
+            targetLUFS = try container.decodeIfPresent(
+                Float.self,
+                forKey: .targetLUFS
+            ) ?? defaults.targetLUFS
+            immersiveFadeDuration = try container.decodeIfPresent(
+                Double.self,
+                forKey: .immersiveFadeDuration
+            ) ?? defaults.immersiveFadeDuration
+            requireAnalysisBeforeTransition = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .requireAnalysisBeforeTransition
+            ) ?? defaults.requireAnalysisBeforeTransition
+            scanSubfolders = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .scanSubfolders
+            ) ?? defaults.scanSubfolders
+            notifyOnDeviceSwitch = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .notifyOnDeviceSwitch
+            ) ?? defaults.notifyOnDeviceSwitch
+            notifyDeviceSwitchSilent = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .notifyDeviceSwitchSilent
+            ) ?? defaults.notifyDeviceSwitchSilent
+            colorSchemeOverride = try container.decodeIfPresent(
+                Int.self,
+                forKey: .colorSchemeOverride
+            ) ?? defaults.colorSchemeOverride
+            playlistPanelMode = try container.decodeIfPresent(
+                Int.self,
+                forKey: .playlistPanelMode
+            ) ?? defaults.playlistPanelMode
+            compactRootPane = try container.decodeIfPresent(
+                Int.self,
+                forKey: .compactRootPane
+            ) ?? defaults.compactRootPane
+            ipcDebugEnabled = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .ipcDebugEnabled
+            ) ?? defaults.ipcDebugEnabled
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(volume, forKey: .volume)
+            try container.encode(playbackRate, forKey: .playbackRate)
+            try container.encode(playbackMode, forKey: .playbackMode)
+            // playbackScope deliberately belongs to playback_session, not v2.
+            try container.encode(normalizationEnabled, forKey: .normalizationEnabled)
+            try container.encode(immersiveEnabled, forKey: .immersiveEnabled)
+            try container.encode(analyzeDuringPlayback, forKey: .analyzeDuringPlayback)
+            try container.encode(autoPreanalyze, forKey: .autoPreanalyze)
+            try container.encode(targetLUFS, forKey: .targetLUFS)
+            try container.encode(immersiveFadeDuration, forKey: .immersiveFadeDuration)
+            try container.encode(
+                requireAnalysisBeforeTransition,
+                forKey: .requireAnalysisBeforeTransition
+            )
+            try container.encode(scanSubfolders, forKey: .scanSubfolders)
+            try container.encode(notifyOnDeviceSwitch, forKey: .notifyOnDeviceSwitch)
+            try container.encode(notifyDeviceSwitchSilent, forKey: .notifyDeviceSwitchSilent)
+            try container.encode(colorSchemeOverride, forKey: .colorSchemeOverride)
+            try container.encode(playlistPanelMode, forKey: .playlistPanelMode)
+            try container.encode(compactRootPane, forKey: .compactRootPane)
+            try container.encode(ipcDebugEnabled, forKey: .ipcDebugEnabled)
+        }
 
         static let `default` = Preferences(
             volume: 0.5,
@@ -82,6 +253,21 @@ final class AppPreferencesStore: @unchecked Sendable {
         let preferences: Preferences
     }
 
+    /// v1 stored only the four preferences that have always been coherent.
+    /// Keeping a dedicated decoder makes migration precedence explicit: v1
+    /// owns these values while scattered legacy keys fill only v2 additions.
+    private struct EnvelopeV1: Decodable {
+        struct PreferencesV1: Decodable {
+            let volume: Float
+            let playbackRate: Float
+            let playbackMode: PlaybackMode
+            let playbackScope: PlaybackScope
+        }
+
+        let version: Int
+        let preferences: PreferencesV1
+    }
+
     private struct VersionProbe: Decodable {
         let version: Int?
     }
@@ -95,6 +281,20 @@ final class AppPreferencesStore: @unchecked Sendable {
         static let shuffle = "userShuffleEnabled"
         static let scopeKind = "userPlaybackScopeKind"
         static let scopePlaylistID = "userPlaybackScopePlaylistID"
+        static let normalizationEnabled = "userNormalizationEnabled"
+        static let immersiveEnabled = "userImmersivePlaybackEnabled"
+        static let analyzeDuringPlayback = "userAnalyzeVolumesDuringPlayback"
+        static let autoPreanalyze = "userAutoPreanalyzeVolumesWhenIdle"
+        static let targetLUFS = "userNormalizationTargetLUFS"
+        static let immersiveFadeDuration = "userNormalizationFadeDuration"
+        static let requireAnalysisBeforeTransition = "userRequireVolumeAnalysisBeforePlayback"
+        static let scanSubfolders = "userScanSubfoldersEnabled"
+        static let notifyOnDeviceSwitch = "userNotifyOnDeviceSwitch"
+        static let notifyDeviceSwitchSilent = "userNotifyDeviceSwitchSilent"
+        static let colorSchemeOverride = "userColorSchemeOverride"
+        static let playlistPanelMode = "userPlaylistPanelMode"
+        static let compactRootPane = "compactRootPane"
+        static let ipcDebugEnabled = "ipcDebugEnabled"
 
         static let all = [
             volume,
@@ -105,11 +305,25 @@ final class AppPreferencesStore: @unchecked Sendable {
             shuffle,
             scopeKind,
             scopePlaylistID,
+            normalizationEnabled,
+            immersiveEnabled,
+            analyzeDuringPlayback,
+            autoPreanalyze,
+            targetLUFS,
+            immersiveFadeDuration,
+            requireAnalysisBeforeTransition,
+            scanSubfolders,
+            notifyOnDeviceSwitch,
+            notifyDeviceSwitchSilent,
+            colorSchemeOverride,
+            playlistPanelMode,
+            compactRootPane,
+            ipcDebugEnabled,
         ]
     }
 
     static let envelopeKey = "playerPreferencesEnvelope"
-    static let formatVersion = 1
+    static let formatVersion = 2
     static let corruptQuarantineKeys = [
         "playerPreferencesEnvelope.quarantine.0",
         "playerPreferencesEnvelope.quarantine.1",
@@ -123,6 +337,7 @@ final class AppPreferencesStore: @unchecked Sendable {
     private var cachedPreferences = Preferences.default
     private var storedPersistenceState: PersistenceState = .writable
     private var isDirty = false
+    private var needsLegacyCleanup = false
     private var pendingPersistence: DispatchWorkItem?
 
     init(
@@ -147,7 +362,7 @@ final class AppPreferencesStore: @unchecked Sendable {
         ensureLoaded()
         lock.lock()
         defer { lock.unlock() }
-        return isDirty
+        return isDirty || needsLegacyCleanup
     }
 
     func load() -> Preferences {
@@ -223,7 +438,9 @@ final class AppPreferencesStore: @unchecked Sendable {
                 lock.unlock()
                 return .failure(.synchronizationFailed)
             }
-            return .success(())
+            lock.lock()
+            defer { lock.unlock() }
+            return removeLegacyKeysDurablyLocked()
         case .failure(let error):
             return .failure(error)
         }
@@ -260,6 +477,29 @@ final class AppPreferencesStore: @unchecked Sendable {
                 return
             }
 
+            if version == 1 {
+                guard let envelope = try? JSONDecoder().decode(EnvelopeV1.self, from: data) else {
+                    quarantineCorruptEnvelopeLocked(data)
+                    loadLegacyPreferencesLocked()
+                    return
+                }
+
+                var preferences = Preferences(
+                    volume: envelope.preferences.volume,
+                    playbackRate: envelope.preferences.playbackRate,
+                    playbackMode: envelope.preferences.playbackMode,
+                    playbackScope: envelope.preferences.playbackScope
+                )
+                Self.applyAddedLegacyPreferences(
+                    from: userDefaults,
+                    to: &preferences
+                )
+                cachedPreferences = Self.sanitize(preferences)
+                needsLegacyCleanup = hasLegacyValuesLocked()
+                migrateLoadedPreferencesLocked(previousEnvelopeData: data)
+                return
+            }
+
             guard version == Self.formatVersion,
                   let envelope = try? JSONDecoder().decode(Envelope.self, from: data) else {
                 quarantineCorruptEnvelopeLocked(data)
@@ -268,13 +508,14 @@ final class AppPreferencesStore: @unchecked Sendable {
             }
 
             cachedPreferences = Self.sanitize(envelope.preferences)
+            needsLegacyCleanup = hasLegacyValuesLocked()
             isDirty = cachedPreferences != envelope.preferences
+                || Self.requiresCanonicalV2Rewrite(data)
             if isDirty {
-                guard case .success = persistLocked(force: false) else {
-                    return
-                }
+                migrateLoadedPreferencesLocked(previousEnvelopeData: data)
+            } else {
+                _ = removeLegacyKeysDurablyLocked()
             }
-            removeLegacyKeysAfterVerifiedEnvelopeLocked()
             return
         }
 
@@ -318,21 +559,31 @@ final class AppPreferencesStore: @unchecked Sendable {
         } else {
             preferences.playbackScope = .queue
         }
+        Self.applyAddedLegacyPreferences(from: userDefaults, to: &preferences)
 
         cachedPreferences = Self.sanitize(preferences)
         guard hadLegacyValues else {
             isDirty = false
+            needsLegacyCleanup = false
             return
         }
 
+        needsLegacyCleanup = true
+        migrateLoadedPreferencesLocked(previousEnvelopeData: nil)
+    }
+
+    /// Writes the v2 envelope and obtains a durability receipt before removing
+    /// any legacy value. If synchronization fails, the previous envelope and
+    /// all legacy keys remain available for a later retry.
+    private func migrateLoadedPreferencesLocked(previousEnvelopeData: Data?) {
         isDirty = true
-        guard case .success = persistLocked(force: false),
-              userDefaults.data(forKey: Self.envelopeKey) != nil,
-              userDefaults.synchronize() else {
+        guard case .success = persistLocked(force: false) else { return }
+        guard userDefaults.synchronize() else {
+            restoreEnvelopeLocked(previousEnvelopeData)
+            isDirty = true
             return
         }
-        LegacyKey.all.forEach(userDefaults.removeObject(forKey:))
-        _ = userDefaults.synchronize()
+        _ = removeLegacyKeysDurablyLocked()
     }
 
     private func persistLocked(force: Bool) -> Result<Void, PersistenceError> {
@@ -382,11 +633,39 @@ final class AppPreferencesStore: @unchecked Sendable {
         PersistenceLogger.log("播放器偏好 envelope 损坏，已隔离并使用安全默认值")
     }
 
-    private func removeLegacyKeysAfterVerifiedEnvelopeLocked() {
-        guard LegacyKey.all.contains(where: { userDefaults.object(forKey: $0) != nil }) else {
-            return
+    private func hasLegacyValuesLocked() -> Bool {
+        LegacyKey.all.contains { userDefaults.object(forKey: $0) != nil }
+    }
+
+    private func removeLegacyKeysDurablyLocked() -> Result<Void, PersistenceError> {
+        guard needsLegacyCleanup || hasLegacyValuesLocked() else {
+            needsLegacyCleanup = false
+            return .success(())
         }
+
+        let legacyValues = Dictionary(
+            uniqueKeysWithValues: LegacyKey.all.compactMap { key in
+                userDefaults.object(forKey: key).map { (key, $0) }
+            }
+        )
         LegacyKey.all.forEach(userDefaults.removeObject(forKey:))
+        guard userDefaults.synchronize() else {
+            legacyValues.forEach { userDefaults.set($0.value, forKey: $0.key) }
+            _ = userDefaults.synchronize()
+            needsLegacyCleanup = true
+            isDirty = true
+            return .failure(.synchronizationFailed)
+        }
+        needsLegacyCleanup = false
+        return .success(())
+    }
+
+    private func restoreEnvelopeLocked(_ data: Data?) {
+        if let data {
+            userDefaults.set(data, forKey: Self.envelopeKey)
+        } else {
+            userDefaults.removeObject(forKey: Self.envelopeKey)
+        }
         _ = userDefaults.synchronize()
     }
 
@@ -398,7 +677,103 @@ final class AppPreferencesStore: @unchecked Sendable {
         sanitized.playbackRate = preferences.playbackRate.isFinite
             ? max(0.5, min(2, preferences.playbackRate))
             : Preferences.default.playbackRate
+        sanitized.targetLUFS = preferences.targetLUFS.isFinite
+            ? max(-30, min(-8, preferences.targetLUFS))
+            : Preferences.default.targetLUFS
+        sanitized.immersiveFadeDuration = preferences.immersiveFadeDuration.isFinite
+            ? max(0, min(1.5, preferences.immersiveFadeDuration))
+            : Preferences.default.immersiveFadeDuration
+        sanitized.colorSchemeOverride = max(0, min(2, preferences.colorSchemeOverride))
+        sanitized.playlistPanelMode = max(0, min(1, preferences.playlistPanelMode))
+        sanitized.compactRootPane = max(0, min(1, preferences.compactRootPane))
         return sanitized
+    }
+
+    private static func applyAddedLegacyPreferences(
+        from userDefaults: UserDefaults,
+        to preferences: inout Preferences
+    ) {
+        if let value = strictBool(userDefaults.object(forKey: LegacyKey.normalizationEnabled)) {
+            preferences.normalizationEnabled = value
+        }
+        if let value = strictBool(userDefaults.object(forKey: LegacyKey.immersiveEnabled)) {
+            preferences.immersiveEnabled = value
+        }
+        if let value = strictBool(userDefaults.object(forKey: LegacyKey.analyzeDuringPlayback)) {
+            preferences.analyzeDuringPlayback = value
+        }
+        if let value = strictBool(userDefaults.object(forKey: LegacyKey.autoPreanalyze)) {
+            preferences.autoPreanalyze = value
+        }
+        if let value = finiteNumber(userDefaults.object(forKey: LegacyKey.targetLUFS)) {
+            preferences.targetLUFS = Float(value)
+        }
+        if let value = finiteNumber(userDefaults.object(forKey: LegacyKey.immersiveFadeDuration)) {
+            preferences.immersiveFadeDuration = value
+        }
+        if let value = strictBool(
+            userDefaults.object(forKey: LegacyKey.requireAnalysisBeforeTransition)
+        ) {
+            preferences.requireAnalysisBeforeTransition = value
+        }
+        if let value = strictBool(userDefaults.object(forKey: LegacyKey.scanSubfolders)) {
+            preferences.scanSubfolders = value
+        }
+        if let value = strictBool(userDefaults.object(forKey: LegacyKey.notifyOnDeviceSwitch)) {
+            preferences.notifyOnDeviceSwitch = value
+        }
+        if let value = strictBool(
+            userDefaults.object(forKey: LegacyKey.notifyDeviceSwitchSilent)
+        ) {
+            preferences.notifyDeviceSwitchSilent = value
+        }
+        if let value = strictInteger(
+            userDefaults.object(forKey: LegacyKey.colorSchemeOverride),
+            allowed: 0...2
+        ) {
+            preferences.colorSchemeOverride = value
+        }
+        if let value = strictInteger(
+            userDefaults.object(forKey: LegacyKey.playlistPanelMode),
+            allowed: 0...1
+        ) {
+            preferences.playlistPanelMode = value
+        }
+        if let value = strictInteger(
+            userDefaults.object(forKey: LegacyKey.compactRootPane),
+            allowed: 0...1
+        ) {
+            preferences.compactRootPane = value
+        }
+        if let value = strictBool(userDefaults.object(forKey: LegacyKey.ipcDebugEnabled)) {
+            preferences.ipcDebugEnabled = value
+        }
+    }
+
+    private static let canonicalV2PreferenceKeys: Set<String> = [
+        "volume",
+        "playbackRate",
+        "playbackMode",
+        "normalizationEnabled",
+        "immersiveEnabled",
+        "analyzeDuringPlayback",
+        "autoPreanalyze",
+        "targetLUFS",
+        "immersiveFadeDuration",
+        "requireAnalysisBeforeTransition",
+        "scanSubfolders",
+        "notifyOnDeviceSwitch",
+        "notifyDeviceSwitchSilent",
+        "colorSchemeOverride",
+        "playlistPanelMode",
+        "compactRootPane",
+        "ipcDebugEnabled",
+    ]
+
+    private static func requiresCanonicalV2Rewrite(_ data: Data) -> Bool {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let preferences = root["preferences"] as? [String: Any] else { return false }
+        return Set(preferences.keys) != canonicalV2PreferenceKeys
     }
 
     private static func finiteNumber(_ value: Any?) -> Double? {
@@ -412,5 +787,19 @@ final class AppPreferencesStore: @unchecked Sendable {
         guard let number = value as? NSNumber,
               CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
         return number.boolValue
+    }
+
+    private static func strictInteger(
+        _ value: Any?,
+        allowed: ClosedRange<Int>
+    ) -> Int? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let double = number.doubleValue
+        guard double.isFinite,
+              double.rounded(.towardZero) == double,
+              double >= Double(allowed.lowerBound),
+              double <= Double(allowed.upperBound) else { return nil }
+        return Int(double)
     }
 }

@@ -6,10 +6,11 @@ import UserNotifications
 struct MusicPlayerCommands: Commands {
     @ObservedObject var audioPlayer: AudioPlayer
     let playlistManager: PlaylistManager
-    @AppStorage("userNotifyOnDeviceSwitch") private var notifyOnDeviceSwitch: Bool = true
-    @AppStorage("userNotifyDeviceSwitchSilent") private var notifyDeviceSwitchSilent: Bool = true
-    @AppStorage("userColorSchemeOverride") private var userColorSchemeOverride: Int = 0
-    @AppStorage(IPCDebugSettings.userDefaultsKey) private var ipcDebugEnabled: Bool = false
+
+    init(audioPlayer: AudioPlayer, playlistManager: PlaylistManager) {
+        self.audioPlayer = audioPlayer
+        self.playlistManager = playlistManager
+    }
 
     var body: some Commands {
         // 保证 Command+Q 在任何弹窗/子窗口/Sheet 打开时都能正常退出（不被焦点/第一响应者影响）
@@ -44,7 +45,16 @@ struct MusicPlayerCommands: Commands {
         CommandGroup(after: .appSettings) {
             Divider()
             Menu("外观") {
-                Picker("外观", selection: $userColorSchemeOverride) {
+                Picker("外观", selection: Binding(
+                    get: {
+                        playlistManager.appPreferencesStore.load().colorSchemeOverride
+                    },
+                    set: { newValue in
+                        persistPresentationPreference {
+                            $0.colorSchemeOverride = newValue
+                        }
+                    }
+                )) {
                     Text("跟随系统").tag(UserColorSchemeOverride.system.rawValue)
                     Text("亮色").tag(UserColorSchemeOverride.light.rawValue)
                     Text("暗色").tag(UserColorSchemeOverride.dark.rawValue)
@@ -206,7 +216,7 @@ struct MusicPlayerCommands: Commands {
                             case .playlist(let id): return .playlist(id)
                             }
                         }()
-                        let result = PlaybackWeights.shared.clear(scope: scope)
+                        let result = playlistManager.playbackWeights.clear(scope: scope)
                         switch result {
                         case .applied, .unchanged:
                             NotificationCenter.default.post(
@@ -233,7 +243,7 @@ struct MusicPlayerCommands: Commands {
                             cancelTitle: "不清除"
                         )
                         guard confirmed else { return }
-                        let result = PlaybackWeights.shared.clearAll()
+                        let result = playlistManager.playbackWeights.clearAll()
                         switch result {
                         case .applied, .unchanged:
                             NotificationCenter.default.post(
@@ -416,26 +426,29 @@ struct MusicPlayerCommands: Commands {
                 }
 
                 Button("发送测试通知") {
-                    SystemNotifier.shared.notifyDeviceChanged(to: "测试设备", silent: notifyDeviceSwitchSilent)
+                    SystemNotifier.shared.notifyDeviceChanged(
+                        to: "测试设备",
+                        silent: audioPlayer.notifyDeviceSwitchSilent
+                    )
                 }
 
                 Divider()
 
                 Toggle(isOn: Binding(
-                    get: { notifyOnDeviceSwitch },
+                    get: { audioPlayer.notifyOnDeviceSwitch },
                     set: { newValue in
-                        notifyOnDeviceSwitch = newValue
                         audioPlayer.notifyOnDeviceSwitch = newValue
+                        audioPlayer.saveNotifyOnDeviceSwitchPreference()
                     }
                 )) {
                     Text("设备切换时通知")
                 }
 
                 Toggle(isOn: Binding(
-                    get: { notifyDeviceSwitchSilent },
+                    get: { audioPlayer.notifyDeviceSwitchSilent },
                     set: { newValue in
-                        notifyDeviceSwitchSilent = newValue
                         audioPlayer.notifyDeviceSwitchSilent = newValue
+                        audioPlayer.saveNotifyDeviceSwitchSilentPreference()
                     }
                 )) {
                     Text("设备切换通知静音（默认）")
@@ -445,16 +458,29 @@ struct MusicPlayerCommands: Commands {
             Divider()
 
             Toggle(isOn: Binding(
-                get: { ipcDebugEnabled },
+                get: { IPCDebugSettings.isEnabled() },
                 set: { newValue in
-                    ipcDebugEnabled = newValue
-                    IPCDebugSettings.setEnabled(newValue)
-                    NotificationSettingsHelper.postToast(
-                        title: newValue ? "已开启 CLI 调试模式" : "已关闭 CLI 调试模式",
-                        subtitle: newValue ? "musicplayerctl 命令现已可用" : "IPC 命令调用将被拒绝",
-                        kind: newValue ? "success" : "info",
-                        duration: 2.8
-                    )
+                    switch IPCDebugSettings.persistEnabled(
+                        newValue,
+                        preferencesStore: playlistManager.appPreferencesStore
+                    ) {
+                    case .success(let storedValue):
+                        NotificationSettingsHelper.postToast(
+                            title: storedValue ? "已开启 CLI 调试模式" : "已关闭 CLI 调试模式",
+                            subtitle: storedValue
+                                ? "musicplayerctl 命令现已可用"
+                                : "IPC 命令调用将被拒绝",
+                            kind: storedValue ? "success" : "info",
+                            duration: 2.8
+                        )
+                    case .failure(let error):
+                        NotificationSettingsHelper.postToast(
+                            title: "CLI 调试模式未更改",
+                            subtitle: String(describing: error),
+                            kind: "warning",
+                            duration: 3.5
+                        )
+                    }
                 }
             )) {
                 Text("启用 CLI 调试模式")
@@ -467,6 +493,19 @@ struct MusicPlayerCommands: Commands {
             }
             .help("检查 GitHub Releases 是否有新版本")
         }
+    }
+
+    private func persistPresentationPreference(
+        _ mutation: (inout AppPreferencesStore.Preferences) -> Void
+    ) {
+        let store = playlistManager.appPreferencesStore
+        guard store.persistenceState == .writable else { return }
+        _ = store.update(mutation)
+        _ = store.persist()
+        NotificationCenter.default.post(
+            name: .appPreferencesPresentationDidChange,
+            object: nil
+        )
     }
 
     private static func postCacheFailure(
