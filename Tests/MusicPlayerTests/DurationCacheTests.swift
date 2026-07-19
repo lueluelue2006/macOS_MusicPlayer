@@ -74,8 +74,7 @@ final class DurationCacheTests: XCTestCase {
             do {
                 let writer = DurationCache(cacheFileURLOverride: cacheURL)
                 await writer.storeDuration(300.0, for: url)
-                // Wait for debounced save to complete before writer is released
-                try await Task.sleep(nanoseconds: 600_000_000)
+                await writer.flushForTesting()
             }
 
             let reader = DurationCache(cacheFileURLOverride: cacheURL)

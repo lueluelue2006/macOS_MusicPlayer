@@ -454,6 +454,17 @@ final class PlaylistManager: ObservableObject {
         taskToCancel?.cancel()
     }
 
+    /// Stops accepting import work without waiting for filesystem operations.
+    /// AppKit termination must stay synchronous: waiting from
+    /// `applicationShouldTerminate` can deadlock its nested run loop.
+    @MainActor
+    func prepareForImmediateTermination() {
+        isTerminating = true
+        pendingAddURLs.removeAll()
+        addFilesTask?.cancel()
+        resetAddFilesProgress()
+    }
+
     @MainActor
     private func startNextAddBatchIfNeeded() {
         guard addFilesTask == nil else { return }
@@ -488,17 +499,14 @@ final class PlaylistManager: ObservableObject {
 
     @MainActor
     func drainAndFlushForTermination() async {
-        isTerminating = true
+        prepareForImmediateTermination()
 
         let startWaiters = terminationStartWaiters
         terminationStartWaiters.removeAll()
         for waiter in startWaiters {
             waiter.resume()
         }
-
-        pendingAddURLs.removeAll()
         let taskToWait = addFilesTask
-        taskToWait?.cancel()
         await taskToWait?.value
         flushPlaylistPersistence()
     }

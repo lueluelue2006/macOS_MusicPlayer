@@ -7,7 +7,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private weak var playlistsStore: PlaylistsStore?
     private var keyEventMonitor: Any?
     private var activityEventMonitor: Any?
-    private var isTerminationDrainInProgress = false
 
     func configure(
         audioPlayer: AudioPlayer,
@@ -117,6 +116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        playlistManager?.prepareForImmediateTermination()
         audioPlayer?.cancelVolumeNormalizationPreanalysis()
         audioPlayer?.flushVolumeCachePersistence()
         audioPlayer?.flushImmersivePlaybackCachePersistence()
@@ -134,16 +134,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ application: NSApplication) -> NSApplication.TerminateReply {
-        guard !isTerminationDrainInProgress else { return .terminateLater }
-        isTerminationDrainInProgress = true
-
-        Task { @MainActor in
-            await playlistManager?.drainAndFlushForTermination()
-            await playlistsStore?.drainAndFlushForTermination()
-            application.reply(toApplicationShouldTerminate: true)
-        }
-
-        return .terminateLater
+        // `terminate(_:)` waits in a nested AppKit run loop after `.terminateLater`.
+        // A MainActor task scheduled from here may therefore never run, leaving
+        // Cmd+Q permanently stuck. Cancel unfinished imports immediately; the
+        // committed queue/playlists and caches are synchronously flushed from
+        // `applicationWillTerminate` before AppKit exits the process.
+        playlistManager?.prepareForImmediateTermination()
+        audioPlayer?.cancelVolumeNormalizationPreanalysis()
+        return .terminateNow
     }
 
     // Finder/Dock 图标打开单个文件
